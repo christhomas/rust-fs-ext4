@@ -1,8 +1,8 @@
 //! End-to-end mkdir + rmdir test against a writable copy of ext4-basic.img.
 
 use ext4rs::block_io::FileDevice;
-use ext4rs::Filesystem;
 use ext4rs::path as path_mod;
+use ext4rs::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
@@ -15,7 +15,9 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() { return None; }
+    if !std::path::Path::new(&src).exists() {
+        return None;
+    }
     let dst = format!("/tmp/ext4rs_mkdir_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
@@ -28,7 +30,9 @@ fn resolve(fs: &Filesystem, path: &str) -> Option<u32> {
 
 #[test]
 fn mkdir_creates_dir_with_correct_nlink() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -37,20 +41,33 @@ fn mkdir_creates_dir_with_correct_nlink() {
 
     let (new_inode, _) = fs.read_inode_verified(ino).expect("read new dir inode");
     assert!(new_inode.is_dir(), "mkdir target must be a directory");
-    assert_eq!(new_inode.links_count, 2, "new dir nlink must be 2 (. + parent)");
-    assert_eq!(new_inode.size, fs.sb.block_size() as u64, "size == one data block");
+    assert_eq!(
+        new_inode.links_count, 2,
+        "new dir nlink must be 2 (. + parent)"
+    );
+    assert_eq!(
+        new_inode.size,
+        fs.sb.block_size() as u64,
+        "size == one data block"
+    );
 
     // Parent root inode's nlink should have bumped by 1.
     let root_ino = resolve(&fs, "/").expect("resolve root");
     let (root, _) = fs.read_inode_verified(root_ino).expect("read root");
-    assert!(root.links_count >= 3, "root nlink must be >=3 after mkdir /fresh_dir (got {})", root.links_count);
+    assert!(
+        root.links_count >= 3,
+        "root nlink must be >=3 after mkdir /fresh_dir (got {})",
+        root.links_count
+    );
 
     fs::remove_file(path).ok();
 }
 
 #[test]
 fn mkdir_rejects_existing_target() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -63,7 +80,9 @@ fn mkdir_rejects_existing_target() {
 
 #[test]
 fn mkdir_survives_remount_and_is_listable() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     {
         let dev = FileDevice::open_rw(&path).expect("open rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
@@ -83,7 +102,9 @@ fn mkdir_survives_remount_and_is_listable() {
 
 #[test]
 fn rmdir_removes_empty_dir() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -118,7 +139,9 @@ fn rmdir_removes_empty_dir() {
 
 #[test]
 fn rmdir_refuses_non_empty_dir() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -136,7 +159,9 @@ fn rmdir_refuses_non_empty_dir() {
 
 #[test]
 fn rmdir_on_regular_file_rejected() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let err = fs.apply_rmdir("/test.txt").unwrap_err();
@@ -150,7 +175,9 @@ fn rmdir_on_regular_file_rejected() {
 
 #[test]
 fn readonly_mount_rejects_mkdir_and_rmdir() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open(&path).expect("open ro");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     assert!(fs.apply_mkdir("/foo", 0o755).is_err());

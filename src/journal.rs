@@ -237,7 +237,11 @@ fn parse_descriptor_tags(
     let mut pos = 12usize; // skip header
     loop {
         let tag_size = if uses_v3 {
-            if uses_64bit { 16 } else { 12 }
+            if uses_64bit {
+                16
+            } else {
+                12
+            }
         } else if uses_64bit {
             12
         } else {
@@ -316,7 +320,10 @@ fn parse_revoke_block(
         } else {
             u32::from_be_bytes(block[pos..pos + 4].try_into().unwrap()) as u64
         };
-        out.push(RevokeEntry { transaction, fs_block });
+        out.push(RevokeEntry {
+            transaction,
+            fs_block,
+        });
         pos += record_size;
     }
     Ok(out)
@@ -325,7 +332,7 @@ fn parse_revoke_block(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::jbd2::{JBD2_SUPERBLOCK_V2, JbdIncompat};
+    use crate::jbd2::{JbdIncompat, JBD2_SUPERBLOCK_V2};
 
     fn mk_jsb(incompat: u32, max_len: u32) -> JournalSuperblock {
         JournalSuperblock {
@@ -373,15 +380,36 @@ mod tests {
     #[test]
     fn filter_revoked_drops_older_writes() {
         let mut plan = ReplayPlan::default();
-        plan.writes.push(ReplayEntry { transaction: 5, fs_block: 100, journal_block: 1, flags: 0 });
-        plan.writes.push(ReplayEntry { transaction: 5, fs_block: 200, journal_block: 2, flags: 0 });
-        plan.writes.push(ReplayEntry { transaction: 7, fs_block: 100, journal_block: 3, flags: 0 });
-        plan.revokes.push(RevokeEntry { transaction: 6, fs_block: 100 });
+        plan.writes.push(ReplayEntry {
+            transaction: 5,
+            fs_block: 100,
+            journal_block: 1,
+            flags: 0,
+        });
+        plan.writes.push(ReplayEntry {
+            transaction: 5,
+            fs_block: 200,
+            journal_block: 2,
+            flags: 0,
+        });
+        plan.writes.push(ReplayEntry {
+            transaction: 7,
+            fs_block: 100,
+            journal_block: 3,
+            flags: 0,
+        });
+        plan.revokes.push(RevokeEntry {
+            transaction: 6,
+            fs_block: 100,
+        });
         plan.filter_revoked();
         // fs_block 100 revoked at txn 6; txn 5 write dropped, txn 7 kept.
         assert_eq!(plan.writes.len(), 2);
         assert!(plan.writes.iter().any(|w| w.fs_block == 200));
-        assert!(plan.writes.iter().any(|w| w.fs_block == 100 && w.transaction == 7));
+        assert!(plan
+            .writes
+            .iter()
+            .any(|w| w.fs_block == 100 && w.transaction == 7));
     }
 
     #[test]
@@ -395,13 +423,11 @@ mod tests {
         blk[12..16].copy_from_slice(&1000u32.to_be_bytes());
         blk[16..18].copy_from_slice(&0u16.to_be_bytes()); // checksum
         blk[18..20].copy_from_slice(&0u16.to_be_bytes()); // flags = 0 → uuid present
-        // 16-byte uuid at 20..36
-        // tag 2: blocknr=2000, flags = SAME_UUID | LAST (0xA)
+                                                          // 16-byte uuid at 20..36
+                                                          // tag 2: blocknr=2000, flags = SAME_UUID | LAST (0xA)
         blk[36..40].copy_from_slice(&2000u32.to_be_bytes());
         blk[40..42].copy_from_slice(&0u16.to_be_bytes());
-        blk[42..44].copy_from_slice(
-            &((TAG_SAME_UUID | TAG_LAST) as u16).to_be_bytes(),
-        );
+        blk[42..44].copy_from_slice(&((TAG_SAME_UUID | TAG_LAST) as u16).to_be_bytes());
 
         let mut cur = 1u64;
         let out = parse_descriptor_tags(&blk, &mut cur, &jsb, 10).unwrap();
@@ -440,9 +466,9 @@ mod tests {
         // We can exercise walk() without real I/O by checking the clean shortcut.
         let mut jsb = mk_jsb(0, 128);
         jsb.start = 0; // clean
-        // walk() requires a full Filesystem which is heavier to fake; just
-        // verify the guard triggers by reading the public code path — the
-        // is_clean branch returns before any I/O.
+                       // walk() requires a full Filesystem which is heavier to fake; just
+                       // verify the guard triggers by reading the public code path — the
+                       // is_clean branch returns before any I/O.
         assert!(jsb.is_clean());
         let plan = ReplayPlan::default();
         assert!(plan.writes.is_empty());

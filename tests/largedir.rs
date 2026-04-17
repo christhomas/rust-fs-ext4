@@ -74,7 +74,11 @@ fn huge_dir_is_htree_indexed() {
          a directory with {EXPECTED_FILES} entries"
     );
     println!("/huge is htree-indexed (flags=0x{:x})", huge.flags);
-    println!("  size={} blocks={}", huge.size, huge.size / fs.sb.block_size() as u64);
+    println!(
+        "  size={} blocks={}",
+        huge.size,
+        huge.size / fs.sb.block_size() as u64
+    );
 }
 
 /// LARGEDIR must be set in the superblock. It lives in the INCOMPAT mask
@@ -133,11 +137,7 @@ fn missing_file_returns_not_found() {
     let mut reader = inode_reader(&fs);
 
     let result = path::lookup(dev_ref, &fs.sb, &mut reader, "/huge/not_here.txt");
-    assert!(
-        result.is_err(),
-        "expected NotFound, got {:?}",
-        result
-    );
+    assert!(result.is_err(), "expected NotFound, got {:?}", result);
 }
 
 /// Linear scan every block of /huge, sum up the regular file entries, and

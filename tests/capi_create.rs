@@ -178,7 +178,10 @@ fn create_null_inputs_do_not_crash() {
     assert!(!fs.is_null());
 
     let path_c = CString::new("/x.txt").unwrap();
-    assert_eq!(unsafe { ext4rs_create(std::ptr::null_mut(), path_c.as_ptr(), 0o644) }, 0);
+    assert_eq!(
+        unsafe { ext4rs_create(std::ptr::null_mut(), path_c.as_ptr(), 0o644) },
+        0
+    );
     assert_eq!(unsafe { ext4rs_create(fs, std::ptr::null(), 0o644) }, 0);
 
     unsafe { ext4rs_umount(fs) };

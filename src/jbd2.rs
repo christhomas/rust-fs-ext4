@@ -148,11 +148,11 @@ impl JournalSuperblock {
         let header_sequence = u32::from_be_bytes(raw[0x08..0x0C].try_into().unwrap());
 
         let block_size = u32::from_be_bytes(raw[0x0C..0x10].try_into().unwrap());
-        let max_len    = u32::from_be_bytes(raw[0x10..0x14].try_into().unwrap());
-        let first      = u32::from_be_bytes(raw[0x14..0x18].try_into().unwrap());
-        let sequence   = u32::from_be_bytes(raw[0x18..0x1C].try_into().unwrap());
-        let start      = u32::from_be_bytes(raw[0x1C..0x20].try_into().unwrap());
-        let errno      = u32::from_be_bytes(raw[0x20..0x24].try_into().unwrap());
+        let max_len = u32::from_be_bytes(raw[0x10..0x14].try_into().unwrap());
+        let first = u32::from_be_bytes(raw[0x14..0x18].try_into().unwrap());
+        let sequence = u32::from_be_bytes(raw[0x18..0x1C].try_into().unwrap());
+        let start = u32::from_be_bytes(raw[0x1C..0x20].try_into().unwrap());
+        let errno = u32::from_be_bytes(raw[0x20..0x24].try_into().unwrap());
 
         let mut out = Self {
             block_type,
@@ -175,18 +175,18 @@ impl JournalSuperblock {
 
         // V2 extends with the dynamic-journal-features section.
         if block_type == JBD2_SUPERBLOCK_V2 {
-            out.feature_compat    = u32::from_be_bytes(raw[0x24..0x28].try_into().unwrap());
-            out.feature_incompat  = u32::from_be_bytes(raw[0x28..0x2C].try_into().unwrap());
+            out.feature_compat = u32::from_be_bytes(raw[0x24..0x28].try_into().unwrap());
+            out.feature_incompat = u32::from_be_bytes(raw[0x28..0x2C].try_into().unwrap());
             out.feature_ro_compat = u32::from_be_bytes(raw[0x2C..0x30].try_into().unwrap());
             out.uuid.copy_from_slice(&raw[0x30..0x40]);
-            out.nr_users          = u32::from_be_bytes(raw[0x40..0x44].try_into().unwrap());
+            out.nr_users = u32::from_be_bytes(raw[0x40..0x44].try_into().unwrap());
             // 0x44 s_dynsuper ignored (never used by upstream)
             // 0x48 s_max_transaction / 0x4C s_max_trans_data ignored (hints only)
-            out.checksum_type     = raw[0x50];
+            out.checksum_type = raw[0x50];
             // 0x51..0x54 padding
-            out.num_fc_blocks     = u32::from_be_bytes(raw[0x54..0x58].try_into().unwrap());
+            out.num_fc_blocks = u32::from_be_bytes(raw[0x54..0x58].try_into().unwrap());
             // 0x58 s_head / padding
-            out.checksum          = u32::from_be_bytes(raw[0xFC..0x100].try_into().unwrap());
+            out.checksum = u32::from_be_bytes(raw[0xFC..0x100].try_into().unwrap());
         }
 
         Ok(out)
@@ -203,7 +203,12 @@ pub fn journal_block_to_physical(
     if (journal_inode.flags & crate::inode::InodeFlags::EXTENTS.bits()) == 0 {
         return Err(Error::Corrupt("journal inode uses legacy indirect blocks"));
     }
-    extent::map_logical(&journal_inode.block, fs.dev.as_ref(), fs.sb.block_size(), journal_block)
+    extent::map_logical(
+        &journal_inode.block,
+        fs.dev.as_ref(),
+        fs.sb.block_size(),
+        journal_block,
+    )
 }
 
 /// Read and parse the JBD2 superblock at block 0 of the journal.

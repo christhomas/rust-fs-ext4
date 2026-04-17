@@ -13,10 +13,7 @@ use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch(label: &str) -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
@@ -32,7 +29,9 @@ fn scratch(label: &str) -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -175,9 +174,7 @@ fn rename_directory_into_own_subtree_returns_einval() {
 
 #[test]
 fn rename_null_args_return_einval() {
-    let rc = unsafe {
-        ext4rs_rename(std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
-    };
+    let rc = unsafe { ext4rs_rename(std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
     assert_eq!(rc, -1);
     assert_eq!(ext4rs_last_errno(), 22);
 }

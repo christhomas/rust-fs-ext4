@@ -12,10 +12,7 @@ use ext4rs::capi::*;
 use std::ffi::CString;
 use std::path::Path;
 
-const IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-largedir.img"
-);
+const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-largedir.img");
 
 fn mount_or_skip() -> Option<*mut ext4rs_fs_t> {
     if !Path::new(IMAGE).exists() {
@@ -24,7 +21,9 @@ fn mount_or_skip() -> Option<*mut ext4rs_fs_t> {
     }
     let p = CString::new(IMAGE).unwrap();
     let fs = unsafe { ext4rs_mount(p.as_ptr()) };
-    if fs.is_null() { return None; }
+    if fs.is_null() {
+        return None;
+    }
     Some(fs)
 }
 
@@ -35,7 +34,9 @@ fn count_entries(fs: *mut ext4rs_fs_t, path: &str) -> usize {
     let mut count = 0usize;
     loop {
         let e = unsafe { ext4rs_dir_next(iter) };
-        if e.is_null() { break; }
+        if e.is_null() {
+            break;
+        }
         count += 1;
     }
     unsafe { ext4rs_dir_close(iter) };
@@ -49,7 +50,9 @@ fn list_names(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
     let mut names = Vec::with_capacity(70_002);
     loop {
         let e = unsafe { ext4rs_dir_next(iter) };
-        if e.is_null() { break; }
+        if e.is_null() {
+            break;
+        }
         let entry = unsafe { &*e };
         let bytes: Vec<u8> = entry.name[..entry.name_len as usize]
             .iter()
@@ -63,7 +66,9 @@ fn list_names(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
 
 #[test]
 fn small_file_reads_control_content() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     let c = CString::new("/small.txt").unwrap();
     let mut buf = [0u8; 32];
     let n = unsafe {
@@ -82,7 +87,9 @@ fn small_file_reads_control_content() {
 
 #[test]
 fn huge_dir_enumerates_all_70000_files_plus_dot_entries() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     let count = count_entries(fs, "/huge");
     // 70_000 files + "." + ".."
     assert_eq!(count, 70_002, "expected 70002 entries, got {count}");
@@ -91,7 +98,9 @@ fn huge_dir_enumerates_all_70000_files_plus_dot_entries() {
 
 #[test]
 fn huge_dir_no_duplicate_entries() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     let names = list_names(fs, "/huge");
     let mut sorted = names.clone();
     sorted.sort();
@@ -102,7 +111,9 @@ fn huge_dir_no_duplicate_entries() {
 
 #[test]
 fn sampled_stat_succeeds_across_the_huge_range() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     // file_NNNNN.txt where NNNNN is 1..=70000 (5-digit zero-padded).
     for idx in [1u32, 100, 35_000, 69_999, 70_000] {
         let name = format!("file_{idx:05}.txt");
@@ -118,7 +129,9 @@ fn sampled_stat_succeeds_across_the_huge_range() {
 
 #[test]
 fn missing_entry_in_huge_dir_returns_enoent() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     let c = CString::new("/huge/file_99999999.txt").unwrap();
     let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
     let rc = unsafe { ext4rs_stat(fs, c.as_ptr(), &mut attr) };

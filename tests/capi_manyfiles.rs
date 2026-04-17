@@ -8,10 +8,7 @@ use ext4rs::capi::*;
 use std::ffi::{CStr, CString};
 use std::path::Path;
 
-const IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-manyfiles.img"
-);
+const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-manyfiles.img");
 
 fn mount_or_skip() -> Option<*mut ext4rs_fs_t> {
     if !Path::new(IMAGE).exists() {
@@ -48,7 +45,9 @@ fn list_dir(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
 
 #[test]
 fn mount_and_umount_manyfiles() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     let mut info: ext4rs_volume_info_t = unsafe { std::mem::zeroed() };
     let rc = unsafe { ext4rs_get_volume_info(fs, &mut info) };
     assert_eq!(rc, 0, "get_volume_info failed");
@@ -58,7 +57,9 @@ fn mount_and_umount_manyfiles() {
 
 #[test]
 fn root_listing_includes_dot_and_dotdot() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     let entries = list_dir(fs, "/");
     assert!(entries.iter().any(|n| n == "."), "missing . in root");
     assert!(entries.iter().any(|n| n == ".."), "missing .. in root");
@@ -68,7 +69,9 @@ fn root_listing_includes_dot_and_dotdot() {
 
 #[test]
 fn stat_works_on_every_root_entry() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     let entries = list_dir(fs, "/");
     let mut errors = 0;
     for name in &entries {
@@ -97,7 +100,9 @@ fn stat_works_on_every_root_entry() {
 
 #[test]
 fn listing_does_not_panic_on_large_dir() {
-    let Some(fs) = mount_or_skip() else { return; };
+    let Some(fs) = mount_or_skip() else {
+        return;
+    };
     // Whatever the biggest directory turns out to be, opening + draining it
     // must not panic or OOM. 64MB image caps this at a reasonable size.
     let entries = list_dir(fs, "/");

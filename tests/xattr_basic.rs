@@ -51,8 +51,14 @@ fn reads_user_xattrs_on_tagged_file() {
         .expect("resolve /tagged.txt");
     let inode = read_inode(&fs, ino);
 
-    let entries = xattr::read_all(dev.as_ref(), &inode, &read_inode_raw_bytes(&fs, ino), fs.sb.inode_size, fs.sb.block_size())
-        .expect("read xattrs");
+    let entries = xattr::read_all(
+        dev.as_ref(),
+        &inode,
+        &read_inode_raw_bytes(&fs, ino),
+        fs.sb.inode_size,
+        fs.sb.block_size(),
+    )
+    .expect("read xattrs");
     println!("xattrs on /tagged.txt:");
     for e in &entries {
         println!("  {:?} = {:?} ({} bytes)", e.name, e.value, e.value.len());
@@ -67,7 +73,10 @@ fn reads_user_xattrs_on_tagged_file() {
         "expected at least one user.* xattr"
     );
 
-    let color = entries.iter().find(|e| e.name == "user.color").expect("user.color");
+    let color = entries
+        .iter()
+        .find(|e| e.name == "user.color")
+        .expect("user.color");
     assert_eq!(color.value, b"red");
 
     let finder = entries
@@ -131,8 +140,14 @@ fn directory_can_have_xattrs() {
         .expect("resolve /tagged_dir");
     let inode = read_inode(&fs, ino);
 
-    let entries = xattr::read_all(dev.as_ref(), &inode, &read_inode_raw_bytes(&fs, ino), fs.sb.inode_size, fs.sb.block_size())
-        .expect("read dir xattrs");
+    let entries = xattr::read_all(
+        dev.as_ref(),
+        &inode,
+        &read_inode_raw_bytes(&fs, ino),
+        fs.sb.inode_size,
+        fs.sb.block_size(),
+    )
+    .expect("read dir xattrs");
 
     let purpose = entries
         .iter()
@@ -152,12 +167,18 @@ fn plain_file_has_no_user_xattrs() {
         Inode::parse(&block_data[off..off + inode_size])
     };
 
-    let ino = path::lookup(dev.as_ref(), &fs.sb, &mut reader, "/plain.txt")
-        .expect("resolve /plain.txt");
+    let ino =
+        path::lookup(dev.as_ref(), &fs.sb, &mut reader, "/plain.txt").expect("resolve /plain.txt");
     let inode = read_inode(&fs, ino);
 
-    let entries = xattr::read_all(dev.as_ref(), &inode, &read_inode_raw_bytes(&fs, ino), fs.sb.inode_size, fs.sb.block_size())
-        .expect("read plain xattrs");
+    let entries = xattr::read_all(
+        dev.as_ref(),
+        &inode,
+        &read_inode_raw_bytes(&fs, ino),
+        fs.sb.inode_size,
+        fs.sb.block_size(),
+    )
+    .expect("read plain xattrs");
 
     let user_xattrs: Vec<_> = entries
         .iter()

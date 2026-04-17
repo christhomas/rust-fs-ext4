@@ -234,7 +234,10 @@ mod tests {
     #[test]
     fn disabled_when_feature_off() {
         // crc32c of an empty seed always yields 0; not interesting.
-        let c = Checksummer { seed: 0, enabled: false };
+        let c = Checksummer {
+            seed: 0,
+            enabled: false,
+        };
         assert!(c.verify_superblock(&[]));
         assert!(c.verify_inode(2, 0, &[]));
         assert!(c.verify_dir_entry_tail(2, 0, &[0u8; 12]));
@@ -243,7 +246,10 @@ mod tests {
 
     #[test]
     fn dir_tail_roundtrip_and_tamper() {
-        let c = Checksummer { seed: 0xCAFEBABE, enabled: true };
+        let c = Checksummer {
+            seed: 0xCAFEBABE,
+            enabled: true,
+        };
         let ino = 42u32;
         let gen = 0xDEADBEEFu32;
         let mut block = vec![0u8; 4096];
@@ -252,9 +258,9 @@ mod tests {
         let end = block.len();
         block[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes()); // det_reserved_zero1
         block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes()); // det_rec_len
-        block[end - 6] = 0;     // det_reserved_zero2
-        block[end - 5] = 0xDE;  // det_reserved_ft
-        // Some plausible directory content bytes (BEFORE the tail).
+        block[end - 6] = 0; // det_reserved_zero2
+        block[end - 5] = 0xDE; // det_reserved_ft
+                               // Some plausible directory content bytes (BEFORE the tail).
         block[0..8].copy_from_slice(&[2, 0, 0, 0, 12, 0, 1, 2]);
         block[100] = 0x5A;
         // CRC covers block[..len-12]; tail's last 4 bytes hold the result.
@@ -273,7 +279,10 @@ mod tests {
     fn extent_tail_excludes_only_last_4_bytes() {
         // The extent tail recipe excludes only the final u32 et_checksum,
         // unlike dir_entry_tail which excludes the full 12-byte tail.
-        let c = Checksummer { seed: 0x12345678, enabled: true };
+        let c = Checksummer {
+            seed: 0x12345678,
+            enabled: true,
+        };
         let mut block = vec![0u8; 1024];
         block[0..12].copy_from_slice(&[0x0A, 0xF3, 0, 1, 0, 1, 0, 0, 0, 0, 0, 0]);
         block[500] = 0xAB;
@@ -287,14 +296,20 @@ mod tests {
 
     #[test]
     fn dir_tail_rejects_too_short_block_when_enabled() {
-        let c = Checksummer { seed: 0, enabled: true };
+        let c = Checksummer {
+            seed: 0,
+            enabled: true,
+        };
         // Less than 12 bytes cannot even hold the tail struct.
         assert!(!c.verify_dir_entry_tail(2, 0, &[0u8; 8]));
     }
 
     #[test]
     fn crc_helpers_are_deterministic() {
-        let c = Checksummer { seed: 0xDEAD_BEEF, enabled: true };
+        let c = Checksummer {
+            seed: 0xDEAD_BEEF,
+            enabled: true,
+        };
         let a = c.crc(b"hello");
         let b = c.crc(b"hello");
         assert_eq!(a, b);
@@ -337,7 +352,10 @@ mod tests {
         let path = "test-disks/ext4-basic.img";
         let dev = match FileDevice::open(path) {
             Ok(d) => d,
-            Err(_) => { eprintln!("skip: {path} not present"); return; }
+            Err(_) => {
+                eprintln!("skip: {path} not present");
+                return;
+            }
         };
         let sb = Superblock::read(&dev).expect("parse sb");
         let csum = Checksummer::from_superblock(&sb);
@@ -372,7 +390,10 @@ mod tests {
         let path = "test-disks/ext4-basic.img";
         let dev = match FileDevice::open(path) {
             Ok(d) => d,
-            Err(_) => { eprintln!("skip: {path} not present"); return; }
+            Err(_) => {
+                eprintln!("skip: {path} not present");
+                return;
+            }
         };
         let dev_dyn: Arc<dyn crate::block_io::BlockDevice> = Arc::new(dev);
         let fs = Filesystem::mount(dev_dyn).expect("mount");
@@ -392,14 +413,17 @@ mod tests {
     fn verifies_real_dir_tail() {
         use crate::block_io::{BlockDevice, FileDevice};
         use crate::dir;
-        use crate::fs::Filesystem;
         use crate::extent;
+        use crate::fs::Filesystem;
         use std::sync::Arc;
 
         let path = "test-disks/ext4-basic.img";
         let dev = match FileDevice::open(path) {
             Ok(d) => d,
-            Err(_) => { eprintln!("skip: {path} not present"); return; }
+            Err(_) => {
+                eprintln!("skip: {path} not present");
+                return;
+            }
         };
         let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
         let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
@@ -414,9 +438,13 @@ mod tests {
             .expect("dir block 0 mapped");
         let mut block = vec![0u8; bs as usize];
         dev_dyn.read_at(phys * bs as u64, &mut block).unwrap();
-        assert!(dir::has_csum_tail(&block), "expected tail on root dir block");
         assert!(
-            fs.csum.verify_dir_entry_tail(2, root_inode.generation, &block),
+            dir::has_csum_tail(&block),
+            "expected tail on root dir block"
+        );
+        assert!(
+            fs.csum
+                .verify_dir_entry_tail(2, root_inode.generation, &block),
             "dir tail csum mismatch on {path} root dir"
         );
     }
@@ -434,7 +462,10 @@ mod tests {
         let path = "test-disks/ext4-deep-extents.img";
         let dev = match FileDevice::open(path) {
             Ok(d) => d,
-            Err(_) => { eprintln!("skip: {path} not present"); return; }
+            Err(_) => {
+                eprintln!("skip: {path} not present");
+                return;
+            }
         };
         let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
         let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
@@ -446,19 +477,31 @@ mod tests {
         let bs = fs.sb.block_size();
         let mut found = None;
         for ino in 11..200u32 {
-            let (inode, _raw) = match fs.read_inode_verified(ino) { Ok(x) => x, Err(_) => continue };
-            if !inode.is_file() || !inode.has_extents() { continue; }
-            let header = match ExtentHeader::parse(&inode.block) { Ok(h) => h, Err(_) => continue };
+            let (inode, _raw) = match fs.read_inode_verified(ino) {
+                Ok(x) => x,
+                Err(_) => continue,
+            };
+            if !inode.is_file() || !inode.has_extents() {
+                continue;
+            }
+            let header = match ExtentHeader::parse(&inode.block) {
+                Ok(h) => h,
+                Err(_) => continue,
+            };
             if header.depth > 0 && header.entries >= 1 {
-                let idx = ExtentIdx::parse(&inode.block[EXT4_EXT_NODE_SIZE..2 * EXT4_EXT_NODE_SIZE])
-                    .expect("parse first idx");
+                let idx =
+                    ExtentIdx::parse(&inode.block[EXT4_EXT_NODE_SIZE..2 * EXT4_EXT_NODE_SIZE])
+                        .expect("parse first idx");
                 found = Some((ino, inode.generation, idx.leaf_block));
                 break;
             }
         }
         let (ino, gen, child_block) = match found {
             Some(x) => x,
-            None => { eprintln!("skip: no depth>0 inode in first 200 of {path}"); return; }
+            None => {
+                eprintln!("skip: no depth>0 inode in first 200 of {path}");
+                return;
+            }
         };
         let mut buf = vec![0u8; bs as usize];
         dev_dyn.read_at(child_block * bs as u64, &mut buf).unwrap();
@@ -469,7 +512,11 @@ mod tests {
 
         // Also exercise the verified traversal API end-to-end.
         let (inode, _) = fs.read_inode_verified(ino).unwrap();
-        let ctx = extent::ExtentVerifyCtx { ino, generation: gen, csum: &fs.csum };
+        let ctx = extent::ExtentVerifyCtx {
+            ino,
+            generation: gen,
+            csum: &fs.csum,
+        };
         let _ = extent::lookup_verified(&inode.block, dev_dyn.as_ref(), bs, 0, Some(&ctx))
             .expect("lookup_verified must accept valid extent blocks");
     }

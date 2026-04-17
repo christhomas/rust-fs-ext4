@@ -47,7 +47,10 @@ pub const NAME_PREFIXES: &[(u8, &str)] = &[
 
 /// Look up the human-readable prefix for a numeric name_index.
 pub fn prefix_for_index(idx: u8) -> Option<&'static str> {
-    NAME_PREFIXES.iter().find(|(i, _)| *i == idx).map(|(_, s)| *s)
+    NAME_PREFIXES
+        .iter()
+        .find(|(i, _)| *i == idx)
+        .map(|(_, s)| *s)
 }
 
 /// One parsed xattr entry: fully-qualified name + raw value bytes.
@@ -80,7 +83,9 @@ pub fn read_all(
     if inode_raw.len() >= 128 + 4 {
         let extra_isize = u16::from_le_bytes(inode_raw[128..130].try_into().unwrap()) as usize;
         let xattr_region_start = 128 + extra_isize;
-        if xattr_region_start + 4 <= inode_size as usize && xattr_region_start + 4 <= inode_raw.len() {
+        if xattr_region_start + 4 <= inode_size as usize
+            && xattr_region_start + 4 <= inode_raw.len()
+        {
             let region = &inode_raw[xattr_region_start..(inode_size as usize).min(inode_raw.len())];
             let magic = u32::from_le_bytes(region[..4].try_into().unwrap());
             if magic == EXT4_XATTR_MAGIC {
@@ -142,8 +147,8 @@ fn parse_entries(entries_buf: &[u8], _region_len: usize, out: &mut Vec<XattrEntr
 
         let name_bytes = &entries_buf[pos + 16..pos + 16 + name_len];
         let prefix = prefix_for_index(name_index).unwrap_or("");
-        let suffix = std::str::from_utf8(name_bytes)
-            .map_err(|_| Error::Corrupt("xattr name not utf-8"))?;
+        let suffix =
+            std::str::from_utf8(name_bytes).map_err(|_| Error::Corrupt("xattr name not utf-8"))?;
         let full_name = format!("{prefix}{suffix}");
 
         let value = if value_size > 0 {
@@ -195,8 +200,8 @@ fn parse_entries_block(block: &[u8], out: &mut Vec<XattrEntry>) -> Result<()> {
 
         let name_bytes = &block[pos + 16..pos + 16 + name_len];
         let prefix = prefix_for_index(name_index).unwrap_or("");
-        let suffix = std::str::from_utf8(name_bytes)
-            .map_err(|_| Error::Corrupt("xattr name not utf-8"))?;
+        let suffix =
+            std::str::from_utf8(name_bytes).map_err(|_| Error::Corrupt("xattr name not utf-8"))?;
         let full_name = format!("{prefix}{suffix}");
 
         let value = if value_size > 0 {

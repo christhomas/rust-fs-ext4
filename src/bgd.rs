@@ -58,32 +58,39 @@ impl BlockGroupDescriptor {
         let itable_unused_lo = u16::from_le_bytes(buf[0x1C..0x1E].try_into().unwrap());
         let checksum = u16::from_le_bytes(buf[0x1E..0x20].try_into().unwrap());
 
-        let (block_bitmap_hi, inode_bitmap_hi, inode_table_hi,
-             free_blocks_hi, free_inodes_hi, used_dirs_hi,
-             itable_unused_hi, block_bitmap_csum_hi, inode_bitmap_csum_hi) =
-            if desc_size >= 64 {
-                (
-                    u32::from_le_bytes(buf[0x20..0x24].try_into().unwrap()),
-                    u32::from_le_bytes(buf[0x24..0x28].try_into().unwrap()),
-                    u32::from_le_bytes(buf[0x28..0x2C].try_into().unwrap()),
-                    u16::from_le_bytes(buf[0x2C..0x2E].try_into().unwrap()),
-                    u16::from_le_bytes(buf[0x2E..0x30].try_into().unwrap()),
-                    u16::from_le_bytes(buf[0x30..0x32].try_into().unwrap()),
-                    u16::from_le_bytes(buf[0x32..0x34].try_into().unwrap()),
-                    u16::from_le_bytes(buf[0x38..0x3A].try_into().unwrap()),
-                    u16::from_le_bytes(buf[0x3A..0x3C].try_into().unwrap()),
-                )
-            } else {
-                (0, 0, 0, 0, 0, 0, 0, 0, 0)
-            };
+        let (
+            block_bitmap_hi,
+            inode_bitmap_hi,
+            inode_table_hi,
+            free_blocks_hi,
+            free_inodes_hi,
+            used_dirs_hi,
+            itable_unused_hi,
+            block_bitmap_csum_hi,
+            inode_bitmap_csum_hi,
+        ) = if desc_size >= 64 {
+            (
+                u32::from_le_bytes(buf[0x20..0x24].try_into().unwrap()),
+                u32::from_le_bytes(buf[0x24..0x28].try_into().unwrap()),
+                u32::from_le_bytes(buf[0x28..0x2C].try_into().unwrap()),
+                u16::from_le_bytes(buf[0x2C..0x2E].try_into().unwrap()),
+                u16::from_le_bytes(buf[0x2E..0x30].try_into().unwrap()),
+                u16::from_le_bytes(buf[0x30..0x32].try_into().unwrap()),
+                u16::from_le_bytes(buf[0x32..0x34].try_into().unwrap()),
+                u16::from_le_bytes(buf[0x38..0x3A].try_into().unwrap()),
+                u16::from_le_bytes(buf[0x3A..0x3C].try_into().unwrap()),
+            )
+        } else {
+            (0, 0, 0, 0, 0, 0, 0, 0, 0)
+        };
 
         Ok(Self {
             block_bitmap: ((block_bitmap_hi as u64) << 32) | block_bitmap_lo as u64,
             inode_bitmap: ((inode_bitmap_hi as u64) << 32) | inode_bitmap_lo as u64,
-            inode_table:  ((inode_table_hi  as u64) << 32) | inode_table_lo  as u64,
+            inode_table: ((inode_table_hi as u64) << 32) | inode_table_lo as u64,
             free_blocks_count: ((free_blocks_hi as u32) << 16) | free_blocks_lo as u32,
             free_inodes_count: ((free_inodes_hi as u32) << 16) | free_inodes_lo as u32,
-            used_dirs_count:   ((used_dirs_hi   as u32) << 16) | used_dirs_lo   as u32,
+            used_dirs_count: ((used_dirs_hi as u32) << 16) | used_dirs_lo as u32,
             flags,
             itable_unused: ((itable_unused_hi as u32) << 16) | itable_unused_lo as u32,
             block_bitmap_csum: ((block_bitmap_csum_hi as u32) << 16) | block_bitmap_csum_lo as u32,
@@ -122,7 +129,9 @@ pub fn read_all<D: BlockDevice + ?Sized>(
         let off = i * sb.desc_size as usize;
         let raw = &buf[off..off + sb.desc_size as usize];
         if csum.enabled && !csum.verify_bgd(i as u32, raw, sb.desc_size) {
-            return Err(Error::BadChecksum { what: "block group descriptor" });
+            return Err(Error::BadChecksum {
+                what: "block group descriptor",
+            });
         }
         let bgd = BlockGroupDescriptor::parse(raw, sb.desc_size)?;
         groups.push(bgd);
@@ -132,7 +141,11 @@ pub fn read_all<D: BlockDevice + ?Sized>(
 
 /// Locate the inode table block + offset for a given inode number.
 /// Returns (physical block containing the inode, byte offset within block).
-pub fn locate_inode(sb: &Superblock, groups: &[BlockGroupDescriptor], ino: u32) -> Result<(u64, u32)> {
+pub fn locate_inode(
+    sb: &Superblock,
+    groups: &[BlockGroupDescriptor],
+    ino: u32,
+) -> Result<(u64, u32)> {
     if ino == 0 || ino > sb.inodes_count {
         return Err(Error::InvalidInode(ino));
     }

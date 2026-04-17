@@ -12,10 +12,7 @@ const EIO: i32 = 5;
 const ENOTDIR: i32 = 20;
 const EINVAL: i32 = 22;
 
-const TEST_IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn mount() -> *mut ext4rs_fs_t {
     let path = CString::new(TEST_IMAGE).unwrap();
@@ -116,19 +113,14 @@ fn read_file_on_symlink_sets_einval() {
 
 #[test]
 fn getxattr_missing_name_sets_enoent() {
-    let xattr_image = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/test-disks/ext4-xattr.img"
-    );
+    let xattr_image = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-xattr.img");
     let path = CString::new(xattr_image).unwrap();
     let fs = unsafe { ext4rs_mount(path.as_ptr()) };
     assert!(!fs.is_null());
 
     let p = CString::new("/tagged.txt").unwrap();
     let name = CString::new("user.does_not_exist").unwrap();
-    let n = unsafe {
-        ext4rs_getxattr(fs, p.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0)
-    };
+    let n = unsafe { ext4rs_getxattr(fs, p.as_ptr(), name.as_ptr(), std::ptr::null_mut(), 0) };
     assert_eq!(n, -1);
     assert_eq!(ext4rs_last_errno(), ENOENT);
 

@@ -22,10 +22,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -52,7 +49,10 @@ fn truncate_on_directory_should_fail_with_eisdir() {
     // POSIX EISDIR = 21 on Linux/macOS. Also accept EINVAL (22) as our
     // general type-mismatch code.
     let e = ext4rs_last_errno();
-    assert!(e == 21 || e == 22, "expected EISDIR (21) or EINVAL (22), got {e}");
+    assert!(
+        e == 21 || e == 22,
+        "expected EISDIR (21) or EINVAL (22), got {e}"
+    );
 
     unsafe { ext4rs_umount(fs_h) };
     let _ = fs::remove_file(&img);
@@ -75,7 +75,12 @@ fn truncate_grow_fails_with_einval() {
 
     let rc = unsafe { ext4rs_truncate(fs_h, path.as_ptr(), original + 4096) };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 22, "expected EINVAL for grow, got {}", ext4rs_last_errno());
+    assert_eq!(
+        ext4rs_last_errno(),
+        22,
+        "expected EINVAL for grow, got {}",
+        ext4rs_last_errno()
+    );
 
     unsafe { ext4rs_umount(fs_h) };
     let _ = fs::remove_file(&img);
@@ -120,7 +125,9 @@ fn truncate_on_directory_leaves_the_dir_intact() {
     let mut count = 0;
     loop {
         let e = unsafe { ext4rs_dir_next(iter) };
-        if e.is_null() { break; }
+        if e.is_null() {
+            break;
+        }
         count += 1;
     }
     unsafe { ext4rs_dir_close(iter) };

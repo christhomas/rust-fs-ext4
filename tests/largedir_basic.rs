@@ -31,9 +31,7 @@ fn open_or_skip() -> Option<(Arc<dyn BlockDevice>, Filesystem)> {
     Some((dev_dyn, fs))
 }
 
-fn inode_reader(
-    fs: &Filesystem,
-) -> impl FnMut(u32) -> Result<Inode> + '_ {
+fn inode_reader(fs: &Filesystem) -> impl FnMut(u32) -> Result<Inode> + '_ {
     move |ino: u32| -> Result<Inode> {
         let (block, offset) = bgd::locate_inode(&fs.sb, &fs.groups, ino)?;
         let block_data = fs.read_block(block)?;
@@ -50,7 +48,9 @@ fn resolve(dev: &dyn BlockDevice, fs: &Filesystem, p: &str) -> u32 {
 
 #[test]
 fn largedir_mount_succeeds_and_sees_control_file() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     // mount already succeeded; sanity check the control file via linear path.
     let ino = resolve(dev.as_ref(), &fs, "/small.txt");
     assert!(ino >= 2);
@@ -58,10 +58,18 @@ fn largedir_mount_succeeds_and_sees_control_file() {
 
 #[test]
 fn htree_resolves_boundary_entries() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     // First, last, and a couple of interior names — if any of these hits a
     // wrong tree leaf the resolve will fail or return the wrong inode.
-    for name in ["file_00001.txt", "file_00002.txt", "file_35000.txt", "file_69999.txt", "file_70000.txt"] {
+    for name in [
+        "file_00001.txt",
+        "file_00002.txt",
+        "file_35000.txt",
+        "file_69999.txt",
+        "file_70000.txt",
+    ] {
         let p = format!("/huge/{name}");
         let ino = resolve(dev.as_ref(), &fs, &p);
         assert!(ino >= 2, "resolve {p} -> {ino}");
@@ -70,7 +78,9 @@ fn htree_resolves_boundary_entries() {
 
 #[test]
 fn htree_random_sample_all_resolve() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     // Deterministic "random" sample — evenly spaced across the 70k range.
     for i in (1..=70_000u32).step_by(517) {
         let p = format!("/huge/file_{i:05}.txt");
@@ -81,16 +91,12 @@ fn htree_random_sample_all_resolve() {
 
 #[test]
 fn missing_entry_returns_notfound() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     let mut reader = inode_reader(&fs);
     // Name that clearly isn't in the 1..=70000 range.
-    let err = path::lookup(
-        dev.as_ref(),
-        &fs.sb,
-        &mut reader,
-        "/huge/file_99999.txt",
-    )
-    .unwrap_err();
+    let err = path::lookup(dev.as_ref(), &fs.sb, &mut reader, "/huge/file_99999.txt").unwrap_err();
     use ext4rs::error::Error;
     assert!(matches!(err, Error::NotFound));
 }

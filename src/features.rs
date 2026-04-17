@@ -77,8 +77,7 @@ pub const SUPPORTED_INCOMPAT: u32 = 0
     | Incompat::INLINE_DATA.bits()  // we'll handle the flag, even if data overflow uses xattr later
     | Incompat::LARGEDIR.bits()
     | Incompat::EA_INODE.bits()
-    | Incompat::CASEFOLD.bits()
-    ;
+    | Incompat::CASEFOLD.bits();
 
 /// RO_COMPAT bits we tolerate (since we mount read-only anyway).
 pub const SUPPORTED_RO_COMPAT: u32 = 0
@@ -100,7 +99,9 @@ pub const SUPPORTED_RO_COMPAT: u32 = 0
 pub fn check_mountable(feature_incompat: u32, _feature_ro_compat: u32) -> crate::error::Result<()> {
     let unsupported_incompat = feature_incompat & !SUPPORTED_INCOMPAT;
     if unsupported_incompat != 0 {
-        return Err(crate::error::Error::UnsupportedIncompat(unsupported_incompat));
+        return Err(crate::error::Error::UnsupportedIncompat(
+            unsupported_incompat,
+        ));
     }
     // RO_COMPAT bits are all OK for read-only mount even if unknown,
     // per the spec's compatibility model. We log them but don't fail.

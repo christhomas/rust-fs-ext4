@@ -15,10 +15,7 @@ use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch(label: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -34,7 +31,9 @@ fn scratch(label: &str) -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -66,7 +65,11 @@ fn write_file_result_survives_csum_verification_on_remount() {
     // goes through read_inode_verified. Any CRC mismatch aborts.
     {
         let fs_h = unsafe { ext4rs_mount(img_c.as_ptr()) };
-        assert!(!fs_h.is_null(), "remount after write_file failed: {}", last_err());
+        assert!(
+            !fs_h.is_null(),
+            "remount after write_file failed: {}",
+            last_err()
+        );
 
         // Stat the file we wrote (read_inode_verified).
         let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
@@ -81,7 +84,9 @@ fn write_file_result_survives_csum_verification_on_remount() {
         let mut count = 0;
         loop {
             let e = unsafe { ext4rs_dir_next(iter) };
-            if e.is_null() { break; }
+            if e.is_null() {
+                break;
+            }
             count += 1;
         }
         unsafe { ext4rs_dir_close(iter) };
@@ -167,14 +172,21 @@ fn unlink_result_survives_csum_verification_on_remount() {
         let mut names = Vec::new();
         loop {
             let e = unsafe { ext4rs_dir_next(iter) };
-            if e.is_null() { break; }
+            if e.is_null() {
+                break;
+            }
             let ent = unsafe { &*e };
             let bytes: Vec<u8> = ent.name[..ent.name_len as usize]
-                .iter().map(|b| *b as u8).collect();
+                .iter()
+                .map(|b| *b as u8)
+                .collect();
             names.push(String::from_utf8_lossy(&bytes).into_owned());
         }
         unsafe { ext4rs_dir_close(iter) };
-        assert!(!names.contains(&"test.txt".to_string()), "test.txt should be absent");
+        assert!(
+            !names.contains(&"test.txt".to_string()),
+            "test.txt should be absent"
+        );
 
         unsafe { ext4rs_umount(fs_h) };
     }

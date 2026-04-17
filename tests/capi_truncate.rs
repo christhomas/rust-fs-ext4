@@ -66,7 +66,11 @@ fn mount_rw_then_truncate_shrinks_and_persists() {
     let target = original / 2;
     let rc = unsafe { ext4rs_truncate(fs, path_c.as_ptr(), target) };
     assert_eq!(rc, 0, "truncate: {}", last_err_str());
-    assert_eq!(stat_size(fs, "/test.txt"), target, "size after truncate (pre-remount)");
+    assert_eq!(
+        stat_size(fs, "/test.txt"),
+        target,
+        "size after truncate (pre-remount)"
+    );
 
     unsafe { ext4rs_umount(fs) };
 
@@ -127,7 +131,11 @@ fn truncate_growing_is_rejected() {
     // grow branch in apply_truncate_shrink.
     let rc = unsafe { ext4rs_truncate(fs, path_c.as_ptr(), original + 4096) };
     assert_eq!(rc, -1, "grow-truncate must fail");
-    assert_eq!(stat_size(fs, "/test.txt"), original, "size must be unchanged");
+    assert_eq!(
+        stat_size(fs, "/test.txt"),
+        original,
+        "size must be unchanged"
+    );
 
     unsafe { ext4rs_umount(fs) };
     std::fs::remove_file(&img).ok();

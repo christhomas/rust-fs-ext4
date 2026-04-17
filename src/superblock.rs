@@ -15,7 +15,7 @@ pub const EXT4_MAGIC: u16 = 0xEF53;
 #[derive(Debug, Clone)]
 pub struct Superblock {
     pub inodes_count: u32,
-    pub blocks_count: u64,        // combined lo + hi
+    pub blocks_count: u64, // combined lo + hi
     pub free_blocks_count: u64,
     pub free_inodes_count: u32,
     pub first_data_block: u32,
@@ -30,12 +30,12 @@ pub struct Superblock {
     pub feature_ro_compat: u32,
     pub uuid: [u8; 16],
     pub volume_name: String,
-    pub desc_size: u16,           // BGD size: 32 or 64
+    pub desc_size: u16, // BGD size: 32 or 64
     pub hash_seed: [u32; 4],
     pub default_hash_version: u8,
-    pub checksum_seed: u32,       // s_checksum_seed (used when INCOMPAT_CSUM_SEED)
+    pub checksum_seed: u32, // s_checksum_seed (used when INCOMPAT_CSUM_SEED)
     pub journal_inode: u32,
-    pub raw: Vec<u8>,             // keep raw bytes for re-checksum on writes (future)
+    pub raw: Vec<u8>, // keep raw bytes for re-checksum on writes (future)
 }
 
 impl Superblock {
@@ -53,7 +53,10 @@ impl Superblock {
 
         let magic = u16::from_le_bytes([raw[0x38], raw[0x39]]);
         if magic != EXT4_MAGIC {
-            return Err(Error::BadMagic { found: magic, expected: EXT4_MAGIC });
+            return Err(Error::BadMagic {
+                found: magic,
+                expected: EXT4_MAGIC,
+            });
         }
 
         let inodes_count = u32::from_le_bytes(raw[0x00..0x04].try_into().unwrap());
@@ -74,13 +77,19 @@ impl Superblock {
         };
         let feature_compat = if rev_level >= 1 {
             u32::from_le_bytes(raw[0x5C..0x60].try_into().unwrap())
-        } else { 0 };
+        } else {
+            0
+        };
         let feature_incompat = if rev_level >= 1 {
             u32::from_le_bytes(raw[0x60..0x64].try_into().unwrap())
-        } else { 0 };
+        } else {
+            0
+        };
         let feature_ro_compat = if rev_level >= 1 {
             u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap())
-        } else { 0 };
+        } else {
+            0
+        };
 
         let mut uuid = [0u8; 16];
         uuid.copy_from_slice(&raw[0x68..0x78]);
@@ -96,7 +105,7 @@ impl Superblock {
         let mut hash_seed = [0u32; 4];
         for i in 0..4 {
             let off = 0xEC + i * 4;
-            hash_seed[i] = u32::from_le_bytes(raw[off..off+4].try_into().unwrap());
+            hash_seed[i] = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
         }
         let default_hash_version = raw[0xFC];
 
@@ -105,7 +114,8 @@ impl Superblock {
         let free_blocks_count_hi = u32::from_le_bytes(raw[0x158..0x15C].try_into().unwrap());
 
         let blocks_count = ((blocks_count_hi as u64) << 32) | (blocks_count_lo as u64);
-        let free_blocks_count = ((free_blocks_count_hi as u64) << 32) | (free_blocks_count_lo as u64);
+        let free_blocks_count =
+            ((free_blocks_count_hi as u64) << 32) | (free_blocks_count_lo as u64);
 
         let checksum_seed = u32::from_le_bytes(raw[0x270..0x274].try_into().unwrap());
         let journal_inode = u32::from_le_bytes(raw[0xE0..0xE4].try_into().unwrap());

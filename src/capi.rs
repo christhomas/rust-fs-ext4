@@ -34,6 +34,10 @@
 //!   storage; valid until the next FFI call on the same thread.
 
 #![allow(non_camel_case_types)]
+// Module-level docs (above) cover the FFI memory-ownership contract for
+// every exported unsafe fn; per-function `# Safety` sections would be
+// near-duplicates.
+#![allow(clippy::missing_safety_doc)]
 
 use crate::block_io::{BlockDevice, CallbackDevice, FileDevice};
 use crate::dir::{self, DirBlockIter, DirEntryType};
@@ -265,30 +269,33 @@ fn fill_attr(out: &mut ext4rs_attr_t, ino: u32, inode: &Inode) {
 /// Mount an ext4 filesystem from a device path. Returns NULL on failure.
 #[no_mangle]
 pub unsafe extern "C" fn ext4rs_mount(device_path: *const c_char) -> *mut ext4rs_fs_t {
-    ffi_guard(std::ptr::null_mut(), AssertUnwindSafe(|| {
-        clear_last_error();
-        let path = cstr_to_str(device_path);
-        if path.is_empty() {
-            set_err_msg("null or empty device_path", EINVAL);
-            return std::ptr::null_mut();
-        }
-
-        let dev = match FileDevice::open(path) {
-            Ok(d) => Arc::new(d) as Arc<dyn BlockDevice>,
-            Err(e) => {
-                set_err_from(&e, &format!("open {path}"));
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            let path = cstr_to_str(device_path);
+            if path.is_empty() {
+                set_err_msg("null or empty device_path", EINVAL);
                 return std::ptr::null_mut();
             }
-        };
 
-        match Filesystem::mount(dev) {
-            Ok(fs) => Box::into_raw(Box::new(ext4rs_fs_t { fs })),
-            Err(e) => {
-                set_err_from(&e, &format!("mount {path}"));
-                std::ptr::null_mut()
+            let dev = match FileDevice::open(path) {
+                Ok(d) => Arc::new(d) as Arc<dyn BlockDevice>,
+                Err(e) => {
+                    set_err_from(&e, &format!("open {path}"));
+                    return std::ptr::null_mut();
+                }
+            };
+
+            match Filesystem::mount(dev) {
+                Ok(fs) => Box::into_raw(Box::new(ext4rs_fs_t { fs })),
+                Err(e) => {
+                    set_err_from(&e, &format!("mount {path}"));
+                    std::ptr::null_mut()
+                }
             }
-        }
-    }))
+        }),
+    )
 }
 
 /// Mount via a caller-supplied read callback.
@@ -296,14 +303,13 @@ pub unsafe extern "C" fn ext4rs_mount(device_path: *const c_char) -> *mut ext4rs
 pub unsafe extern "C" fn ext4rs_mount_with_callbacks(
     cfg: *const ext4rs_blockdev_cfg_t,
 ) -> *mut ext4rs_fs_t {
-    ffi_guard(std::ptr::null_mut(), AssertUnwindSafe(|| {
-        mount_with_callbacks_inner(cfg)
-    }))
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| mount_with_callbacks_inner(cfg)),
+    )
 }
 
-unsafe fn mount_with_callbacks_inner(
-    cfg: *const ext4rs_blockdev_cfg_t,
-) -> *mut ext4rs_fs_t {
+unsafe fn mount_with_callbacks_inner(cfg: *const ext4rs_blockdev_cfg_t) -> *mut ext4rs_fs_t {
     clear_last_error();
     if cfg.is_null() {
         set_err_msg("null cfg", EINVAL);
@@ -362,11 +368,14 @@ unsafe fn mount_with_callbacks_inner(
 /// Unmount and free the filesystem handle.
 #[no_mangle]
 pub unsafe extern "C" fn ext4rs_umount(fs: *mut ext4rs_fs_t) {
-    ffi_guard((), AssertUnwindSafe(|| {
-        if !fs.is_null() {
-            drop(Box::from_raw(fs));
-        }
-    }))
+    ffi_guard(
+        (),
+        AssertUnwindSafe(|| {
+            if !fs.is_null() {
+                drop(Box::from_raw(fs));
+            }
+        }),
+    )
 }
 
 // ===========================================================================
@@ -379,34 +388,37 @@ pub unsafe extern "C" fn ext4rs_get_volume_info(
     fs: *mut ext4rs_fs_t,
     info: *mut ext4rs_volume_info_t,
 ) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || info.is_null() {
-            set_err_msg("null fs or info", EINVAL);
-            return -1;
-        }
-        let fs = &(*fs).fs;
-        let info = &mut *info;
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || info.is_null() {
+                set_err_msg("null fs or info", EINVAL);
+                return -1;
+            }
+            let fs = &(*fs).fs;
+            let info = &mut *info;
 
-        // Zero the struct
-        std::ptr::write_bytes(info as *mut ext4rs_volume_info_t, 0, 1);
+            // Zero the struct
+            std::ptr::write_bytes(info as *mut ext4rs_volume_info_t, 0, 1);
 
-        // Copy volume name (up to 16 bytes incl. NUL)
-        let name_bytes = fs.sb.volume_name.as_bytes();
-        let copy_len = name_bytes.len().min(15);
-        for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
-            info.volume_name[i] = b as c_char;
-        }
-        info.volume_name[copy_len] = 0;
+            // Copy volume name (up to 16 bytes incl. NUL)
+            let name_bytes = fs.sb.volume_name.as_bytes();
+            let copy_len = name_bytes.len().min(15);
+            for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
+                info.volume_name[i] = b as c_char;
+            }
+            info.volume_name[copy_len] = 0;
 
-        info.block_size = fs.sb.block_size();
-        info.total_blocks = fs.sb.blocks_count;
-        info.free_blocks = fs.sb.free_blocks_count;
-        info.total_inodes = fs.sb.inodes_count;
-        info.free_inodes = fs.sb.free_inodes_count;
+            info.block_size = fs.sb.block_size();
+            info.total_blocks = fs.sb.blocks_count;
+            info.free_blocks = fs.sb.free_blocks_count;
+            info.total_inodes = fs.sb.inodes_count;
+            info.free_inodes = fs.sb.free_inodes_count;
 
-        0
-    }))
+            0
+        }),
+    )
 }
 
 // ===========================================================================
@@ -442,35 +454,38 @@ pub unsafe extern "C" fn ext4rs_stat(
     path: *const c_char,
     attr: *mut ext4rs_attr_t,
 ) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() || attr.is_null() {
-            set_err_msg("null fs, path, or attr", EINVAL);
-            return -1;
-        }
-        let fs = &(*fs).fs;
-        let path = cstr_to_str(path);
-        let attr = &mut *attr;
-
-        let ino = match resolve_path(fs, path) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("stat {path}"));
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() || attr.is_null() {
+                set_err_msg("null fs, path, or attr", EINVAL);
                 return -1;
             }
-        };
+            let fs = &(*fs).fs;
+            let path = cstr_to_str(path);
+            let attr = &mut *attr;
 
-        let (inode, _raw) = match fs.read_inode_verified(ino) {
-            Ok(p) => p,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
-                return -1;
-            }
-        };
+            let ino = match resolve_path(fs, path) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("stat {path}"));
+                    return -1;
+                }
+            };
 
-        fill_attr(attr, ino, &inode);
-        0
-    }))
+            let (inode, _raw) = match fs.read_inode_verified(ino) {
+                Ok(p) => p,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return -1;
+                }
+            };
+
+            fill_attr(attr, ino, &inode);
+            0
+        }),
+    )
 }
 
 /// Open a directory for iteration. Returns NULL on failure.
@@ -479,50 +494,53 @@ pub unsafe extern "C" fn ext4rs_dir_open(
     fs: *mut ext4rs_fs_t,
     path: *const c_char,
 ) -> *mut ext4rs_dir_iter_t {
-    ffi_guard(std::ptr::null_mut(), AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs or path", EINVAL);
-            return std::ptr::null_mut();
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-
-        let ino = match resolve_path(fs_ref, path_str) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("dir_open {path_str}"));
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs or path", EINVAL);
                 return std::ptr::null_mut();
             }
-        };
-        let (inode, _raw) = match fs_ref.read_inode_verified(ino) {
-            Ok(p) => p,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("dir_open {path_str}"));
+                    return std::ptr::null_mut();
+                }
+            };
+            let (inode, _raw) = match fs_ref.read_inode_verified(ino) {
+                Ok(p) => p,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return std::ptr::null_mut();
+                }
+            };
+            if !inode.is_dir() {
+                set_err_msg(&format!("dir_open {path_str}: not a directory"), ENOTDIR);
                 return std::ptr::null_mut();
             }
-        };
-        if !inode.is_dir() {
-            set_err_msg(&format!("dir_open {path_str}: not a directory"), ENOTDIR);
-            return std::ptr::null_mut();
-        }
 
-        // Collect entries from all dir data blocks.
-        let entries = match collect_dir_entries(fs_ref, &inode) {
-            Ok(e) => e,
-            Err(e) => {
-                set_err_from(&e, &format!("read directory {path_str}"));
-                return std::ptr::null_mut();
-            }
-        };
+            // Collect entries from all dir data blocks.
+            let entries = match collect_dir_entries(fs_ref, &inode) {
+                Ok(e) => e,
+                Err(e) => {
+                    set_err_from(&e, &format!("read directory {path_str}"));
+                    return std::ptr::null_mut();
+                }
+            };
 
-        let iter = Box::new(ext4rs_dir_iter_t {
-            entries,
-            position: 0,
-            current: std::mem::zeroed(),
-        });
-        Box::into_raw(iter)
-    }))
+            let iter = Box::new(ext4rs_dir_iter_t {
+                entries,
+                position: 0,
+                current: std::mem::zeroed(),
+            });
+            Box::into_raw(iter)
+        }),
+    )
 }
 
 /// Read all directory entries from an inode into `ext4rs_dirent_t`s.
@@ -593,38 +611,42 @@ fn dir_entry_to_bridge(e: &dir::DirEntry) -> ext4rs_dirent_t {
 
 /// Get the next dir entry. Returns NULL at end or on error.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_dir_next(
-    iter: *mut ext4rs_dir_iter_t,
-) -> *const ext4rs_dirent_t {
-    ffi_guard(std::ptr::null(), AssertUnwindSafe(|| {
-        if iter.is_null() {
-            return std::ptr::null();
-        }
-        let iter = &mut *iter;
-        if iter.position >= iter.entries.len() {
-            return std::ptr::null();
-        }
-        // Copy into the iterator's `current` buffer so the returned pointer
-        // remains valid until the next _dir_next / _dir_close call.
-        iter.current = ext4rs_dirent_t {
-            inode: iter.entries[iter.position].inode,
-            file_type: iter.entries[iter.position].file_type,
-            name_len: iter.entries[iter.position].name_len,
-            name: iter.entries[iter.position].name,
-        };
-        iter.position += 1;
-        &iter.current
-    }))
+pub unsafe extern "C" fn ext4rs_dir_next(iter: *mut ext4rs_dir_iter_t) -> *const ext4rs_dirent_t {
+    ffi_guard(
+        std::ptr::null(),
+        AssertUnwindSafe(|| {
+            if iter.is_null() {
+                return std::ptr::null();
+            }
+            let iter = &mut *iter;
+            if iter.position >= iter.entries.len() {
+                return std::ptr::null();
+            }
+            // Copy into the iterator's `current` buffer so the returned pointer
+            // remains valid until the next _dir_next / _dir_close call.
+            iter.current = ext4rs_dirent_t {
+                inode: iter.entries[iter.position].inode,
+                file_type: iter.entries[iter.position].file_type,
+                name_len: iter.entries[iter.position].name_len,
+                name: iter.entries[iter.position].name,
+            };
+            iter.position += 1;
+            &iter.current
+        }),
+    )
 }
 
 /// Close a directory iterator.
 #[no_mangle]
 pub unsafe extern "C" fn ext4rs_dir_close(iter: *mut ext4rs_dir_iter_t) {
-    ffi_guard((), AssertUnwindSafe(|| {
-        if !iter.is_null() {
-            drop(Box::from_raw(iter));
-        }
-    }))
+    ffi_guard(
+        (),
+        AssertUnwindSafe(|| {
+            if !iter.is_null() {
+                drop(Box::from_raw(iter));
+            }
+        }),
+    )
 }
 
 /// Read bytes from a file. Returns bytes read, or -1 on failure.
@@ -636,43 +658,48 @@ pub unsafe extern "C" fn ext4rs_read_file(
     offset: u64,
     length: u64,
 ) -> i64 {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() || buf.is_null() {
-            set_err_msg("null fs, path, or buf", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-
-        let ino = match resolve_path(fs_ref, path_str) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("read_file {path_str}"));
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() || buf.is_null() {
+                set_err_msg("null fs, path, or buf", EINVAL);
                 return -1;
             }
-        };
-        let (inode, inode_raw) = match fs_ref.read_inode_verified(ino) {
-            Ok(p) => p,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("read_file {path_str}"));
+                    return -1;
+                }
+            };
+            let (inode, inode_raw) = match fs_ref.read_inode_verified(ino) {
+                Ok(p) => p,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return -1;
+                }
+            };
+            if !inode.is_file() {
+                set_err_msg(&format!("read_file {path_str}: not a regular file"), EINVAL);
                 return -1;
             }
-        };
-        if !inode.is_file() {
-            set_err_msg(&format!("read_file {path_str}: not a regular file"), EINVAL);
-            return -1;
-        }
 
-        let out = std::slice::from_raw_parts_mut(buf as *mut u8, length as usize);
-        match file_io::read_with_raw_verified(fs_ref, &inode, &inode_raw, ino, offset, length, out) {
-            Ok(n) => n as i64,
-            Err(e) => {
-                set_err_from(&e, &format!("read_file {path_str}"));
-                -1
+            let out = std::slice::from_raw_parts_mut(buf as *mut u8, length as usize);
+            match file_io::read_with_raw_verified(
+                fs_ref, &inode, &inode_raw, ino, offset, length, out,
+            ) {
+                Ok(n) => n as i64,
+                Err(e) => {
+                    set_err_from(&e, &format!("read_file {path_str}"));
+                    -1
+                }
             }
-        }
-    }))
+        }),
+    )
 }
 
 /// Read a symlink target. Returns 0 on success, -1 on failure.
@@ -685,57 +712,60 @@ pub unsafe extern "C" fn ext4rs_readlink(
     buf: *mut c_char,
     bufsize: usize,
 ) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() || buf.is_null() || bufsize == 0 {
-            set_err_msg("null fs/path/buf or zero bufsize", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-
-        let ino = match resolve_path(fs_ref, path_str) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("readlink {path_str}"));
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() || buf.is_null() || bufsize == 0 {
+                set_err_msg("null fs/path/buf or zero bufsize", EINVAL);
                 return -1;
             }
-        };
-        let (inode, _raw) = match fs_ref.read_inode_verified(ino) {
-            Ok(p) => p,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
-                return -1;
-            }
-        };
-        if !inode.is_symlink() {
-            set_err_msg(&format!("readlink {path_str}: not a symlink"), EINVAL);
-            return -1;
-        }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
 
-        // Fast symlink: target < 60 bytes, stored inline in i_block.
-        // Long symlink: target stored in data blocks, read via file_io.
-        let target = if inode.size < 60 {
-            inode.block[..inode.size as usize].to_vec()
-        } else {
-            let mut out = vec![0u8; inode.size as usize];
-            match file_io::read_verified(fs_ref, &inode, ino, 0, inode.size, &mut out) {
-                Ok(_) => out,
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
                 Err(e) => {
                     set_err_from(&e, &format!("readlink {path_str}"));
                     return -1;
                 }
+            };
+            let (inode, _raw) = match fs_ref.read_inode_verified(ino) {
+                Ok(p) => p,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return -1;
+                }
+            };
+            if !inode.is_symlink() {
+                set_err_msg(&format!("readlink {path_str}: not a symlink"), EINVAL);
+                return -1;
             }
-        };
 
-        // Copy to output buffer with null terminator, truncating if needed.
-        let copy_len = target.len().min(bufsize - 1);
-        let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
-        out[..copy_len].copy_from_slice(&target[..copy_len]);
-        out[copy_len] = 0;
+            // Fast symlink: target < 60 bytes, stored inline in i_block.
+            // Long symlink: target stored in data blocks, read via file_io.
+            let target = if inode.size < 60 {
+                inode.block[..inode.size as usize].to_vec()
+            } else {
+                let mut out = vec![0u8; inode.size as usize];
+                match file_io::read_verified(fs_ref, &inode, ino, 0, inode.size, &mut out) {
+                    Ok(_) => out,
+                    Err(e) => {
+                        set_err_from(&e, &format!("readlink {path_str}"));
+                        return -1;
+                    }
+                }
+            };
 
-        0
-    }))
+            // Copy to output buffer with null terminator, truncating if needed.
+            let copy_len = target.len().min(bufsize - 1);
+            let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
+            out[..copy_len].copy_from_slice(&target[..copy_len]);
+            out[copy_len] = 0;
+
+            0
+        }),
+    )
 }
 
 // ===========================================================================
@@ -751,63 +781,66 @@ pub unsafe extern "C" fn ext4rs_listxattr(
     buf: *mut c_char,
     bufsize: usize,
 ) -> i64 {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs or path", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-
-        let ino = match resolve_path(fs_ref, path_str) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("listxattr {path_str}"));
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs or path", EINVAL);
                 return -1;
             }
-        };
-        let (inode, inode_raw) = match fs_ref.read_inode_verified(ino) {
-            Ok(p) => p,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
-                return -1;
-            }
-        };
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
 
-        let entries = match xattr::read_all(
-            fs_ref.dev.as_ref(),
-            &inode,
-            &inode_raw,
-            fs_ref.sb.inode_size,
-            fs_ref.sb.block_size(),
-        ) {
-            Ok(v) => v,
-            Err(e) => {
-                set_err_from(&e, &format!("listxattr {path_str}"));
-                return -1;
-            }
-        };
-
-        let required: usize = entries.iter().map(|e| e.name.len() + 1).sum();
-
-        if !buf.is_null() && bufsize > 0 {
-            let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
-            let mut pos = 0;
-            for e in &entries {
-                let name_bytes = e.name.as_bytes();
-                let needed = name_bytes.len() + 1;
-                if pos + needed > bufsize {
-                    break;
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("listxattr {path_str}"));
+                    return -1;
                 }
-                out[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
-                out[pos + name_bytes.len()] = 0;
-                pos += needed;
-            }
-        }
+            };
+            let (inode, inode_raw) = match fs_ref.read_inode_verified(ino) {
+                Ok(p) => p,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return -1;
+                }
+            };
 
-        required as i64
-    }))
+            let entries = match xattr::read_all(
+                fs_ref.dev.as_ref(),
+                &inode,
+                &inode_raw,
+                fs_ref.sb.inode_size,
+                fs_ref.sb.block_size(),
+            ) {
+                Ok(v) => v,
+                Err(e) => {
+                    set_err_from(&e, &format!("listxattr {path_str}"));
+                    return -1;
+                }
+            };
+
+            let required: usize = entries.iter().map(|e| e.name.len() + 1).sum();
+
+            if !buf.is_null() && bufsize > 0 {
+                let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
+                let mut pos = 0;
+                for e in &entries {
+                    let name_bytes = e.name.as_bytes();
+                    let needed = name_bytes.len() + 1;
+                    if pos + needed > bufsize {
+                        break;
+                    }
+                    out[pos..pos + name_bytes.len()].copy_from_slice(name_bytes);
+                    out[pos + name_bytes.len()] = 0;
+                    pos += needed;
+                }
+            }
+
+            required as i64
+        }),
+    )
 }
 
 /// Get a single xattr value by fully-qualified name.
@@ -820,58 +853,64 @@ pub unsafe extern "C" fn ext4rs_getxattr(
     buf: *mut c_void,
     bufsize: usize,
 ) -> i64 {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() || name.is_null() {
-            set_err_msg("null fs, path, or name", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-        let name_str = cstr_to_str(name);
-
-        let ino = match resolve_path(fs_ref, path_str) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("getxattr {path_str}"));
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() || name.is_null() {
+                set_err_msg("null fs, path, or name", EINVAL);
                 return -1;
             }
-        };
-        let (inode, inode_raw) = match fs_ref.read_inode_verified(ino) {
-            Ok(p) => p,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
-                return -1;
-            }
-        };
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            let name_str = cstr_to_str(name);
 
-        let value = match xattr::get(
-            fs_ref.dev.as_ref(),
-            &inode,
-            &inode_raw,
-            fs_ref.sb.inode_size,
-            fs_ref.sb.block_size(),
-            name_str,
-        ) {
-            Ok(Some(v)) => v,
-            Ok(None) => {
-                set_err_msg(&format!("getxattr {path_str}: {name_str} not found"), ENOENT);
-                return -1;
-            }
-            Err(e) => {
-                set_err_from(&e, &format!("getxattr {path_str} {name_str}"));
-                return -1;
-            }
-        };
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("getxattr {path_str}"));
+                    return -1;
+                }
+            };
+            let (inode, inode_raw) = match fs_ref.read_inode_verified(ino) {
+                Ok(p) => p,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return -1;
+                }
+            };
 
-        if !buf.is_null() && bufsize > 0 {
-            let copy_len = value.len().min(bufsize);
-            let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
-            out[..copy_len].copy_from_slice(&value[..copy_len]);
-        }
+            let value = match xattr::get(
+                fs_ref.dev.as_ref(),
+                &inode,
+                &inode_raw,
+                fs_ref.sb.inode_size,
+                fs_ref.sb.block_size(),
+                name_str,
+            ) {
+                Ok(Some(v)) => v,
+                Ok(None) => {
+                    set_err_msg(
+                        &format!("getxattr {path_str}: {name_str} not found"),
+                        ENOENT,
+                    );
+                    return -1;
+                }
+                Err(e) => {
+                    set_err_from(&e, &format!("getxattr {path_str} {name_str}"));
+                    return -1;
+                }
+            };
 
-        value.len() as i64
-    }))
+            if !buf.is_null() && bufsize > 0 {
+                let copy_len = value.len().min(bufsize);
+                let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
+                out[..copy_len].copy_from_slice(&value[..copy_len]);
+            }
+
+            value.len() as i64
+        }),
+    )
 }
 
 // ===========================================================================
@@ -891,60 +930,63 @@ pub unsafe extern "C" fn ext4rs_truncate(
     path: *const c_char,
     new_size: u64,
 ) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs/path", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-        let ino = match resolve_path(fs_ref, path_str) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("truncate {path_str}"));
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
                 return -1;
             }
-        };
-        // Type guard: truncating a directory corrupts it (frees data blocks,
-        // loses . and .. entries). POSIX ftruncate(2) mandates EISDIR on dir.
-        // Symlinks, devices, sockets are also not truncatable → EINVAL.
-        let inode = match fs_ref.read_inode_verified(ino) {
-            Ok((i, _)) => i,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("truncate {path_str}"));
+                    return -1;
+                }
+            };
+            // Type guard: truncating a directory corrupts it (frees data blocks,
+            // loses . and .. entries). POSIX ftruncate(2) mandates EISDIR on dir.
+            // Symlinks, devices, sockets are also not truncatable → EINVAL.
+            let inode = match fs_ref.read_inode_verified(ino) {
+                Ok((i, _)) => i,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return -1;
+                }
+            };
+            if inode.is_dir() {
+                set_err_msg(&format!("truncate {path_str}: is a directory"), EISDIR);
                 return -1;
             }
-        };
-        if inode.is_dir() {
-            set_err_msg(&format!("truncate {path_str}: is a directory"), EISDIR);
-            return -1;
-        }
-        if !inode.is_file() {
-            set_err_msg(&format!("truncate {path_str}: not a regular file"), EINVAL);
-            return -1;
-        }
-        // Growing via truncate isn't supported (sparse-grow was trivial but
-        // unused by current callers). Surface EINVAL rather than letting
-        // apply_truncate_shrink return Error::Corrupt → EIO.
-        if new_size > inode.size {
-            set_err_msg(
-                &format!(
-                    "truncate {path_str}: grow not supported ({new_size} > {})",
-                    inode.size
-                ),
-                EINVAL,
-            );
-            return -1;
-        }
-        match fs_ref.apply_truncate_shrink(ino, new_size) {
-            Ok(()) => 0,
-            Err(e) => {
-                set_err_from(&e, &format!("truncate {path_str} -> {new_size}"));
-                -1
+            if !inode.is_file() {
+                set_err_msg(&format!("truncate {path_str}: not a regular file"), EINVAL);
+                return -1;
             }
-        }
-    }))
+            // Growing via truncate isn't supported (sparse-grow was trivial but
+            // unused by current callers). Surface EINVAL rather than letting
+            // apply_truncate_shrink return Error::Corrupt → EIO.
+            if new_size > inode.size {
+                set_err_msg(
+                    &format!(
+                        "truncate {path_str}: grow not supported ({new_size} > {})",
+                        inode.size
+                    ),
+                    EINVAL,
+                );
+                return -1;
+            }
+            match fs_ref.apply_truncate_shrink(ino, new_size) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("truncate {path_str} -> {new_size}"));
+                    -1
+                }
+            }
+        }),
+    )
 }
 
 /// Remove a file entry at `path`. Requires a R/W mount.
@@ -957,26 +999,26 @@ pub unsafe extern "C" fn ext4rs_truncate(
 /// Returns 0 on success, -1 on failure with details in
 /// `ext4rs_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_unlink(
-    fs: *mut ext4rs_fs_t,
-    path: *const c_char,
-) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs/path", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-        match fs_ref.apply_unlink(path_str) {
-            Ok(()) => 0,
-            Err(e) => {
-                set_err_from(&e, &format!("unlink {path_str}"));
-                -1
+pub unsafe extern "C" fn ext4rs_unlink(fs: *mut ext4rs_fs_t, path: *const c_char) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return -1;
             }
-        }
-    }))
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_unlink(path_str) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("unlink {path_str}"));
+                    -1
+                }
+            }
+        }),
+    )
 }
 
 /// Create a new empty regular file at `path` with permission bits `mode`
@@ -992,22 +1034,25 @@ pub unsafe extern "C" fn ext4rs_create(
     path: *const c_char,
     mode: u16,
 ) -> u32 {
-    ffi_guard(0u32, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs/path", EINVAL);
-            return 0u32;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-        match fs_ref.apply_create(path_str, mode) {
-            Ok(ino) => ino,
-            Err(e) => {
-                set_err_from(&e, &format!("create {path_str}"));
-                0u32
+    ffi_guard(
+        0u32,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return 0u32;
             }
-        }
-    }))
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_create(path_str, mode) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    set_err_from(&e, &format!("create {path_str}"));
+                    0u32
+                }
+            }
+        }),
+    )
 }
 
 /// Replace the content of `path` with `len` bytes from `data`. The file
@@ -1025,56 +1070,62 @@ pub unsafe extern "C" fn ext4rs_write_file(
     data: *const c_void,
     len: u64,
 ) -> i64 {
-    ffi_guard(-1i64, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs/path", EINVAL);
-            return -1;
-        }
-        if data.is_null() && len > 0 {
-            set_err_msg("null data with non-zero len", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-        // Type guard at the capi level — mirrors ext4rs_truncate so the
-        // caller gets EISDIR/EINVAL instead of Error::Corrupt → EIO when
-        // the target is the wrong kind of file.
-        let ino = match resolve_path(fs_ref, path_str) {
-            Ok(n) => n,
-            Err(e) => {
-                set_err_from(&e, &format!("write_file {path_str}"));
+    ffi_guard(
+        -1i64,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
                 return -1;
             }
-        };
-        let inode = match fs_ref.read_inode_verified(ino) {
-            Ok((i, _)) => i,
-            Err(e) => {
-                set_err_from(&e, &format!("read inode {ino}"));
+            if data.is_null() && len > 0 {
+                set_err_msg("null data with non-zero len", EINVAL);
                 return -1;
             }
-        };
-        if inode.is_dir() {
-            set_err_msg(&format!("write_file {path_str}: is a directory"), EISDIR);
-            return -1;
-        }
-        if !inode.is_file() {
-            set_err_msg(&format!("write_file {path_str}: not a regular file"), EINVAL);
-            return -1;
-        }
-        let slice: &[u8] = if len == 0 {
-            &[]
-        } else {
-            std::slice::from_raw_parts(data as *const u8, len as usize)
-        };
-        match fs_ref.apply_replace_file_content(path_str, slice) {
-            Ok(new_size) => new_size as i64,
-            Err(e) => {
-                set_err_from(&e, &format!("write_file {path_str} ({len} bytes)"));
-                -1
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            // Type guard at the capi level — mirrors ext4rs_truncate so the
+            // caller gets EISDIR/EINVAL instead of Error::Corrupt → EIO when
+            // the target is the wrong kind of file.
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("write_file {path_str}"));
+                    return -1;
+                }
+            };
+            let inode = match fs_ref.read_inode_verified(ino) {
+                Ok((i, _)) => i,
+                Err(e) => {
+                    set_err_from(&e, &format!("read inode {ino}"));
+                    return -1;
+                }
+            };
+            if inode.is_dir() {
+                set_err_msg(&format!("write_file {path_str}: is a directory"), EISDIR);
+                return -1;
             }
-        }
-    }))
+            if !inode.is_file() {
+                set_err_msg(
+                    &format!("write_file {path_str}: not a regular file"),
+                    EINVAL,
+                );
+                return -1;
+            }
+            let slice: &[u8] = if len == 0 {
+                &[]
+            } else {
+                std::slice::from_raw_parts(data as *const u8, len as usize)
+            };
+            match fs_ref.apply_replace_file_content(path_str, slice) {
+                Ok(new_size) => new_size as i64,
+                Err(e) => {
+                    set_err_from(&e, &format!("write_file {path_str} ({len} bytes)"));
+                    -1
+                }
+            }
+        }),
+    )
 }
 
 /// Mount an ext4 filesystem read-write. Companion to `ext4rs_mount`.
@@ -1082,28 +1133,31 @@ pub unsafe extern "C" fn ext4rs_write_file(
 /// before returning.
 #[no_mangle]
 pub unsafe extern "C" fn ext4rs_mount_rw(device_path: *const c_char) -> *mut ext4rs_fs_t {
-    ffi_guard(std::ptr::null_mut(), AssertUnwindSafe(|| {
-        clear_last_error();
-        let path = cstr_to_str(device_path);
-        if path.is_empty() {
-            set_err_msg("null or empty device_path", EINVAL);
-            return std::ptr::null_mut();
-        }
-        let dev = match FileDevice::open_rw(path) {
-            Ok(d) => Arc::new(d) as Arc<dyn BlockDevice>,
-            Err(e) => {
-                set_err_from(&e, &format!("open_rw {path}"));
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            let path = cstr_to_str(device_path);
+            if path.is_empty() {
+                set_err_msg("null or empty device_path", EINVAL);
                 return std::ptr::null_mut();
             }
-        };
-        match Filesystem::mount(dev) {
-            Ok(fs) => Box::into_raw(Box::new(ext4rs_fs_t { fs })),
-            Err(e) => {
-                set_err_from(&e, &format!("mount_rw {path}"));
-                std::ptr::null_mut()
+            let dev = match FileDevice::open_rw(path) {
+                Ok(d) => Arc::new(d) as Arc<dyn BlockDevice>,
+                Err(e) => {
+                    set_err_from(&e, &format!("open_rw {path}"));
+                    return std::ptr::null_mut();
+                }
+            };
+            match Filesystem::mount(dev) {
+                Ok(fs) => Box::into_raw(Box::new(ext4rs_fs_t { fs })),
+                Err(e) => {
+                    set_err_from(&e, &format!("mount_rw {path}"));
+                    std::ptr::null_mut()
+                }
             }
-        }
-    }))
+        }),
+    )
 }
 
 /// Create a hard link at `dst` pointing at the same inode as `src`.
@@ -1116,23 +1170,26 @@ pub unsafe extern "C" fn ext4rs_link(
     src: *const c_char,
     dst: *const c_char,
 ) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || src.is_null() || dst.is_null() {
-            set_err_msg("null fs/src/dst", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let src_str = cstr_to_str(src);
-        let dst_str = cstr_to_str(dst);
-        match fs_ref.apply_link(src_str, dst_str) {
-            Ok(()) => 0,
-            Err(e) => {
-                set_err_from(&e, &format!("link {src_str} -> {dst_str}"));
-                -1
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || src.is_null() || dst.is_null() {
+                set_err_msg("null fs/src/dst", EINVAL);
+                return -1;
             }
-        }
-    }))
+            let fs_ref = &(*fs).fs;
+            let src_str = cstr_to_str(src);
+            let dst_str = cstr_to_str(dst);
+            match fs_ref.apply_link(src_str, dst_str) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("link {src_str} -> {dst_str}"));
+                    -1
+                }
+            }
+        }),
+    )
 }
 
 /// Rename / move `src` → `dst` within this mount. Works for files and
@@ -1145,74 +1202,76 @@ pub unsafe extern "C" fn ext4rs_rename(
     src: *const c_char,
     dst: *const c_char,
 ) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || src.is_null() || dst.is_null() {
-            set_err_msg("null fs/src/dst", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let src_str = cstr_to_str(src);
-        let dst_str = cstr_to_str(dst);
-        match fs_ref.apply_rename(src_str, dst_str) {
-            Ok(()) => 0,
-            Err(e) => {
-                set_err_from(&e, &format!("rename {src_str} -> {dst_str}"));
-                -1
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || src.is_null() || dst.is_null() {
+                set_err_msg("null fs/src/dst", EINVAL);
+                return -1;
             }
-        }
-    }))
+            let fs_ref = &(*fs).fs;
+            let src_str = cstr_to_str(src);
+            let dst_str = cstr_to_str(dst);
+            match fs_ref.apply_rename(src_str, dst_str) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("rename {src_str} -> {dst_str}"));
+                    -1
+                }
+            }
+        }),
+    )
 }
 
 /// Create a subdirectory at `path` with POSIX permission bits `mode` (low
 /// 12 bits used; file-type bits are set automatically). Returns the new
 /// directory's inode number on success, 0 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_mkdir(
-    fs: *mut ext4rs_fs_t,
-    path: *const c_char,
-    mode: u16,
-) -> u32 {
-    ffi_guard(0u32, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs/path", EINVAL);
-            return 0u32;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-        match fs_ref.apply_mkdir(path_str, mode) {
-            Ok(ino) => ino,
-            Err(e) => {
-                set_err_from(&e, &format!("mkdir {path_str}"));
-                0u32
+pub unsafe extern "C" fn ext4rs_mkdir(fs: *mut ext4rs_fs_t, path: *const c_char, mode: u16) -> u32 {
+    ffi_guard(
+        0u32,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return 0u32;
             }
-        }
-    }))
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_mkdir(path_str, mode) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    set_err_from(&e, &format!("mkdir {path_str}"));
+                    0u32
+                }
+            }
+        }),
+    )
 }
 
 /// Remove an empty directory at `path`. Fails if the directory contains
 /// entries other than `.` and `..`. Returns 0 on success, -1 on failure
 /// with details in `ext4rs_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_rmdir(
-    fs: *mut ext4rs_fs_t,
-    path: *const c_char,
-) -> c_int {
-    ffi_guard(-1, AssertUnwindSafe(|| {
-        clear_last_error();
-        if fs.is_null() || path.is_null() {
-            set_err_msg("null fs/path", EINVAL);
-            return -1;
-        }
-        let fs_ref = &(*fs).fs;
-        let path_str = cstr_to_str(path);
-        match fs_ref.apply_rmdir(path_str) {
-            Ok(()) => 0,
-            Err(e) => {
-                set_err_from(&e, &format!("rmdir {path_str}"));
-                -1
+pub unsafe extern "C" fn ext4rs_rmdir(fs: *mut ext4rs_fs_t, path: *const c_char) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return -1;
             }
-        }
-    }))
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_rmdir(path_str) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("rmdir {path_str}"));
+                    -1
+                }
+            }
+        }),
+    )
 }

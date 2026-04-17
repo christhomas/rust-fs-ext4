@@ -74,11 +74,21 @@ fn list_root_and_read_files() {
         let preview: String = data
             .iter()
             .take(200)
-            .map(|&b| if (32..127).contains(&b) { b as char } else { '.' })
+            .map(|&b| {
+                if (32..127).contains(&b) {
+                    b as char
+                } else {
+                    '.'
+                }
+            })
             .collect();
         println!("  preview: {preview:?}");
 
-        assert_eq!(data.len() as u64, inode.size, "read size mismatch for {name}");
+        assert_eq!(
+            data.len() as u64,
+            inode.size,
+            "read size mismatch for {name}"
+        );
         files_read += 1;
     }
 

@@ -28,7 +28,9 @@ fn try_mount(image: &str) -> Option<Filesystem> {
 
 #[test]
 fn journal_sb_round_trips_on_basic_image() {
-    let Some(fs) = try_mount("ext4-basic.img") else { return };
+    let Some(fs) = try_mount("ext4-basic.img") else {
+        return;
+    };
 
     let sb = jbd2::read_superblock(&fs).expect("read_superblock");
 
@@ -69,19 +71,33 @@ fn journal_sb_round_trips_on_basic_image() {
 
 #[test]
 fn journal_sb_on_csum_seed_image() {
-    let Some(fs) = try_mount("ext4-csum-seed.img") else { return };
-    let Ok(Some(jsb)) = jbd2::read_superblock(&fs) else { return };
+    let Some(fs) = try_mount("ext4-csum-seed.img") else {
+        return;
+    };
+    let Ok(Some(jsb)) = jbd2::read_superblock(&fs) else {
+        return;
+    };
     // On the Pi-style CSUM_SEED image we still expect a valid journal.
-    assert!(matches!(jsb.block_type, JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2));
+    assert!(matches!(
+        jsb.block_type,
+        JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2
+    ));
     assert_eq!(jsb.block_size, fs.sb.block_size());
     assert!(jsb.is_clean());
 }
 
 #[test]
 fn journal_sb_on_htree_image() {
-    let Some(fs) = try_mount("ext4-htree.img") else { return };
-    let Ok(Some(jsb)) = jbd2::read_superblock(&fs) else { return };
-    assert!(matches!(jsb.block_type, JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2));
+    let Some(fs) = try_mount("ext4-htree.img") else {
+        return;
+    };
+    let Ok(Some(jsb)) = jbd2::read_superblock(&fs) else {
+        return;
+    };
+    assert!(matches!(
+        jsb.block_type,
+        JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2
+    ));
     assert!(jsb.max_len > 0);
     assert!(jsb.is_clean());
 }

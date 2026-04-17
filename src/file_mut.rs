@@ -85,7 +85,11 @@ pub fn compute_write_range(offset: u64, length: u64, block_size: u32) -> Option<
     let first = offset / bs;
     let last = (offset + length - 1) / bs;
     let full_blocks = offset % bs == 0 && (offset + length) % bs == 0;
-    Some(WriteBlockRange { first, last, full_blocks })
+    Some(WriteBlockRange {
+        first,
+        last,
+        full_blocks,
+    })
 }
 
 /// Plan to grow `inode_size` to `new_size` without writing any data blocks.
@@ -141,7 +145,9 @@ pub fn plan_truncate_shrink(
     let mut entries: Vec<Extent> = Vec::new();
     for i in 0..header.entries {
         let off = crate::extent::EXT4_EXT_NODE_SIZE * (1 + i as usize);
-        entries.push(Extent::parse(&root_bytes[off..off + crate::extent::EXT4_EXT_NODE_SIZE])?);
+        entries.push(Extent::parse(
+            &root_bytes[off..off + crate::extent::EXT4_EXT_NODE_SIZE],
+        )?);
     }
 
     let mut muts: Vec<ExtentMutation> = Vec::new();
@@ -332,7 +338,12 @@ mod tests {
     }
 
     fn ext(log: u32, len: u16, phys: u64) -> Extent {
-        Extent { logical_block: log, length: len, physical_block: phys, uninitialized: false }
+        Extent {
+            logical_block: log,
+            length: len,
+            physical_block: phys,
+            uninitialized: false,
+        }
     }
 
     #[test]

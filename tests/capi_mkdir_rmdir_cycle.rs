@@ -10,10 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch(label: &str) -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
@@ -29,7 +26,9 @@ fn scratch(label: &str) -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -40,9 +39,14 @@ fn enumerate_root(fs_h: *mut ext4rs_fs_t) -> Vec<String> {
     let mut names = Vec::new();
     loop {
         let e = unsafe { ext4rs_dir_next(iter) };
-        if e.is_null() { break; }
+        if e.is_null() {
+            break;
+        }
         let ent = unsafe { &*e };
-        let b: Vec<u8> = ent.name[..ent.name_len as usize].iter().map(|b| *b as u8).collect();
+        let b: Vec<u8> = ent.name[..ent.name_len as usize]
+            .iter()
+            .map(|b| *b as u8)
+            .collect();
         names.push(String::from_utf8_lossy(&b).into_owned());
     }
     unsafe { ext4rs_dir_close(iter) };
@@ -63,7 +67,10 @@ fn mkdir_creates_an_enumerable_directory() {
 
         // Dir should be visible in root.
         let names = enumerate_root(fs_h);
-        assert!(names.contains(&"mynewdir".into()), "mkdir not in root: {names:?}");
+        assert!(
+            names.contains(&"mynewdir".into()),
+            "mkdir not in root: {names:?}"
+        );
 
         // New dir itself should be enumerable (at least . and ..).
         let iter = unsafe { ext4rs_dir_open(fs_h, new_dir.as_ptr()) };
@@ -71,7 +78,9 @@ fn mkdir_creates_an_enumerable_directory() {
         let mut count = 0;
         loop {
             let e = unsafe { ext4rs_dir_next(iter) };
-            if e.is_null() { break; }
+            if e.is_null() {
+                break;
+            }
             count += 1;
         }
         unsafe { ext4rs_dir_close(iter) };
@@ -117,9 +126,11 @@ fn mkdir_rmdir_cycle_leaves_root_clean() {
         assert_eq!(rc, 0, "rmdir after mkdir: {}", last_err());
 
         // Root listing should now match baseline exactly.
-        let after: std::collections::BTreeSet<String> =
-            enumerate_root(fs_h).into_iter().collect();
-        assert_eq!(after, baseline, "mkdir+rmdir cycle should leave root identical");
+        let after: std::collections::BTreeSet<String> = enumerate_root(fs_h).into_iter().collect();
+        assert_eq!(
+            after, baseline,
+            "mkdir+rmdir cycle should leave root identical"
+        );
 
         unsafe { ext4rs_umount(fs_h) };
     }

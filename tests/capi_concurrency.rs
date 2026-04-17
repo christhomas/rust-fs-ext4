@@ -16,10 +16,7 @@ use std::os::raw::c_void;
 use std::sync::Arc;
 use std::thread;
 
-const IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 /// `*mut ext4rs_fs_t` isn't Send by default. Wrap in a usize for
 /// cross-thread hand-off — the underlying filesystem IS thread-safe
@@ -52,7 +49,11 @@ fn errno_is_thread_isolated() {
         let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
         let rc = unsafe { ext4rs_stat(fs.get(), bad.as_ptr(), &mut attr) };
         assert_eq!(rc, -1);
-        assert_eq!(ext4rs_last_errno(), 2, "A: expected ENOENT after failed stat");
+        assert_eq!(
+            ext4rs_last_errno(),
+            2,
+            "A: expected ENOENT after failed stat"
+        );
     });
 
     let t_b = thread::spawn(move || {
@@ -162,7 +163,9 @@ fn concurrent_dir_iterations_do_not_interfere() {
                     let mut count = 0;
                     loop {
                         let e = unsafe { ext4rs_dir_next(iter) };
-                        if e.is_null() { break; }
+                        if e.is_null() {
+                            break;
+                        }
                         count += 1;
                     }
                     unsafe { ext4rs_dir_close(iter) };

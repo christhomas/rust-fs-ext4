@@ -17,10 +17,7 @@ use std::fs;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 
-const GOOD_IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const GOOD_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn last_err() -> String {
     unsafe {
@@ -57,7 +54,10 @@ fn hammer_all_entry_points(path: &str) {
         // Mount rejected — verify error plumbing worked.
         let errno = ext4rs_last_errno();
         assert_ne!(errno, 0, "mount failed but errno is 0 for {path}");
-        assert!(!last_err().is_empty(), "mount failed but last_error is empty");
+        assert!(
+            !last_err().is_empty(),
+            "mount failed but last_error is empty"
+        );
         return;
     }
 
@@ -101,13 +101,9 @@ fn hammer_all_entry_points(path: &str) {
     };
 
     // xattrs.
-    let _ = unsafe {
-        ext4rs_listxattr(fs, any.as_ptr(), std::ptr::null_mut(), 0)
-    };
+    let _ = unsafe { ext4rs_listxattr(fs, any.as_ptr(), std::ptr::null_mut(), 0) };
     let nm = CString::new("user.whatever").unwrap();
-    let _ = unsafe {
-        ext4rs_getxattr(fs, any.as_ptr(), nm.as_ptr(), std::ptr::null_mut(), 0)
-    };
+    let _ = unsafe { ext4rs_getxattr(fs, any.as_ptr(), nm.as_ptr(), std::ptr::null_mut(), 0) };
 
     unsafe { ext4rs_umount(fs) };
 }
@@ -347,13 +343,13 @@ fn dir_next_null_pointer_returns_null() {
 fn ntfs_image_mounted_as_ext4_rejected_cleanly() {
     // Real-world case: user points the FSKit extension at a non-ext4 disk.
     // Must fail at mount with a clear error — never blunder into garbage.
-    let ntfs_image = concat!(
-        env!("CARGO_MANIFEST_DIR"),
-        "/test-disks/ntfs-basic.img"
-    );
+    let ntfs_image = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ntfs-basic.img");
     let c = CString::new(ntfs_image).unwrap();
     let fs = unsafe { ext4rs_mount(c.as_ptr()) };
-    assert!(fs.is_null(), "mount of an NTFS image must NOT succeed as ext4");
+    assert!(
+        fs.is_null(),
+        "mount of an NTFS image must NOT succeed as ext4"
+    );
     let errno = ext4rs_last_errno();
     assert_ne!(errno, 0, "rejected mount must have non-zero errno");
     let err = last_err();

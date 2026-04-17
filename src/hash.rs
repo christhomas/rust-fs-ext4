@@ -103,8 +103,7 @@ fn legacy_hash(name: &[u8], signed: bool) -> u32 {
     for &b in name {
         let c = if signed { (b as i8) as i32 } else { b as i32 };
         // hash = prev + (hash * 7 + c)
-        let new = prev
-            .wrapping_add((hash.wrapping_mul(7)).wrapping_add(c as u32));
+        let new = prev.wrapping_add((hash.wrapping_mul(7)).wrapping_add(c as u32));
         prev = hash;
         hash = new;
     }
@@ -138,7 +137,11 @@ fn str_to_le32(name: &[u8], buf: &mut [u32], signed: bool) {
         for shift in (0..32).step_by(8) {
             if byte_idx < name.len() {
                 let b = name[byte_idx];
-                let val = if signed { (b as i8) as i32 as u32 } else { b as u32 };
+                let val = if signed {
+                    (b as i8) as i32 as u32
+                } else {
+                    b as u32
+                };
                 word = (word & !(0xFFu32 << shift)) | ((val & 0xFF) << shift);
             } else {
                 word = (word & !(0xFFu32 << shift)) | ((pad_byte & 0xFF) << shift);
@@ -226,11 +229,17 @@ fn ff(a: &mut u32, b: u32, c: u32, d: u32, x: u32, s: u32) {
     *a = rol(*a, s);
 }
 fn gg(a: &mut u32, b: u32, c: u32, d: u32, x: u32, s: u32) {
-    *a = a.wrapping_add(g(b, c, d)).wrapping_add(x).wrapping_add(0x5A82_7999);
+    *a = a
+        .wrapping_add(g(b, c, d))
+        .wrapping_add(x)
+        .wrapping_add(0x5A82_7999);
     *a = rol(*a, s);
 }
 fn hh(a: &mut u32, b: u32, c: u32, d: u32, x: u32, s: u32) {
-    *a = a.wrapping_add(h(b, c, d)).wrapping_add(x).wrapping_add(0x6ED9_EBA1);
+    *a = a
+        .wrapping_add(h(b, c, d))
+        .wrapping_add(x)
+        .wrapping_add(0x6ED9_EBA1);
     *a = rol(*a, s);
 }
 

@@ -101,14 +101,22 @@ fn unlink_first_hardlink_keeps_content_via_second_name() {
 
     // Create a hardlink, then unlink the original; the content must
     // remain reachable via the second name with nlink decremented to 1.
-    assert_eq!(link(fs, "/test.txt", "/aka.txt"), 0, "link: {}", last_err_str());
+    assert_eq!(
+        link(fs, "/test.txt", "/aka.txt"),
+        0,
+        "link: {}",
+        last_err_str()
+    );
     let original = stat(fs, "/test.txt");
 
     let p = CString::new("/test.txt").unwrap();
     let rc = unsafe { ext4rs_unlink(fs, p.as_ptr()) };
     assert_eq!(rc, 0, "unlink primary: {}", last_err_str());
     assert!(!path_exists(fs, "/test.txt"));
-    assert!(path_exists(fs, "/aka.txt"), "hardlink must survive primary unlink");
+    assert!(
+        path_exists(fs, "/aka.txt"),
+        "hardlink must survive primary unlink"
+    );
 
     let survivor = stat(fs, "/aka.txt");
     assert_eq!(survivor.inode, original.inode);
@@ -227,7 +235,10 @@ fn link_null_inputs_do_not_crash() {
 
     let s = CString::new("/test.txt").unwrap();
     let d = CString::new("/link.txt").unwrap();
-    assert_eq!(unsafe { ext4rs_link(std::ptr::null_mut(), s.as_ptr(), d.as_ptr()) }, -1);
+    assert_eq!(
+        unsafe { ext4rs_link(std::ptr::null_mut(), s.as_ptr(), d.as_ptr()) },
+        -1
+    );
     assert_eq!(unsafe { ext4rs_link(fs, std::ptr::null(), d.as_ptr()) }, -1);
     assert_eq!(unsafe { ext4rs_link(fs, s.as_ptr(), std::ptr::null()) }, -1);
 
@@ -248,7 +259,12 @@ fn can_chain_many_hardlinks() {
     let orig_nlink = stat(fs, "/test.txt").link_count;
     for i in 0..10 {
         let dst = format!("/link_{i}.txt");
-        assert_eq!(link(fs, "/test.txt", &dst), 0, "link {dst}: {}", last_err_str());
+        assert_eq!(
+            link(fs, "/test.txt", &dst),
+            0,
+            "link {dst}: {}",
+            last_err_str()
+        );
     }
     assert_eq!(stat(fs, "/test.txt").link_count, orig_nlink + 10);
 

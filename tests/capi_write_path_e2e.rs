@@ -14,10 +14,7 @@ use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch(label: &str) -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
@@ -33,7 +30,9 @@ fn scratch(label: &str) -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -65,9 +64,7 @@ fn create_write_rename_read_truncate_unlink_chain() {
         assert_eq!(n, payload.len() as i64, "write: {}", last_err());
 
         // rename into subdir
-        let rc = unsafe {
-            ext4rs_rename(fs_h, p_initial.as_ptr(), p_renamed.as_ptr())
-        };
+        let rc = unsafe { ext4rs_rename(fs_h, p_initial.as_ptr(), p_renamed.as_ptr()) };
         assert_eq!(rc, 0, "rename: {}", last_err());
 
         // read after rename — same payload

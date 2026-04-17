@@ -153,7 +153,11 @@ pub fn parse_node_entries(block: &[u8]) -> Result<(DxCountLimit, Vec<DxEntry>)> 
     Ok((cl, entries))
 }
 
-fn parse_entries_from(block: &[u8], start: usize, cl: DxCountLimit) -> Result<(DxCountLimit, Vec<DxEntry>)> {
+fn parse_entries_from(
+    block: &[u8],
+    start: usize,
+    cl: DxCountLimit,
+) -> Result<(DxCountLimit, Vec<DxEntry>)> {
     if cl.count == 0 {
         return Err(Error::Corrupt("dx node has zero entries"));
     }
@@ -289,16 +293,16 @@ mod tests {
         // dx_root_info (8 bytes at offset 24):
         //   reserved=0, hash_version=2 (TEA), info_length=8, indirect=0, flags=0
         buf[24..28].copy_from_slice(&0u32.to_le_bytes());
-        buf[28] = 2;   // TEA
-        buf[29] = 8;   // info_length
-        buf[30] = 0;   // indirect_levels
-        buf[31] = 0;   // unused_flags
+        buf[28] = 2; // TEA
+        buf[29] = 8; // info_length
+        buf[30] = 0; // indirect_levels
+        buf[31] = 0; // unused_flags
 
         // entries[0] at offset 32..40: hash slot overloaded with (limit, count),
         // block = 1 (sentinel slot — covers the low-hash range [0, entries[1].hash)).
         buf[32..34].copy_from_slice(&200u16.to_le_bytes()); // limit
-        buf[34..36].copy_from_slice(&2u16.to_le_bytes());   // count
-        buf[36..40].copy_from_slice(&1u32.to_le_bytes());   // entries[0].block
+        buf[34..36].copy_from_slice(&2u16.to_le_bytes()); // count
+        buf[36..40].copy_from_slice(&1u32.to_le_bytes()); // entries[0].block
 
         // entries[1] at offset 40..48: hash=0x80000000, block=2 (covers high hashes).
         buf[40..44].copy_from_slice(&0x8000_0000u32.to_le_bytes());
@@ -350,7 +354,8 @@ mod tests {
         // The closure won't be called when indirect_levels == 0.
         let result = lookup_leaf(b"any-name", &buf, &seed, |_| {
             unreachable!("should not descend with 0 indirect levels")
-        }).expect("lookup");
+        })
+        .expect("lookup");
         assert!(result.is_some());
         // We can't predict which block deterministically because the hash
         // depends on the name + seed, but it must be 1 or 2.

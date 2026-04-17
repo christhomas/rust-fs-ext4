@@ -10,10 +10,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch() -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
@@ -100,9 +97,7 @@ fn link_existing_destination_sets_eexist() {
 
 #[test]
 fn link_null_args_set_einval() {
-    let rc = unsafe {
-        ext4rs_link(std::ptr::null_mut(), std::ptr::null(), std::ptr::null())
-    };
+    let rc = unsafe { ext4rs_link(std::ptr::null_mut(), std::ptr::null(), std::ptr::null()) };
     assert_eq!(rc, -1);
     assert_eq!(ext4rs_last_errno(), 22);
 }

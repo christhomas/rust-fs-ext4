@@ -27,13 +27,20 @@ fn main() {
     // Volume info.
     let mut info: ext4rs_volume_info_t = unsafe { std::mem::zeroed() };
     if unsafe { ext4rs_get_volume_info(fs, &mut info) } == 0 {
-        let name_bytes: Vec<u8> =
-            info.volume_name.iter().take_while(|&&b| b != 0).map(|&b| b as u8).collect();
+        let name_bytes: Vec<u8> = info
+            .volume_name
+            .iter()
+            .take_while(|&&b| b != 0)
+            .map(|&b| b as u8)
+            .collect();
         let name = String::from_utf8_lossy(&name_bytes);
         println!(
             "mounted {path}: label={name:?} bs={} blocks={} free={} inodes={} free_inodes={}",
-            info.block_size, info.total_blocks, info.free_blocks,
-            info.total_inodes, info.free_inodes
+            info.block_size,
+            info.total_blocks,
+            info.free_blocks,
+            info.total_inodes,
+            info.free_inodes
         );
     }
 
@@ -46,7 +53,9 @@ fn main() {
         println!("root entries:");
         loop {
             let e = unsafe { ext4rs_dir_next(iter) };
-            if e.is_null() { break; }
+            if e.is_null() {
+                break;
+            }
             let entry = unsafe { &*e };
             let name_bytes: Vec<u8> = entry.name[..entry.name_len as usize]
                 .iter()
@@ -96,7 +105,9 @@ fn main() {
 fn last_err() -> String {
     unsafe {
         let p = ext4rs_last_error();
-        if p.is_null() { return "<null>".into(); }
+        if p.is_null() {
+            return "<null>".into();
+        }
         CStr::from_ptr(p).to_string_lossy().into_owned()
     }
 }

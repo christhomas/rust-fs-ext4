@@ -104,8 +104,7 @@ pub fn decode(buf: &[u8]) -> Result<Vec<AclEntry>> {
         }
         let e_tag = u16::from_le_bytes(buf[pos..pos + 2].try_into().unwrap());
         let e_perm = u16::from_le_bytes(buf[pos + 2..pos + 4].try_into().unwrap());
-        let tag = AclTag::from_u16(e_tag)
-            .ok_or(Error::Corrupt("acl entry has unknown tag"))?;
+        let tag = AclTag::from_u16(e_tag).ok_or(Error::Corrupt("acl entry has unknown tag"))?;
 
         let (id, size) = if tag.has_id() {
             if pos + 8 > buf.len() {
@@ -117,7 +116,11 @@ pub fn decode(buf: &[u8]) -> Result<Vec<AclEntry>> {
             (None, 4)
         };
 
-        entries.push(AclEntry { tag, perm: e_perm, id });
+        entries.push(AclEntry {
+            tag,
+            perm: e_perm,
+            id,
+        });
         pos += size;
     }
     Ok(entries)
@@ -154,8 +157,12 @@ pub fn read(
 mod tests {
     use super::*;
 
-    fn le32(v: u32) -> [u8; 4] { v.to_le_bytes() }
-    fn le16(v: u16) -> [u8; 2] { v.to_le_bytes() }
+    fn le32(v: u32) -> [u8; 4] {
+        v.to_le_bytes()
+    }
+    fn le16(v: u16) -> [u8; 2] {
+        v.to_le_bytes()
+    }
 
     /// Build a minimal valid ACL blob in ext4 compact format.
     fn build(entries: &[(u16, u16, Option<u32>)]) -> Vec<u8> {
@@ -174,33 +181,71 @@ mod tests {
     #[test]
     fn decodes_minimal_acl() {
         // Standard mode-mapped acl: USER_OBJ(rwx), GROUP_OBJ(r-x), OTHER(r--)
-        let buf = build(&[
-            (0x01, 7, None),
-            (0x04, 5, None),
-            (0x20, 4, None),
-        ]);
+        let buf = build(&[(0x01, 7, None), (0x04, 5, None), (0x20, 4, None)]);
         let entries = decode(&buf).unwrap();
         assert_eq!(entries.len(), 3);
-        assert_eq!(entries[0], AclEntry { tag: AclTag::UserObj, perm: 7, id: None });
-        assert_eq!(entries[1], AclEntry { tag: AclTag::GroupObj, perm: 5, id: None });
-        assert_eq!(entries[2], AclEntry { tag: AclTag::Other, perm: 4, id: None });
+        assert_eq!(
+            entries[0],
+            AclEntry {
+                tag: AclTag::UserObj,
+                perm: 7,
+                id: None
+            }
+        );
+        assert_eq!(
+            entries[1],
+            AclEntry {
+                tag: AclTag::GroupObj,
+                perm: 5,
+                id: None
+            }
+        );
+        assert_eq!(
+            entries[2],
+            AclEntry {
+                tag: AclTag::Other,
+                perm: 4,
+                id: None
+            }
+        );
     }
 
     #[test]
     fn decodes_named_user_and_group() {
         let buf = build(&[
-            (0x01, 7, None),           // USER_OBJ rwx
-            (0x02, 6, Some(1000)),     // named USER uid=1000 rw-
-            (0x04, 5, None),           // GROUP_OBJ r-x
-            (0x08, 4, Some(2000)),     // named GROUP gid=2000 r--
-            (0x10, 7, None),           // MASK rwx
-            (0x20, 0, None),           // OTHER ---
+            (0x01, 7, None),       // USER_OBJ rwx
+            (0x02, 6, Some(1000)), // named USER uid=1000 rw-
+            (0x04, 5, None),       // GROUP_OBJ r-x
+            (0x08, 4, Some(2000)), // named GROUP gid=2000 r--
+            (0x10, 7, None),       // MASK rwx
+            (0x20, 0, None),       // OTHER ---
         ]);
         let entries = decode(&buf).unwrap();
         assert_eq!(entries.len(), 6);
-        assert_eq!(entries[1], AclEntry { tag: AclTag::User, perm: 6, id: Some(1000) });
-        assert_eq!(entries[3], AclEntry { tag: AclTag::Group, perm: 4, id: Some(2000) });
-        assert_eq!(entries[4], AclEntry { tag: AclTag::Mask, perm: 7, id: None });
+        assert_eq!(
+            entries[1],
+            AclEntry {
+                tag: AclTag::User,
+                perm: 6,
+                id: Some(1000)
+            }
+        );
+        assert_eq!(
+            entries[3],
+            AclEntry {
+                tag: AclTag::Group,
+                perm: 4,
+                id: Some(2000)
+            }
+        );
+        assert_eq!(
+            entries[4],
+            AclEntry {
+                tag: AclTag::Mask,
+                perm: 7,
+                id: None
+            }
+        );
     }
 
     #[test]

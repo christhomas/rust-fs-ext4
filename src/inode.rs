@@ -84,7 +84,7 @@ pub struct Inode {
     pub ctime_nsec: u32,
     pub crtime_nsec: u32,
     pub links_count: u16,
-    pub blocks: u64,         // 512-byte sectors (per spec; HUGE_FILE flag changes meaning)
+    pub blocks: u64, // 512-byte sectors (per spec; HUGE_FILE flag changes meaning)
     pub flags: u32,
     /// Raw 60-byte i_block area — extent header / direct pointers / inline data.
     /// Parsed by the extent module.
@@ -103,39 +103,39 @@ impl Inode {
             return Err(Error::Corrupt("inode buffer too small"));
         }
 
-        let mode          = u16::from_le_bytes(raw[0x00..0x02].try_into().unwrap());
-        let uid_lo        = u16::from_le_bytes(raw[0x02..0x04].try_into().unwrap());
-        let size_lo       = u32::from_le_bytes(raw[0x04..0x08].try_into().unwrap());
-        let atime         = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
-        let ctime         = u32::from_le_bytes(raw[0x0C..0x10].try_into().unwrap());
-        let mtime         = u32::from_le_bytes(raw[0x10..0x14].try_into().unwrap());
-        let dtime         = u32::from_le_bytes(raw[0x14..0x18].try_into().unwrap());
-        let gid_lo        = u16::from_le_bytes(raw[0x18..0x1A].try_into().unwrap());
-        let links_count   = u16::from_le_bytes(raw[0x1A..0x1C].try_into().unwrap());
-        let blocks_lo     = u32::from_le_bytes(raw[0x1C..0x20].try_into().unwrap());
-        let flags         = u32::from_le_bytes(raw[0x20..0x24].try_into().unwrap());
+        let mode = u16::from_le_bytes(raw[0x00..0x02].try_into().unwrap());
+        let uid_lo = u16::from_le_bytes(raw[0x02..0x04].try_into().unwrap());
+        let size_lo = u32::from_le_bytes(raw[0x04..0x08].try_into().unwrap());
+        let atime = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
+        let ctime = u32::from_le_bytes(raw[0x0C..0x10].try_into().unwrap());
+        let mtime = u32::from_le_bytes(raw[0x10..0x14].try_into().unwrap());
+        let dtime = u32::from_le_bytes(raw[0x14..0x18].try_into().unwrap());
+        let gid_lo = u16::from_le_bytes(raw[0x18..0x1A].try_into().unwrap());
+        let links_count = u16::from_le_bytes(raw[0x1A..0x1C].try_into().unwrap());
+        let blocks_lo = u32::from_le_bytes(raw[0x1C..0x20].try_into().unwrap());
+        let flags = u32::from_le_bytes(raw[0x20..0x24].try_into().unwrap());
         // 0x24..0x28 is i_osd1 (Linux: i_version_lo) — ignored here.
 
         let mut block = [0u8; 60];
         block.copy_from_slice(&raw[0x28..0x64]);
 
-        let generation    = u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap());
-        let file_acl_lo   = u32::from_le_bytes(raw[0x68..0x6C].try_into().unwrap());
-        let size_hi       = u32::from_le_bytes(raw[0x6C..0x70].try_into().unwrap());
+        let generation = u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap());
+        let file_acl_lo = u32::from_le_bytes(raw[0x68..0x6C].try_into().unwrap());
+        let size_hi = u32::from_le_bytes(raw[0x6C..0x70].try_into().unwrap());
         // 0x70..0x74 obso_faddr ignored.
-        let blocks_hi     = u16::from_le_bytes(raw[0x74..0x76].try_into().unwrap());
-        let file_acl_hi   = u16::from_le_bytes(raw[0x76..0x78].try_into().unwrap());
-        let uid_hi        = u16::from_le_bytes(raw[0x78..0x7A].try_into().unwrap());
-        let gid_hi        = u16::from_le_bytes(raw[0x7A..0x7C].try_into().unwrap());
-        let checksum_lo   = u16::from_le_bytes(raw[0x7C..0x7E].try_into().unwrap());
+        let blocks_hi = u16::from_le_bytes(raw[0x74..0x76].try_into().unwrap());
+        let file_acl_hi = u16::from_le_bytes(raw[0x76..0x78].try_into().unwrap());
+        let uid_hi = u16::from_le_bytes(raw[0x78..0x7A].try_into().unwrap());
+        let gid_hi = u16::from_le_bytes(raw[0x7A..0x7C].try_into().unwrap());
+        let checksum_lo = u16::from_le_bytes(raw[0x7C..0x7E].try_into().unwrap());
         // 0x7E..0x80 i_reserved2.
 
         // Defaults (when no extra section present).
-        let mut atime_nsec  = 0u32;
-        let mut mtime_nsec  = 0u32;
-        let mut ctime_nsec  = 0u32;
+        let mut atime_nsec = 0u32;
+        let mut mtime_nsec = 0u32;
+        let mut ctime_nsec = 0u32;
         let mut crtime_nsec = 0u32;
-        let mut crtime      = 0u32;
+        let mut crtime = 0u32;
         let mut checksum_hi = 0u16;
 
         // Extra fields — only present when on-disk inode size is >= 160 AND

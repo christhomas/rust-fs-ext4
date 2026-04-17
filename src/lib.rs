@@ -18,33 +18,33 @@
 
 #![allow(dead_code)] // many spec items not yet wired through
 
-pub mod block_io;
-pub mod superblock;
-pub mod features;
+pub mod acl;
+pub mod alloc;
 pub mod bgd;
-pub mod inode;
-pub mod extent;
+pub mod block_io;
+pub mod casefold;
+pub mod checksum;
 pub mod dir;
+pub mod ea_inode;
+pub mod error;
+pub mod extent;
+pub mod extent_mut;
+pub mod features;
+pub mod file_io;
+pub mod file_mut;
+pub mod fs;
 pub mod hash;
 pub mod htree;
-pub mod xattr;
+pub mod htree_mut;
 pub mod inline_data;
-pub mod checksum;
-pub mod acl;
+pub mod inode;
 pub mod jbd2;
 pub mod journal;
 pub mod journal_apply;
-pub mod alloc;
-pub mod extent_mut;
-pub mod htree_mut;
-pub mod file_mut;
-pub mod transaction;
-pub mod casefold;
-pub mod ea_inode;
-pub mod fs;
-pub mod file_io;
 pub mod path;
-pub mod error;
+pub mod superblock;
+pub mod transaction;
+pub mod xattr;
 
 // Always compile the C ABI exports — `libext4bridge.a` must expose the same
 // symbols as the C/lwext4 build for drop-in linking.

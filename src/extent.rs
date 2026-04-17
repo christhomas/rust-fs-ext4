@@ -65,7 +65,9 @@ pub struct ExtentVerifyCtx<'a> {
 
 impl<'a> ExtentVerifyCtx<'a> {
     /// True if every off-inode node read should be CRC-verified.
-    fn active(&self) -> bool { self.csum.enabled }
+    fn active(&self) -> bool {
+        self.csum.enabled
+    }
 }
 
 /// Magic number at the start of every extent header.
@@ -93,11 +95,11 @@ impl ExtentHeader {
         if raw.len() < EXT4_EXT_NODE_SIZE {
             return Err(Error::CorruptExtentTree("header buffer too small"));
         }
-        let magic       = u16::from_le_bytes(raw[0x00..0x02].try_into().unwrap());
-        let entries     = u16::from_le_bytes(raw[0x02..0x04].try_into().unwrap());
-        let max         = u16::from_le_bytes(raw[0x04..0x06].try_into().unwrap());
-        let depth       = u16::from_le_bytes(raw[0x06..0x08].try_into().unwrap());
-        let generation  = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
+        let magic = u16::from_le_bytes(raw[0x00..0x02].try_into().unwrap());
+        let entries = u16::from_le_bytes(raw[0x02..0x04].try_into().unwrap());
+        let max = u16::from_le_bytes(raw[0x04..0x06].try_into().unwrap());
+        let depth = u16::from_le_bytes(raw[0x06..0x08].try_into().unwrap());
+        let generation = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
 
         if magic != EXT4_EXT_MAGIC {
             return Err(Error::CorruptExtentTree("bad extent header magic"));
@@ -105,7 +107,13 @@ impl ExtentHeader {
         if entries > max {
             return Err(Error::CorruptExtentTree("entries > max"));
         }
-        Ok(Self { magic, entries, max, depth, generation })
+        Ok(Self {
+            magic,
+            entries,
+            max,
+            depth,
+            generation,
+        })
     }
 
     pub fn is_leaf(&self) -> bool {
@@ -132,9 +140,9 @@ impl Extent {
             return Err(Error::CorruptExtentTree("leaf extent buffer too small"));
         }
         let logical_block = u32::from_le_bytes(raw[0x00..0x04].try_into().unwrap());
-        let ee_len        = u16::from_le_bytes(raw[0x04..0x06].try_into().unwrap());
-        let start_hi      = u16::from_le_bytes(raw[0x06..0x08].try_into().unwrap());
-        let start_lo      = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
+        let ee_len = u16::from_le_bytes(raw[0x04..0x06].try_into().unwrap());
+        let start_hi = u16::from_le_bytes(raw[0x06..0x08].try_into().unwrap());
+        let start_lo = u32::from_le_bytes(raw[0x08..0x0C].try_into().unwrap());
 
         let (length, uninitialized) = if ee_len > EXT_INIT_MAX_LEN {
             (ee_len - EXT_INIT_MAX_LEN, true)
@@ -143,7 +151,12 @@ impl Extent {
         };
         let physical_block = ((start_hi as u64) << 32) | start_lo as u64;
 
-        Ok(Self { logical_block, length, physical_block, uninitialized })
+        Ok(Self {
+            logical_block,
+            length,
+            physical_block,
+            uninitialized,
+        })
     }
 
     /// Does this extent cover the given logical block?
@@ -175,11 +188,14 @@ impl ExtentIdx {
             return Err(Error::CorruptExtentTree("index entry buffer too small"));
         }
         let logical_block = u32::from_le_bytes(raw[0x00..0x04].try_into().unwrap());
-        let leaf_lo       = u32::from_le_bytes(raw[0x04..0x08].try_into().unwrap());
-        let leaf_hi       = u16::from_le_bytes(raw[0x08..0x0A].try_into().unwrap());
+        let leaf_lo = u32::from_le_bytes(raw[0x04..0x08].try_into().unwrap());
+        let leaf_hi = u16::from_le_bytes(raw[0x08..0x0A].try_into().unwrap());
         // 0x0A..0x0C reserved.
         let leaf_block = ((leaf_hi as u64) << 32) | leaf_lo as u64;
-        Ok(Self { logical_block, leaf_block })
+        Ok(Self {
+            logical_block,
+            leaf_block,
+        })
     }
 }
 
@@ -254,15 +270,18 @@ pub fn lookup_verified(
                 break;
             }
         }
-        let idx = chosen_idx
-            .ok_or(Error::CorruptExtentTree("no index entry covers logical block"))?;
+        let idx = chosen_idx.ok_or(Error::CorruptExtentTree(
+            "no index entry covers logical block",
+        ))?;
 
         // Read the child block, parse its header, continue loop.
         let mut buf = vec![0u8; block_size as usize];
         dev.read_at(idx.leaf_block * block_size as u64, &mut buf)?;
         if let Some(c) = ctx {
             if c.active() && !c.csum.verify_extent_tail(c.ino, c.generation, &buf) {
-                return Err(Error::BadChecksum { what: "extent block" });
+                return Err(Error::BadChecksum {
+                    what: "extent block",
+                });
             }
         }
         node = buf;
@@ -273,11 +292,7 @@ pub fn lookup_verified(
 
 /// Walk the entire extent tree and collect every leaf extent. Useful for
 /// building a file-block list or for testing.
-pub fn collect_all(
-    root: &[u8],
-    dev: &dyn BlockDevice,
-    block_size: u32,
-) -> Result<Vec<Extent>> {
+pub fn collect_all(root: &[u8], dev: &dyn BlockDevice, block_size: u32) -> Result<Vec<Extent>> {
     let header = ExtentHeader::parse(root)?;
     let mut out = Vec::new();
     walk(root, &header, dev, block_size, &mut out)?;
@@ -375,14 +390,18 @@ mod tests {
     #[test]
     fn leaf_lookup_finds_mapping() {
         let mut buf = make_root(2);
-        set_leaf(&mut buf, 0, 0, 4, 100);   // logical 0..4 -> physical 100..104
-        set_leaf(&mut buf, 1, 4, 2, 200);   // logical 4..6 -> physical 200..202
+        set_leaf(&mut buf, 0, 0, 4, 100); // logical 0..4 -> physical 100..104
+        set_leaf(&mut buf, 1, 4, 2, 200); // logical 4..6 -> physical 200..202
 
         // Stub dev; never read.
         struct Dummy;
         impl BlockDevice for Dummy {
-            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<()> { unreachable!() }
-            fn size_bytes(&self) -> u64 { 0 }
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<()> {
+                unreachable!()
+            }
+            fn size_bytes(&self) -> u64 {
+                0
+            }
         }
 
         let r = lookup(&buf, &Dummy, 4096, 0).unwrap().unwrap();
@@ -406,8 +425,12 @@ mod tests {
 
         struct Dummy;
         impl BlockDevice for Dummy {
-            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<()> { unreachable!() }
-            fn size_bytes(&self) -> u64 { 0 }
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<()> {
+                unreachable!()
+            }
+            fn size_bytes(&self) -> u64 {
+                0
+            }
         }
 
         // The lookup succeeds but map_logical returns None (read as zeros).
@@ -462,8 +485,8 @@ mod tests {
         assert_eq!(header.depth, 0, "expected a leaf root for tiny test image");
         assert!(header.entries >= 1);
 
-        let all = collect_all(&inode.block, dev.as_ref(), fs.sb.block_size())
-            .expect("collect extents");
+        let all =
+            collect_all(&inode.block, dev.as_ref(), fs.sb.block_size()).expect("collect extents");
         assert!(!all.is_empty());
         // First extent should start at logical block 0 for a small dir.
         assert_eq!(all[0].logical_block, 0);
@@ -473,7 +496,8 @@ mod tests {
         // (should have '.' as the first entry).
         let first_phys = all[0].map(0);
         let mut blk = vec![0u8; fs.sb.block_size() as usize];
-        dev.read_at(first_phys * fs.sb.block_size() as u64, &mut blk).unwrap();
+        dev.read_at(first_phys * fs.sb.block_size() as u64, &mut blk)
+            .unwrap();
 
         let entries = crate::dir::parse_block(&blk, true).expect("parse dir block");
         assert!(!entries.is_empty());

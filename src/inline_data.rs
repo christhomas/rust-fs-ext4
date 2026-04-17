@@ -49,14 +49,7 @@ pub fn read_all(
     }
 
     // Overflow lives in the system.data xattr.
-    if let Some(extra) = xattr::get(
-        dev,
-        inode,
-        inode_raw,
-        inode_size,
-        block_size,
-        "system.data",
-    )? {
+    if let Some(extra) = xattr::get(dev, inode, inode_raw, inode_size, block_size, "system.data")? {
         let need = total - inline_max;
         let take = extra.len().min(need);
         out.extend_from_slice(&extra[..take]);

@@ -15,10 +15,7 @@ use ext4rs::fs::Filesystem;
 use ext4rs::inode::Inode;
 use std::sync::Arc;
 
-const IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 /// Reimplementation of the Linux `crc32c_le` used by ext4.
 /// Equivalent to `crc32c::crc32c_append(!initial, data)` xor-inverted back.
@@ -56,7 +53,9 @@ fn determine_which_hash_range_matches_real_block() {
         .expect("map")
         .expect("root dir should have block 0");
     let mut block = vec![0u8; bs as usize];
-    dev_dyn.read_at(phys * bs as u64, &mut block).expect("read block");
+    dev_dyn
+        .read_at(phys * bs as u64, &mut block)
+        .expect("read block");
 
     let end = block.len();
     // Sanity: this image should have metadata_csum enabled and a dir tail.

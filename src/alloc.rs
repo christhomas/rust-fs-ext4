@@ -187,7 +187,7 @@ where
         let max_bits = blocks_in_group(sb, gi);
 
         let bitmap_bytes: Vec<u8> = if bgd.flags().contains(BgdFlags::BLOCK_UNINIT) {
-            vec![0u8; (sb.block_size() as usize)]
+            vec![0u8; sb.block_size() as usize]
         } else {
             bitmap_reader(bgd.block_bitmap)?
         };
@@ -196,7 +196,8 @@ where
             continue;
         };
 
-        let group_first_block = (gi as u64) * (blocks_per_group as u64) + sb.first_data_block as u64;
+        let group_first_block =
+            (gi as u64) * (blocks_per_group as u64) + sb.first_data_block as u64;
         let first_block = group_first_block + bit_start as u64;
 
         return Ok(BlockAllocationPlan {
@@ -221,7 +222,9 @@ where
         });
     }
 
-    Err(Error::Corrupt("no group has a contiguous free run of this size"))
+    Err(Error::Corrupt(
+        "no group has a contiguous free run of this size",
+    ))
 }
 
 /// Returns the number of blocks that actually exist in group `gi` (the last
@@ -232,7 +235,11 @@ fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
         return sb.blocks_per_group;
     }
     let remainder = (sb.blocks_count - sb.first_data_block as u64) % sb.blocks_per_group as u64;
-    if remainder == 0 { sb.blocks_per_group } else { remainder as u32 }
+    if remainder == 0 {
+        sb.blocks_per_group
+    } else {
+        remainder as u32
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -272,7 +279,7 @@ where
 
         let max_bits = sb.inodes_per_group;
         let bitmap_bytes: Vec<u8> = if bgd.flags().contains(BgdFlags::INODE_UNINIT) {
-            vec![0u8; (sb.block_size() as usize)]
+            vec![0u8; sb.block_size() as usize]
         } else {
             bitmap_reader(bgd.inode_bitmap)?
         };
@@ -361,7 +368,9 @@ pub fn apply_bitmap_write(buf: &mut [u8], w: &BitmapWrite) {
         let idx = (w.bit_start + b) as usize;
         let byte = idx / 8;
         let mask = 1u8 << (idx % 8);
-        if byte >= buf.len() { break; }
+        if byte >= buf.len() {
+            break;
+        }
         if w.set {
             buf[byte] |= mask;
         } else {
@@ -374,7 +383,12 @@ pub fn apply_bitmap_write(buf: &mut [u8], w: &BitmapWrite) {
 mod tests {
     use super::*;
 
-    fn mk_sb(block_size: u32, blocks_per_group: u32, inodes_per_group: u32, total_blocks: u64) -> Superblock {
+    fn mk_sb(
+        block_size: u32,
+        blocks_per_group: u32,
+        inodes_per_group: u32,
+        total_blocks: u64,
+    ) -> Superblock {
         // Minimal superblock constructed from a synthetic buffer.
         let mut raw = vec![0u8; crate::superblock::SUPERBLOCK_SIZE];
         // magic
@@ -382,9 +396,8 @@ mod tests {
         raw[0x00..0x04].copy_from_slice(&(inodes_per_group * 4).to_le_bytes());
         raw[0x04..0x08].copy_from_slice(&(total_blocks as u32).to_le_bytes());
         raw[0x14..0x18].copy_from_slice(&1u32.to_le_bytes()); // first_data_block
-        raw[0x18..0x1C].copy_from_slice(
-            &((block_size.trailing_zeros().saturating_sub(10))).to_le_bytes(),
-        );
+        raw[0x18..0x1C]
+            .copy_from_slice(&(block_size.trailing_zeros().saturating_sub(10)).to_le_bytes());
         raw[0x20..0x24].copy_from_slice(&blocks_per_group.to_le_bytes());
         raw[0x28..0x2C].copy_from_slice(&inodes_per_group.to_le_bytes());
         raw[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes()); // rev_level=1 so inode_size read
@@ -393,7 +406,12 @@ mod tests {
         crate::superblock::Superblock::parse(raw).unwrap()
     }
 
-    fn mk_bgd(free_blocks: u32, free_inodes: u32, used_dirs: u32, flags: u16) -> BlockGroupDescriptor {
+    fn mk_bgd(
+        free_blocks: u32,
+        free_inodes: u32,
+        used_dirs: u32,
+        flags: u16,
+    ) -> BlockGroupDescriptor {
         BlockGroupDescriptor {
             block_bitmap: 100,
             inode_bitmap: 200,
@@ -456,7 +474,7 @@ mod tests {
     #[test]
     fn block_allocation_skips_full_group() {
         let sb = mk_sb(4096, 32768, 8192, 65536);
-        let g0 = mk_bgd(5, 8000, 0, 0);   // not enough for 10-block run
+        let g0 = mk_bgd(5, 8000, 0, 0); // not enough for 10-block run
         let g1 = mk_bgd(20000, 8000, 0, 0);
         let groups = vec![g0, g1];
         let read = |_b| Ok(vec![0u8; 4096]);
@@ -473,7 +491,10 @@ mod tests {
         let g0 = mk_bgd(32768, 8000, 0, BgdFlags::BLOCK_UNINIT.bits());
         let groups = vec![g0];
         let mut call_count = 0;
-        let read = |_b| { call_count += 1; Ok(vec![0xFFu8; 4096]) };
+        let read = |_b| {
+            call_count += 1;
+            Ok(vec![0xFFu8; 4096])
+        };
         let plan = plan_block_allocation(&sb, &groups, 4, 0, read).unwrap();
         assert_eq!(plan.count, 4);
         assert_eq!(call_count, 0, "UNINIT group should not read bitmap");
@@ -517,19 +538,25 @@ mod tests {
     #[test]
     fn apply_bitmap_write_sets_and_clears_bits() {
         let mut buf = vec![0u8; 2];
-        apply_bitmap_write(&mut buf, &BitmapWrite {
-            bitmap_block: 0,
-            bit_start: 0,
-            count: 10,
-            set: true,
-        });
+        apply_bitmap_write(
+            &mut buf,
+            &BitmapWrite {
+                bitmap_block: 0,
+                bit_start: 0,
+                count: 10,
+                set: true,
+            },
+        );
         assert_eq!(buf, vec![0xFF, 0x03]);
-        apply_bitmap_write(&mut buf, &BitmapWrite {
-            bitmap_block: 0,
-            bit_start: 5,
-            count: 3,
-            set: false,
-        });
+        apply_bitmap_write(
+            &mut buf,
+            &BitmapWrite {
+                bitmap_block: 0,
+                bit_start: 5,
+                count: 3,
+                set: false,
+            },
+        );
         assert_eq!(buf, vec![0b0001_1111, 0x03]);
     }
 }

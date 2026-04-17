@@ -12,10 +12,7 @@ use ext4rs::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
-const TEST_IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-inline.img"
-);
+const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-inline.img");
 
 fn last_err_str() -> String {
     unsafe {
@@ -70,7 +67,12 @@ fn reads_medium_inline_file_with_xattr_overflow() {
             buf.len() as u64,
         )
     };
-    assert_eq!(n, 100, "medium.txt should be 100 bytes (inline+xattr): {}", last_err_str());
+    assert_eq!(
+        n,
+        100,
+        "medium.txt should be 100 bytes (inline+xattr): {}",
+        last_err_str()
+    );
     assert!(buf[..100].iter().all(|&b| b == b'A'), "content mismatch");
 
     unsafe { ext4rs_umount(fs) };
@@ -82,15 +84,7 @@ fn inline_read_respects_offset_and_length() {
     let path = CString::new("/medium.txt").unwrap();
 
     let mut buf = [0u8; 32];
-    let n = unsafe {
-        ext4rs_read_file(
-            fs,
-            path.as_ptr(),
-            buf.as_mut_ptr() as *mut c_void,
-            50,
-            10,
-        )
-    };
+    let n = unsafe { ext4rs_read_file(fs, path.as_ptr(), buf.as_mut_ptr() as *mut c_void, 50, 10) };
     assert_eq!(n, 10);
     assert!(buf[..10].iter().all(|&b| b == b'A'));
 
@@ -123,9 +117,7 @@ fn inline_data_symlink_readlink() {
     let path = CString::new("/symlink").unwrap();
 
     let mut buf = [0u8; 128];
-    let rc = unsafe {
-        ext4rs_readlink(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len())
-    };
+    let rc = unsafe { ext4rs_readlink(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
     assert_eq!(rc, 0, "readlink failed: {}", last_err_str());
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     assert_eq!(&buf[..end], b"target/path/here");

@@ -67,7 +67,11 @@ pub struct DirBlockIter<'a> {
 
 impl<'a> DirBlockIter<'a> {
     pub fn new(buf: &'a [u8], has_file_type: bool) -> Self {
-        Self { buf, offset: 0, has_file_type }
+        Self {
+            buf,
+            offset: 0,
+            has_file_type,
+        }
     }
 }
 
@@ -82,10 +86,17 @@ impl<'a> Iterator for DirBlockIter<'a> {
 
             let inode_bytes = &self.buf[self.offset..self.offset + 4];
             let inode = u32::from_le_bytes(inode_bytes.try_into().unwrap());
-            let rec_len = u16::from_le_bytes(self.buf[self.offset + 4..self.offset + 6].try_into().unwrap());
+            let rec_len = u16::from_le_bytes(
+                self.buf[self.offset + 4..self.offset + 6]
+                    .try_into()
+                    .unwrap(),
+            );
 
             // Sanity-check rec_len before trusting it for the next iteration.
-            if rec_len < 8 || (rec_len as usize) > self.buf.len() - self.offset || (rec_len % 4) != 0 {
+            if rec_len < 8
+                || (rec_len as usize) > self.buf.len() - self.offset
+                || (rec_len % 4) != 0
+            {
                 return Some(Err(Error::CorruptDirEntry("bad rec_len")));
             }
 
@@ -93,10 +104,8 @@ impl<'a> Iterator for DirBlockIter<'a> {
             let type_or_namehi = self.buf[self.offset + 7];
 
             // Detect csum tail: inode==0, rec_len==12, name_len==0, type==0xDE.
-            let is_csum_tail = inode == 0
-                && rec_len == 12
-                && name_len_lo == 0
-                && type_or_namehi == 0xDE;
+            let is_csum_tail =
+                inode == 0 && rec_len == 12 && name_len_lo == 0 && type_or_namehi == 0xDE;
 
             let entry_end = self.offset + rec_len as usize;
 
@@ -128,7 +137,11 @@ impl<'a> Iterator for DirBlockIter<'a> {
             };
 
             self.offset = entry_end;
-            return Some(Ok(DirEntry { inode, name, file_type }));
+            return Some(Ok(DirEntry {
+                inode,
+                name,
+                file_type,
+            }));
         }
     }
 }
@@ -171,7 +184,9 @@ pub fn parse_block_verified(
     csum: &Checksummer,
 ) -> Result<Vec<DirEntry>> {
     if csum.enabled && has_csum_tail(buf) && !csum.verify_dir_entry_tail(ino, generation, buf) {
-        return Err(Error::BadChecksum { what: "directory block" });
+        return Err(Error::BadChecksum {
+            what: "directory block",
+        });
     }
     parse_block(buf, has_file_type)
 }
@@ -240,7 +255,9 @@ pub fn add_entry_to_block(
     reserved_tail: usize,
 ) -> Result<()> {
     if inode == 0 {
-        return Err(Error::CorruptDirEntry("refuse to insert entry with inode 0"));
+        return Err(Error::CorruptDirEntry(
+            "refuse to insert entry with inode 0",
+        ));
     }
     if name.is_empty() || name.len() > 255 {
         return Err(Error::CorruptDirEntry("name length out of range"));
@@ -265,7 +282,15 @@ pub fn add_entry_to_block(
         if cur_inode == 0 {
             // Reuse a tombstone slot in-place (keep its rec_len).
             if rec_len >= needed {
-                write_entry(buf, off, inode, rec_len as u16, name, file_type, has_file_type);
+                write_entry(
+                    buf,
+                    off,
+                    inode,
+                    rec_len as u16,
+                    name,
+                    file_type,
+                    has_file_type,
+                );
                 return Ok(());
             }
         } else {
@@ -337,9 +362,7 @@ pub fn remove_entry_from_block(
             } else {
                 ((cur_type_or_hi as usize) << 8) | cur_name_lo as usize
             };
-            if 8 + cur_name_len <= rec_len
-                && &buf[off + 8..off + 8 + cur_name_len] == name
-            {
+            if 8 + cur_name_len <= rec_len && &buf[off + 8..off + 8 + cur_name_len] == name {
                 if let Some(prev) = prev_off {
                     // Coalesce: previous entry absorbs this one's space.
                     let prev_rec_len =
@@ -439,10 +462,10 @@ mod tests {
 
     #[test]
     fn rec_len_matches_kernel_layout() {
-        assert_eq!(entry_rec_len(1), 12);   // "."
-        assert_eq!(entry_rec_len(2), 12);   // ".."
-        assert_eq!(entry_rec_len(5), 16);   // "hello"
-        assert_eq!(entry_rec_len(8), 16);   // exact 4-byte alignment
+        assert_eq!(entry_rec_len(1), 12); // "."
+        assert_eq!(entry_rec_len(2), 12); // ".."
+        assert_eq!(entry_rec_len(5), 16); // "hello"
+        assert_eq!(entry_rec_len(8), 16); // exact 4-byte alignment
         assert_eq!(entry_rec_len(9), 20);
     }
 

@@ -211,7 +211,12 @@ mod tests {
 
     #[test]
     fn replay_entry_structure_stable() {
-        let e = ReplayEntry { transaction: 1, fs_block: 100, journal_block: 5, flags: 0 };
+        let e = ReplayEntry {
+            transaction: 1,
+            fs_block: 100,
+            journal_block: 5,
+            flags: 0,
+        };
         assert_eq!(e.transaction, 1);
         assert_eq!(e.fs_block, 100);
         assert_eq!(e.journal_block, 5);

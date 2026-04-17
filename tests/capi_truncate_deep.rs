@@ -50,7 +50,9 @@ fn last_err() -> String {
 
 #[test]
 fn truncate_on_multi_level_extent_tree_rejects_cleanly() {
-    let Some(img) = scratch() else { return; };
+    let Some(img) = scratch() else {
+        return;
+    };
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/sparse.bin").unwrap();
 
@@ -82,7 +84,9 @@ fn truncate_on_single_extent_file_still_works_after_deep_reject() {
     // Same idea as above but isolated, in case someone removes the dense
     // fallback from the first test: verify the straightforward case stays
     // healthy on this image.
-    let Some(img) = scratch() else { return; };
+    let Some(img) = scratch() else {
+        return;
+    };
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let fs = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_err());

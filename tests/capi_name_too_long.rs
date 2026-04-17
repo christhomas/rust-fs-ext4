@@ -8,10 +8,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch() -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
@@ -28,7 +25,9 @@ fn scratch() -> PathBuf {
 fn long_name(n: usize) -> String {
     // 256-char name (1 byte over EXT4_NAME_LEN=255).
     let mut s = String::from("/");
-    for _ in 0..n { s.push('a'); }
+    for _ in 0..n {
+        s.push('a');
+    }
     s
 }
 

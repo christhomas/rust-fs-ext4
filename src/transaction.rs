@@ -38,9 +38,7 @@
 //! separately (it composes with @5's `checksum.rs`).
 
 use crate::error::{Error, Result};
-use crate::jbd2::{
-    JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK, JBD2_MAGIC_NUMBER, JBD2_REVOKE_BLOCK,
-};
+use crate::jbd2::{JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK, JBD2_MAGIC_NUMBER, JBD2_REVOKE_BLOCK};
 use crate::journal::{TAG_LAST, TAG_SAME_UUID};
 
 /// One buffered write the transaction will journal.
@@ -124,7 +122,11 @@ impl Transaction {
         self.write_header(&mut blk, JBD2_DESCRIPTOR_BLOCK);
 
         let tag_size = if self.uses_csum_v3 {
-            if self.uses_64bit { 16 } else { 12 }
+            if self.uses_64bit {
+                16
+            } else {
+                12
+            }
         } else if self.uses_64bit {
             12
         } else {
@@ -207,7 +209,7 @@ impl Transaction {
 mod tests {
     use super::*;
     use crate::jbd2::{JbdIncompat, JournalSuperblock, JBD2_SUPERBLOCK_V2};
-    use crate::journal::{ReplayPlan, ReplayEntry, RevokeEntry};
+    use crate::journal::{ReplayEntry, ReplayPlan, RevokeEntry};
 
     fn mk_tx(seq: u32) -> Transaction {
         Transaction::begin(seq, 4096, false, false)
@@ -232,7 +234,7 @@ mod tests {
         tx.add_write(200, vec![0xBB; 4096]).unwrap();
         let blocks = tx.commit().unwrap();
         assert_eq!(blocks.len(), 4); // desc + 2 data + commit
-        // blocks[0] = descriptor
+                                     // blocks[0] = descriptor
         let bt0 = u32::from_be_bytes(blocks[0][4..8].try_into().unwrap());
         assert_eq!(bt0, JBD2_DESCRIPTOR_BLOCK);
         // blocks[1..3] = data (no JBD header required; just payload)
@@ -253,7 +255,11 @@ mod tests {
         assert_eq!(blocknr_lo, 0x1234_5678);
         let flags_u16 = u16::from_be_bytes(desc[18..20].try_into().unwrap()) as u32;
         assert_eq!(flags_u16 & TAG_LAST, TAG_LAST, "last tag must set TAG_LAST");
-        assert_eq!(flags_u16 & TAG_SAME_UUID, TAG_SAME_UUID, "same_uuid expected");
+        assert_eq!(
+            flags_u16 & TAG_SAME_UUID,
+            TAG_SAME_UUID,
+            "same_uuid expected"
+        );
     }
 
     #[test]
@@ -344,7 +350,9 @@ mod tests {
         let mut pos = 12usize;
         let mut tag_idx = 0u64;
         loop {
-            if pos + 8 > desc.len() { break; }
+            if pos + 8 > desc.len() {
+                break;
+            }
             let blocknr = u32::from_be_bytes(desc[pos..pos + 4].try_into().unwrap()) as u64;
             let flags = u16::from_be_bytes(desc[pos + 6..pos + 8].try_into().unwrap()) as u32;
             if blocknr == 0 && flags == 0 && tag_idx > 0 {
@@ -401,7 +409,10 @@ mod tests {
                 num_fc_blocks: 0,
                 checksum: 0,
             },
-            RevokeEntry { transaction: 1, fs_block: 0 },
+            RevokeEntry {
+                transaction: 1,
+                fs_block: 0,
+            },
         );
     }
 }

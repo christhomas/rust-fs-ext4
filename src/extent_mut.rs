@@ -23,9 +23,7 @@
 //! callers can fall back to copy-on-write or error out cleanly.
 
 use crate::error::{Error, Result};
-use crate::extent::{
-    Extent, ExtentHeader, EXT4_EXT_MAGIC, EXT4_EXT_NODE_SIZE, EXT_INIT_MAX_LEN,
-};
+use crate::extent::{Extent, ExtentHeader, EXT4_EXT_MAGIC, EXT4_EXT_NODE_SIZE, EXT_INIT_MAX_LEN};
 
 /// A primitive change the extent-write path wants to make to the tree. The
 /// caller (E10 or a test) converts this into real I/O under a transaction.
@@ -175,7 +173,9 @@ pub fn plan_insert_extent(root: &[u8], new: Extent) -> Result<Vec<ExtentMutation
 /// Errors if `split_at` is not strictly inside the chosen extent.
 pub fn plan_split_extent(root: &[u8], idx: usize, split_at: u32) -> Result<Vec<ExtentMutation>> {
     let (header, mut entries) = read_leaf_entries(root)?;
-    let e = *entries.get(idx).ok_or(Error::CorruptExtentTree("split idx out of range"))?;
+    let e = *entries
+        .get(idx)
+        .ok_or(Error::CorruptExtentTree("split idx out of range"))?;
     let start = e.logical_block;
     let end = start + e.length as u32;
     if split_at <= start || split_at >= end {
@@ -228,7 +228,9 @@ pub fn plan_merge_adjacent(root: &[u8], i: usize) -> Result<Vec<ExtentMutation>>
 /// blocks via the bitmap allocator (E5).
 pub fn plan_free_extent(root: &[u8], idx: usize) -> Result<Vec<ExtentMutation>> {
     let (header, mut entries) = read_leaf_entries(root)?;
-    let removed = entries.get(idx).copied()
+    let removed = entries
+        .get(idx)
+        .copied()
         .ok_or(Error::CorruptExtentTree("free idx out of range"))?;
     entries.remove(idx);
     let new_root = build_root(&header, &entries, root.len());
@@ -288,7 +290,9 @@ mod tests {
     fn insert_sorted_ordering() {
         let root = mk_root(&[ext(100, 5, 2000, false)]);
         let muts = plan_insert_extent(&root, ext(0, 10, 1000, false)).unwrap();
-        let ExtentMutation::WriteRoot { bytes } = &muts[0] else { panic!() };
+        let ExtentMutation::WriteRoot { bytes } = &muts[0] else {
+            panic!()
+        };
         let back = read_back(bytes);
         assert_eq!(back[0].logical_block, 0);
         assert_eq!(back[1].logical_block, 100);
@@ -299,7 +303,9 @@ mod tests {
         let root = mk_root(&[ext(0, 10, 1000, false)]);
         // New extent at logical 10, phys 1010 — contiguous with the first.
         let muts = plan_insert_extent(&root, ext(10, 5, 1010, false)).unwrap();
-        let ExtentMutation::WriteRoot { bytes } = &muts[0] else { panic!() };
+        let ExtentMutation::WriteRoot { bytes } = &muts[0] else {
+            panic!()
+        };
         let back = read_back(bytes);
         assert_eq!(back.len(), 1, "should merge into single extent");
         assert_eq!(back[0].length, 15);
@@ -310,7 +316,9 @@ mod tests {
         let root = mk_root(&[ext(0, 10, 1000, false)]);
         // Contiguous physically/logically but marked uninitialised — must NOT merge.
         let muts = plan_insert_extent(&root, ext(10, 5, 1010, true)).unwrap();
-        let ExtentMutation::WriteRoot { bytes } = &muts[0] else { panic!() };
+        let ExtentMutation::WriteRoot { bytes } = &muts[0] else {
+            panic!()
+        };
         let back = read_back(bytes);
         assert_eq!(back.len(), 2);
         assert!(!back[0].uninitialized);
@@ -346,7 +354,9 @@ mod tests {
     fn split_extent_at_midpoint() {
         let root = mk_root(&[ext(0, 10, 1000, false)]);
         let muts = plan_split_extent(&root, 0, 4).unwrap();
-        let ExtentMutation::WriteRoot { bytes } = &muts[0] else { panic!() };
+        let ExtentMutation::WriteRoot { bytes } = &muts[0] else {
+            panic!()
+        };
         let back = read_back(bytes);
         assert_eq!(back.len(), 2);
         assert_eq!(back[0].logical_block, 0);
@@ -360,7 +370,7 @@ mod tests {
     #[test]
     fn split_rejects_boundary_point() {
         let root = mk_root(&[ext(0, 10, 1000, false)]);
-        assert!(plan_split_extent(&root, 0, 0).is_err());  // start
+        assert!(plan_split_extent(&root, 0, 0).is_err()); // start
         assert!(plan_split_extent(&root, 0, 10).is_err()); // end
     }
 
@@ -371,7 +381,9 @@ mod tests {
             ext(5, 5, 1005, false), // contiguous
         ]);
         let muts = plan_merge_adjacent(&root, 0).unwrap();
-        let ExtentMutation::WriteRoot { bytes } = &muts[0] else { panic!() };
+        let ExtentMutation::WriteRoot { bytes } = &muts[0] else {
+            panic!()
+        };
         let back = read_back(bytes);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].length, 10);
@@ -389,10 +401,7 @@ mod tests {
 
     #[test]
     fn free_extent_emits_physical_run() {
-        let root = mk_root(&[
-            ext(0, 5, 1000, false),
-            ext(10, 3, 2000, false),
-        ]);
+        let root = mk_root(&[ext(0, 5, 1000, false), ext(10, 3, 2000, false)]);
         let muts = plan_free_extent(&root, 0).unwrap();
         assert_eq!(muts.len(), 2);
         match &muts[1] {
@@ -402,7 +411,9 @@ mod tests {
             }
             _ => panic!("expected FreePhysicalRun"),
         }
-        let ExtentMutation::WriteRoot { bytes } = &muts[0] else { panic!() };
+        let ExtentMutation::WriteRoot { bytes } = &muts[0] else {
+            panic!()
+        };
         let back = read_back(bytes);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].logical_block, 10);

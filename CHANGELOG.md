@@ -26,6 +26,10 @@ repo into a standalone crate.
   ABI; reads only for xattrs.
 - Write path is unjournaled. `jbd2` replay works at mount for a
   cleanly-closed journal; live transactions are not yet wrapped.
+- Clippy lint backlog (`manual_div_ceil`, `manual_is_multiple_of`,
+  `needless_as_bytes`, `unnecessary_cast`, misc.): ~30 findings
+  remain. CI runs clippy informationally; the `-D warnings` gate will
+  be re-enabled after the cleanup pass.
 
 ### Origin
 

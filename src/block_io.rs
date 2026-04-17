@@ -24,7 +24,9 @@ pub trait BlockDevice: Send + Sync {
     /// Write exactly `buf.len()` bytes at `offset`. Default: returns an error
     /// for read-only devices. Writable devices override this.
     fn write_at(&self, _offset: u64, _buf: &[u8]) -> Result<()> {
-        Err(Error::Corrupt("block device is read-only (no write_at impl)"))
+        Err(Error::Corrupt(
+            "block device is read-only (no write_at impl)",
+        ))
     }
 
     /// Flush any pending writes to stable storage. Default: no-op for
@@ -52,7 +54,11 @@ impl FileDevice {
     pub fn open(path: &str) -> Result<Self> {
         let file = File::open(path)?;
         let size = file.metadata()?.len();
-        Ok(Self { file: Mutex::new(file), size, writable: false })
+        Ok(Self {
+            file: Mutex::new(file),
+            size,
+            writable: false,
+        })
     }
 
     /// Open read-write. Prefer this when the caller needs to journal-replay
@@ -61,7 +67,11 @@ impl FileDevice {
     pub fn open_rw(path: &str) -> Result<Self> {
         let file = OpenOptions::new().read(true).write(true).open(path)?;
         let size = file.metadata()?.len();
-        Ok(Self { file: Mutex::new(file), size, writable: true })
+        Ok(Self {
+            file: Mutex::new(file),
+            size,
+            writable: true,
+        })
     }
 
     /// Open read-write if possible; otherwise fall back to read-only. Useful
@@ -166,10 +176,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = format!(
-            "/tmp/ext4rs_block_io_test_{}_{n}.img",
-            std::process::id()
-        );
+        let path = format!("/tmp/ext4rs_block_io_test_{}_{n}.img", std::process::id());
         let mut f = File::create(&path).unwrap();
         f.write_all(bytes).unwrap();
         path
@@ -210,7 +217,10 @@ mod tests {
         std::fs::set_permissions(&path, perm).unwrap();
 
         let dev = FileDevice::open_best_effort(&path).unwrap();
-        assert!(!dev.is_writable(), "read-only file should not report writable");
+        assert!(
+            !dev.is_writable(),
+            "read-only file should not report writable"
+        );
         // Cleanup: restore writability so remove_file succeeds.
         let mut perm = std::fs::metadata(&path).unwrap().permissions();
         #[allow(clippy::permissions_set_readonly_false)]
@@ -223,7 +233,10 @@ mod tests {
     fn callback_device_without_writer_rejects_writes() {
         let dev = CallbackDevice {
             size: 4096,
-            read: Box::new(|_, buf| { buf.fill(0); Ok(()) }),
+            read: Box::new(|_, buf| {
+                buf.fill(0);
+                Ok(())
+            }),
             write: None,
             flush: None,
         };

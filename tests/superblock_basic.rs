@@ -1,8 +1,8 @@
 //! End-to-end: parse the existing test-disks/ext4-basic.img superblock.
 
 use ext4rs::block_io::FileDevice;
-use ext4rs::superblock::Superblock;
 use ext4rs::error::Error;
+use ext4rs::superblock::Superblock;
 
 const TEST_IMAGE: &str = "test-disks/ext4-basic.img";
 
@@ -12,8 +12,11 @@ fn superblock_parses_basic_image() {
     let sb = Superblock::read(&dev).expect("parse superblock");
 
     assert_eq!(sb.magic, 0xEF53, "magic");
-    assert!(sb.block_size() == 1024 || sb.block_size() == 2048
-            || sb.block_size() == 4096, "block_size = {}", sb.block_size());
+    assert!(
+        sb.block_size() == 1024 || sb.block_size() == 2048 || sb.block_size() == 4096,
+        "block_size = {}",
+        sb.block_size()
+    );
     assert!(sb.inodes_count > 0, "inodes_count");
     assert!(sb.blocks_count > 0, "blocks_count");
     assert!(sb.blocks_per_group > 0, "blocks_per_group");
@@ -23,8 +26,14 @@ fn superblock_parses_basic_image() {
     println!("  volume_name = {:?}", sb.volume_name);
     println!("  uuid        = {:02x?}", sb.uuid);
     println!("  block_size  = {}", sb.block_size());
-    println!("  inodes      = {} ({} free)", sb.inodes_count, sb.free_inodes_count);
-    println!("  blocks      = {} ({} free)", sb.blocks_count, sb.free_blocks_count);
+    println!(
+        "  inodes      = {} ({} free)",
+        sb.inodes_count, sb.free_inodes_count
+    );
+    println!(
+        "  blocks      = {} ({} free)",
+        sb.blocks_count, sb.free_blocks_count
+    );
     println!("  groups      = {}", sb.block_group_count());
     println!("  rev_level   = {}", sb.rev_level);
     println!("  inode_size  = {}", sb.inode_size);

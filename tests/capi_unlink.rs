@@ -48,11 +48,17 @@ fn unlink_regular_file_removes_entry_and_persists() {
 
     let fs = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
-    assert!(path_exists(fs, "/test.txt"), "/test.txt should exist before unlink");
+    assert!(
+        path_exists(fs, "/test.txt"),
+        "/test.txt should exist before unlink"
+    );
 
     let rc = unsafe { ext4rs_unlink(fs, path_c.as_ptr()) };
     assert_eq!(rc, 0, "unlink: {}", last_err_str());
-    assert!(!path_exists(fs, "/test.txt"), "/test.txt should not stat after unlink");
+    assert!(
+        !path_exists(fs, "/test.txt"),
+        "/test.txt should not stat after unlink"
+    );
 
     unsafe { ext4rs_umount(fs) };
 

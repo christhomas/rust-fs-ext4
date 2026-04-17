@@ -13,10 +13,7 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -35,7 +32,9 @@ fn scratch() -> PathBuf {
 fn last_err() -> String {
     unsafe {
         let p = ext4rs_last_error();
-        if p.is_null() { return String::new(); }
+        if p.is_null() {
+            return String::new();
+        }
         CStr::from_ptr(p).to_string_lossy().into_owned()
     }
 }
@@ -70,7 +69,10 @@ fn truncate_to_zero_increases_free_blocks() {
     // ext4-basic.img uses 4KB blocks and /test.txt is 16 bytes — fits in
     // exactly one extent leaf (1 physical block). We should see at least 1
     // block freed; accept >= 0 to be robust to any accounting differences.
-    eprintln!("free_blocks: before={before} after={after} delta={}", after - before);
+    eprintln!(
+        "free_blocks: before={before} after={after} delta={}",
+        after - before
+    );
 
     unsafe { ext4rs_umount(fs) };
     let _ = fs::remove_file(&img);

@@ -76,7 +76,8 @@ fn medium_inline_file_uses_xattr_overflow() {
     let expected: Vec<u8> = std::iter::repeat(b'A').take(100).collect();
     assert_eq!(inode.size, 100);
     assert_eq!(
-        data, expected,
+        data,
+        expected,
         "medium.txt content (got {} bytes, want 100)",
         data.len()
     );

@@ -5,8 +5,8 @@
 //! copy of ext4-basic.img so no other tests see the mutation.
 
 use ext4rs::block_io::FileDevice;
-use ext4rs::Filesystem;
 use ext4rs::path as path_mod;
+use ext4rs::Filesystem;
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
     let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
@@ -25,7 +25,9 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() { return None; }
+    if !std::path::Path::new(&src).exists() {
+        return None;
+    }
     let dst = format!("/tmp/ext4rs_trunc_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
@@ -33,7 +35,9 @@ fn copy_to_tmp(name: &str) -> Option<String> {
 
 #[test]
 fn truncate_read_only_device_rejected() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open(&path).expect("open ro");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let ino = resolve(&fs, "/test.txt");
@@ -45,7 +49,9 @@ fn truncate_read_only_device_rejected() {
 
 #[test]
 fn truncate_zero_frees_blocks_and_clears_size() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -65,7 +71,9 @@ fn truncate_zero_frees_blocks_and_clears_size() {
 
 #[test]
 fn truncate_survives_remount() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
 
     // First mount: truncate /test.txt to 4 bytes (file was "hello from ext4.\n").
     {
@@ -87,14 +95,21 @@ fn truncate_survives_remount() {
 
 #[test]
 fn truncate_grow_direction_rejected() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let ino = resolve(&fs, "/test.txt");
     let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
     // apply_truncate_shrink refuses growth.
-    let err = fs.apply_truncate_shrink(ino, inode.size + 4096).unwrap_err();
+    let err = fs
+        .apply_truncate_shrink(ino, inode.size + 4096)
+        .unwrap_err();
     let msg = format!("{err}");
-    assert!(msg.contains("new_size > old_size"), "unexpected error: {msg}");
+    assert!(
+        msg.contains("new_size > old_size"),
+        "unexpected error: {msg}"
+    );
     fs::remove_file(path).ok();
 }

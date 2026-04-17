@@ -12,13 +12,20 @@ use std::os::raw::c_void;
 fn last_err() -> String {
     unsafe {
         let p = ext4rs_last_error();
-        if p.is_null() { return "<null>".into(); }
+        if p.is_null() {
+            return "<null>".into();
+        }
         CStr::from_ptr(p).to_string_lossy().into_owned()
     }
 }
 
 fn image_path(name: &str) -> CString {
-    CString::new(format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)).unwrap()
+    CString::new(format!(
+        "{}/test-disks/{}",
+        env!("CARGO_MANIFEST_DIR"),
+        name
+    ))
+    .unwrap()
 }
 
 fn list_dir(fs: *mut ext4rs_fs_t, path: &str) -> Vec<(String, u8)> {
@@ -30,7 +37,9 @@ fn list_dir(fs: *mut ext4rs_fs_t, path: &str) -> Vec<(String, u8)> {
     let mut entries = Vec::new();
     loop {
         let de = unsafe { ext4rs_dir_next(iter) };
-        if de.is_null() { break; }
+        if de.is_null() {
+            break;
+        }
         let ft = unsafe { (*de).file_type };
         let name_ptr = unsafe { &(*de).name[0] as *const _ };
         let name = unsafe { CStr::from_ptr(name_ptr).to_string_lossy().into_owned() };
@@ -44,9 +53,17 @@ fn read_file_to_string(fs: *mut ext4rs_fs_t, path: &str, max: usize) -> Option<S
     let p = CString::new(path).unwrap();
     let mut buf = vec![0u8; max];
     let n = unsafe {
-        ext4rs_read_file(fs, p.as_ptr(), buf.as_mut_ptr() as *mut c_void, 0, max as u64)
+        ext4rs_read_file(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut c_void,
+            0,
+            max as u64,
+        )
     };
-    if n < 0 { return None; }
+    if n < 0 {
+        return None;
+    }
     buf.truncate(n as usize);
     String::from_utf8(buf).ok()
 }
@@ -65,7 +82,10 @@ fn htree_readdir_returns_all_256_files() {
     }
 
     let entries = list_dir(fs, "/bigdir");
-    let file_count = entries.iter().filter(|(n, _)| n.starts_with("file_")).count();
+    let file_count = entries
+        .iter()
+        .filter(|(n, _)| n.starts_with("file_"))
+        .count();
     // Expect . + .. + 256 files = 258. Tolerate . / .. handling variations.
     assert!(
         file_count == 256,
@@ -105,7 +125,11 @@ fn htree_lookup_specific_file() {
 fn csum_seed_image_mounts() {
     let path = image_path("ext4-csum-seed.img");
     let fs = unsafe { ext4rs_mount(path.as_ptr()) };
-    assert!(!fs.is_null(), "CSUM_SEED image failed to mount: {}", last_err());
+    assert!(
+        !fs.is_null(),
+        "CSUM_SEED image failed to mount: {}",
+        last_err()
+    );
 
     // Read /hello.txt
     let content = read_file_to_string(fs, "/hello.txt", 256);
@@ -150,7 +174,13 @@ fn deep_extent_tree_sparse_file() {
     let p = CString::new("/sparse.bin").unwrap();
     let mut buf = vec![0u8; 128 * 1024];
     let n = unsafe {
-        ext4rs_read_file(fs, p.as_ptr(), buf.as_mut_ptr() as *mut c_void, 0, buf.len() as u64)
+        ext4rs_read_file(
+            fs,
+            p.as_ptr(),
+            buf.as_mut_ptr() as *mut c_void,
+            0,
+            buf.len() as u64,
+        )
     };
     assert!(n > 0, "read /sparse.bin 0..128K: {}", last_err());
 
@@ -172,10 +202,19 @@ fn deep_extent_tree_sparse_file() {
 fn no_csum_image_mounts() {
     let path = image_path("ext4-no-csum.img");
     let fs = unsafe { ext4rs_mount(path.as_ptr()) };
-    assert!(!fs.is_null(), "no-csum image failed to mount: {}", last_err());
+    assert!(
+        !fs.is_null(),
+        "no-csum image failed to mount: {}",
+        last_err()
+    );
 
     let content = read_file_to_string(fs, "/file.txt", 256);
-    assert_eq!(content.as_deref(), Some("no checksum here\n"), "got: {:?}", content);
+    assert_eq!(
+        content.as_deref(),
+        Some("no checksum here\n"),
+        "got: {:?}",
+        content
+    );
 
     unsafe { ext4rs_umount(fs) };
 }
@@ -186,8 +225,13 @@ fn no_csum_image_mounts() {
 
 #[test]
 fn all_images_report_volume_info() {
-    for img in ["ext4-basic.img", "ext4-htree.img", "ext4-csum-seed.img",
-                "ext4-deep-extents.img", "ext4-no-csum.img"] {
+    for img in [
+        "ext4-basic.img",
+        "ext4-htree.img",
+        "ext4-csum-seed.img",
+        "ext4-deep-extents.img",
+        "ext4-no-csum.img",
+    ] {
         let path = image_path(img);
         let fs = unsafe { ext4rs_mount(path.as_ptr()) };
         if fs.is_null() {

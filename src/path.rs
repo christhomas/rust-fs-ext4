@@ -48,7 +48,10 @@ where
     // Backwards-compatible shim — defers to `lookup_with_csum` with a
     // disabled `Checksummer` so callers that don't have one keep working
     // (verification is silently skipped).
-    let csum = crate::checksum::Checksummer { seed: 0, enabled: false };
+    let csum = crate::checksum::Checksummer {
+        seed: 0,
+        enabled: false,
+    };
     lookup_with_csum(dev, sb, read_inode, path, &csum)
 }
 
@@ -115,7 +118,16 @@ fn find_entry(
         // scan as a safety net (covers edge cases / corruption).
     }
 
-    find_entry_linear(dev, sb, dir_ino, dir_inode, name, has_filetype, block_size, csum)
+    find_entry_linear(
+        dev,
+        sb,
+        dir_ino,
+        dir_inode,
+        name,
+        has_filetype,
+        block_size,
+        csum,
+    )
 }
 
 /// Linear scan of every directory data block.
@@ -214,7 +226,9 @@ fn find_entry_htree(
         && dir::has_csum_tail(&leaf)
         && !csum.verify_dir_entry_tail(dir_ino, dir_inode.generation, &leaf)
     {
-        return Err(Error::BadChecksum { what: "directory block" });
+        return Err(Error::BadChecksum {
+            what: "directory block",
+        });
     }
 
     for entry in dir::DirBlockIter::new(&leaf, has_filetype) {
@@ -318,8 +332,12 @@ mod tests {
         let fs = Filesystem::mount(dev.clone()).expect("mount");
         let mut reader = read_inode_fn(&fs);
 
-        let result = lookup(dev.as_ref(), &fs.sb, &mut reader,
-                            "/this-does-not-exist-xyz");
+        let result = lookup(
+            dev.as_ref(),
+            &fs.sb,
+            &mut reader,
+            "/this-does-not-exist-xyz",
+        );
         assert!(matches!(result, Err(Error::NotFound)), "got {result:?}");
     }
 
@@ -341,14 +359,12 @@ mod tests {
         let root = reader(EXT4_ROOT_INODE).expect("root inode");
         let block_size = fs.sb.block_size();
         let total_blocks = (root.size + block_size as u64 - 1) / block_size as u64;
-        let has_filetype =
-            fs.sb.feature_incompat & crate::features::Incompat::FILETYPE.bits() != 0;
+        let has_filetype = fs.sb.feature_incompat & crate::features::Incompat::FILETYPE.bits() != 0;
 
         let mut reg_file_name: Option<Vec<u8>> = None;
         'outer: for logical in 0..total_blocks {
-            if let Some(phys) =
-                extent::map_logical(&root.block, dev.as_ref(), block_size, logical)
-                    .expect("map logical")
+            if let Some(phys) = extent::map_logical(&root.block, dev.as_ref(), block_size, logical)
+                .expect("map logical")
             {
                 let mut blk = vec![0u8; block_size as usize];
                 dev.read_at(phys * block_size as u64, &mut blk).unwrap();
@@ -370,7 +386,9 @@ mod tests {
         let bad_path = format!("/{name_str}/child");
 
         let result = lookup(dev.as_ref(), &fs.sb, &mut reader, &bad_path);
-        assert!(matches!(result, Err(Error::NotADirectory)),
-                "got {result:?} for path {bad_path}");
+        assert!(
+            matches!(result, Err(Error::NotADirectory)),
+            "got {result:?} for path {bad_path}"
+        );
     }
 }

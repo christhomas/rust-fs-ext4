@@ -16,9 +16,15 @@ fn split_parent_and_base(path: &str) -> Result<(String, String)> {
     if trimmed.is_empty() {
         return Err(Error::InvalidArgument("empty path"));
     }
-    let last_slash = trimmed.rfind('/').ok_or(Error::InvalidArgument("relative path"))?;
+    let last_slash = trimmed
+        .rfind('/')
+        .ok_or(Error::InvalidArgument("relative path"))?;
     let base = &trimmed[last_slash + 1..];
-    let parent = if last_slash == 0 { "/" } else { &trimmed[..last_slash] };
+    let parent = if last_slash == 0 {
+        "/"
+    } else {
+        &trimmed[..last_slash]
+    };
     if base.is_empty() {
         // Trailing slash on a non-dir path is POSIX ENOTDIR, not a generic arg error.
         return Err(Error::NotADirectory);
@@ -59,7 +65,12 @@ impl Filesystem {
             return Err(Error::BadChecksum { what: "superblock" });
         }
         let groups = bgd::read_all(dev.as_ref(), &sb, &csum)?;
-        let fs = Self { dev, sb, groups, csum };
+        let fs = Self {
+            dev,
+            sb,
+            groups,
+            csum,
+        };
 
         // Replay a dirty journal if the device is writable. Silently skips
         // for read-only mounts — the read path tolerates a non-clean journal
@@ -101,9 +112,7 @@ impl Filesystem {
     pub fn read_inode_verified(&self, ino: u32) -> Result<(Inode, Vec<u8>)> {
         let raw = self.read_inode_raw(ino)?;
         let inode = Inode::parse(&raw)?;
-        if self.csum.enabled
-            && !self.csum.verify_inode(ino, inode.generation, &raw)
-        {
+        if self.csum.enabled && !self.csum.verify_inode(ino, inode.generation, &raw) {
             return Err(Error::BadChecksum { what: "inode" });
         }
         Ok((inode, raw))
@@ -133,7 +142,11 @@ impl Filesystem {
     /// other bytes (including the extent tree header + entries in `i_block`)
     /// intact. `new_block_count` is in 512-byte sectors per spec (same
     /// convention as `Inode::blocks`).
-    pub fn patch_inode_size_and_blocks(raw: &mut [u8], new_size: u64, new_block_count: u64) -> Result<()> {
+    pub fn patch_inode_size_and_blocks(
+        raw: &mut [u8],
+        new_size: u64,
+        new_block_count: u64,
+    ) -> Result<()> {
         if raw.len() < 128 {
             return Err(Error::Corrupt("patch_inode: buffer too small"));
         }
@@ -157,7 +170,9 @@ impl Filesystem {
             return Err(Error::Corrupt("patch_inode_block_area: buffer too small"));
         }
         if new_root.len() != 60 {
-            return Err(Error::Corrupt("patch_inode_block_area: new_root != 60 bytes"));
+            return Err(Error::Corrupt(
+                "patch_inode_block_area: new_root != 60 bytes",
+            ));
         }
         raw[0x28..0x64].copy_from_slice(new_root);
         Ok(())
@@ -177,7 +192,9 @@ impl Filesystem {
         }
         let (inode, mut raw) = self.read_inode_verified(ino)?;
         if new_size > inode.size {
-            return Err(Error::InvalidArgument("truncate: new_size > old_size (grow not supported)"));
+            return Err(Error::InvalidArgument(
+                "truncate: new_size > old_size (grow not supported)",
+            ));
         }
 
         let (_size_change, muts) = crate::file_mut::plan_truncate_shrink(
@@ -218,7 +235,10 @@ impl Filesystem {
         // Write the inode back. Recompute + splice the inode checksum first
         // so CSUM-enabled mounts see a valid inode on the next read.
         if self.csum.enabled {
-            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, inode.generation, &raw) {
+            if let Some((lo, hi)) = self
+                .csum
+                .compute_inode_checksum(ino, inode.generation, &raw)
+            {
                 raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
                 if raw.len() >= 0x84 {
                     raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
@@ -259,12 +279,8 @@ impl Filesystem {
 
         // Resolve parent + target inodes.
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino_num = crate::path::lookup(
-            self.dev.as_ref(),
-            &self.sb,
-            &mut reader,
-            &parent_ino,
-        )?;
+        let parent_ino_num =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_ino)?;
         let (parent_inode, _parent_raw) = self.read_inode_verified(parent_ino_num)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
@@ -290,23 +306,32 @@ impl Filesystem {
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut removed = false;
         for logical in 0..parent_blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &parent_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let mut block = self.read_block(phys)?;
             // `dir_entry_tail` occupies the last 12 bytes when metadata_csum
             // is on; don't scribble over it.
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) { 12 } else { 0 };
-            if crate::dir::remove_entry_from_block(&mut block, base_name.as_bytes(), has_ft, reserved_tail)? {
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+                12
+            } else {
+                0
+            };
+            if crate::dir::remove_entry_from_block(
+                &mut block,
+                base_name.as_bytes(),
+                has_ft,
+                reserved_tail,
+            )? {
                 // Recompute the tail csum if present — entry-list shape changed.
                 if self.csum.enabled && reserved_tail == 12 {
                     let end = block.len();
-                    let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino_num.to_le_bytes());
+                    let mut c = crate::checksum::linux_crc32c(
+                        self.csum.seed,
+                        &parent_ino_num.to_le_bytes(),
+                    );
                     c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
                     c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                     block[end - 4..end].copy_from_slice(&c.to_le_bytes());
@@ -327,10 +352,11 @@ impl Filesystem {
 
         if new_links > 0 {
             if self.csum.enabled {
-                if let Some((lo, hi)) = self
-                    .csum
-                    .compute_inode_checksum(target_ino, target_inode.generation, &target_raw)
-                {
+                if let Some((lo, hi)) = self.csum.compute_inode_checksum(
+                    target_ino,
+                    target_inode.generation,
+                    &target_raw,
+                ) {
                     target_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
                     if target_raw.len() >= 0x84 {
                         target_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
@@ -369,7 +395,11 @@ impl Filesystem {
         self.free_inode_slot(target_ino)?;
 
         // Update SB counters: free_inodes_count++, free_blocks_count += (freed_sectors / sectors_per_block).
-        let freed_blocks = if sectors_per_block > 0 { freed_sectors / sectors_per_block } else { 0 };
+        let freed_blocks = if sectors_per_block > 0 {
+            freed_sectors / sectors_per_block
+        } else {
+            0
+        };
         self.patch_sb_counters(freed_blocks as i64, 1)?;
         // Also credit the freed data blocks to the group's bg_free_blocks_count.
         if freed_blocks > 0 && target_inode.has_extents() {
@@ -388,16 +418,18 @@ impl Filesystem {
         // generation.
         let inode_size = self.sb.inode_size as usize;
         let old_gen = target_inode.generation;
-        for b in &mut target_raw[..inode_size] { *b = 0; }
+        for b in &mut target_raw[..inode_size] {
+            *b = 0;
+        }
         // dtime at offset 0x14..0x18
         let dtime = now_unix_seconds();
         target_raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
         // restore generation at 0x64..0x68
         target_raw[0x64..0x68].copy_from_slice(&old_gen.to_le_bytes());
         if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(target_ino, old_gen, &target_raw)
+            if let Some((lo, hi)) =
+                self.csum
+                    .compute_inode_checksum(target_ino, old_gen, &target_raw)
             {
                 target_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
                 if target_raw.len() >= 0x84 {
@@ -435,17 +467,16 @@ impl Filesystem {
 
         // Resolve parent. Refuse if target already exists.
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino_num = crate::path::lookup(
-            self.dev.as_ref(),
-            &self.sb,
-            &mut reader,
-            &parent_path,
-        )?;
+        let parent_ino_num =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
         let (parent_inode, _parent_raw) = self.read_inode_verified(parent_ino_num)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
         }
-        if self.find_entry_in_dir(&parent_inode, base_name.as_bytes()).is_ok() {
+        if self
+            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
+            .is_ok()
+        {
             return Err(Error::AlreadyExists);
         }
 
@@ -474,10 +505,7 @@ impl Filesystem {
             plan.bgd.free_inodes_delta,
             plan.bgd.used_dirs_delta,
         )?;
-        self.patch_sb_counters(
-            plan.sb.free_blocks_delta as i64,
-            plan.sb.free_inodes_delta,
-        )?;
+        self.patch_sb_counters(plan.sb.free_blocks_delta as i64, plan.sb.free_inodes_delta)?;
 
         // Build + write the inode.
         let raw = self.build_regular_file_inode(new_ino, mode)?;
@@ -488,16 +516,17 @@ impl Filesystem {
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut added = false;
         for logical in 0..parent_blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &parent_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) { 12 } else { 0 };
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+                12
+            } else {
+                0
+            };
             match crate::dir::add_entry_to_block(
                 &mut block,
                 new_ino,
@@ -509,8 +538,14 @@ impl Filesystem {
                 Ok(()) => {
                     if self.csum.enabled && reserved_tail == 12 {
                         let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino_num.to_le_bytes());
-                        c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
+                        let mut c = crate::checksum::linux_crc32c(
+                            self.csum.seed,
+                            &parent_ino_num.to_le_bytes(),
+                        );
+                        c = crate::checksum::linux_crc32c(
+                            c,
+                            &parent_inode.generation.to_le_bytes(),
+                        );
                         c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                         block[end - 4..end].copy_from_slice(&c.to_le_bytes());
                     }
@@ -565,22 +600,22 @@ impl Filesystem {
         raw[eh_off + 2..eh_off + 4].copy_from_slice(&0u16.to_le_bytes()); // entries
         raw[eh_off + 4..eh_off + 6].copy_from_slice(&4u16.to_le_bytes()); // max
         raw[eh_off + 6..eh_off + 8].copy_from_slice(&0u16.to_le_bytes()); // depth
-        // eh_generation at eh_off+8..eh_off+12 stays zero
+                                                                          // eh_generation at eh_off+8..eh_off+12 stays zero
 
         // Timestamps: atime 0x08, ctime 0x0C, mtime 0x10, dtime 0x14
         let now = now_unix_seconds();
         raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
-        // dtime stays zero (not deleted).
+                                                             // dtime stays zero (not deleted).
 
         // i_generation at 0x64..0x68. We combine pid + a process-lifetime
         // counter so successive creates within the same session have
         // different generations.
         use std::sync::atomic::{AtomicU32, Ordering};
         static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
-        let generation = (std::process::id() as u32)
-            .wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let generation =
+            (std::process::id() as u32).wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
         raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
 
         // i_extra_isize at 0x80..0x82 — 32 is the modern default (room for
@@ -619,10 +654,14 @@ impl Filesystem {
         let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
         if !inode.is_file() {
-            return Err(Error::InvalidArgument("write_file target is not a regular file"));
+            return Err(Error::InvalidArgument(
+                "write_file target is not a regular file",
+            ));
         }
         if !inode.has_extents() {
-            return Err(Error::InvalidArgument("write_file target is non-EXTENTS (legacy inode)"));
+            return Err(Error::InvalidArgument(
+                "write_file target is non-EXTENTS (legacy inode)",
+            ));
         }
 
         let bs = self.sb.block_size();
@@ -633,12 +672,8 @@ impl Filesystem {
         // planner which handles partial tail extents cleanly.
         let mut freed_fs_blocks: u64 = 0;
         if inode.size > 0 {
-            let (_sc, muts) = crate::file_mut::plan_truncate_shrink(
-                inode.size,
-                0,
-                &inode.block,
-                bs,
-            )?;
+            let (_sc, muts) =
+                crate::file_mut::plan_truncate_shrink(inode.size, 0, &inode.block, bs)?;
             for m in &muts {
                 if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
                     self.free_block_run(*start, *len as u64)?;
@@ -713,7 +748,8 @@ impl Filesystem {
             let chunk_end = ((i as usize + 1) * bs as usize).min(data.len());
             let mut block = vec![0u8; bs as usize];
             block[..chunk_end - off_in_data].copy_from_slice(&data[off_in_data..chunk_end]);
-            self.dev.write_at((plan.first_block + i) * bs as u64, &block)?;
+            self.dev
+                .write_at((plan.first_block + i) * bs as u64, &block)?;
         }
 
         // Phase 5: insert the single extent into the (now-empty) inline root.
@@ -800,12 +836,9 @@ impl Filesystem {
         let bs = self.sb.block_size();
         let n_blocks = dir_inode.size.div_ceil(bs as u64);
         for logical in 0..n_blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &dir_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&dir_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let block = self.read_block(phys)?;
@@ -910,14 +943,22 @@ impl Filesystem {
         patch_u32(
             &mut block,
             off_in_block + 0x0C,
-            if desc_size >= 0x40 { Some(off_in_block + 0x2A) } else { None },
+            if desc_size >= 0x40 {
+                Some(off_in_block + 0x2A)
+            } else {
+                None
+            },
             free_blocks_delta,
         );
         // Free-inodes: 16-bit at 0x0E, hi at 0x2C when 64-bit
         patch_u32(
             &mut block,
             off_in_block + 0x0E,
-            if desc_size >= 0x40 { Some(off_in_block + 0x2C) } else { None },
+            if desc_size >= 0x40 {
+                Some(off_in_block + 0x2C)
+            } else {
+                None
+            },
             free_inodes_delta,
         );
         // Used-dirs: 16-bit only (kernel defines u16+u16 hi at 0x2E too, but
@@ -925,7 +966,11 @@ impl Filesystem {
         patch_u32(
             &mut block,
             off_in_block + 0x10,
-            if desc_size >= 0x40 { Some(off_in_block + 0x2E) } else { None },
+            if desc_size >= 0x40 {
+                Some(off_in_block + 0x2E)
+            } else {
+                None
+            },
             used_dirs_delta,
         );
         let _ = patch_u16;
@@ -963,7 +1008,8 @@ impl Filesystem {
             let csum = crate::checksum::linux_crc32c(!0, &sb_raw[..0x3FC]);
             sb_raw[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
         }
-        self.dev.write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb_raw)?;
+        self.dev
+            .write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb_raw)?;
         Ok(())
     }
 
@@ -1049,16 +1095,15 @@ impl Filesystem {
         raw[0x1A..0x1C].copy_from_slice(&2u16.to_le_bytes());
 
         // i_flags = EXTENTS
-        raw[0x20..0x24]
-            .copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
+        raw[0x20..0x24].copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
 
         // i_block (60 B): extent header (leaf, 1 entry, max 4) + one Extent.
         let eh = 0x28;
         raw[eh..eh + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
         raw[eh + 2..eh + 4].copy_from_slice(&1u16.to_le_bytes()); // entries
         raw[eh + 4..eh + 6].copy_from_slice(&4u16.to_le_bytes()); // max
-        // depth=0 leaf, generation=0
-        // Entry at eh+12..eh+24: logical 0, len 1, phys = data_phys_block.
+                                                                  // depth=0 leaf, generation=0
+                                                                  // Entry at eh+12..eh+24: logical 0, len 1, phys = data_phys_block.
         let e = eh + 12;
         raw[e..e + 4].copy_from_slice(&0u32.to_le_bytes()); // logical
         raw[e + 4..e + 6].copy_from_slice(&1u16.to_le_bytes()); // length
@@ -1089,8 +1134,8 @@ impl Filesystem {
         // successive mkdir calls have distinct values.
         use std::sync::atomic::{AtomicU32, Ordering};
         static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
-        let generation = (std::process::id() as u32)
-            .wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
+        let generation =
+            (std::process::id() as u32).wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
         raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
 
         if inode_size >= 0x82 + 2 {
@@ -1098,9 +1143,7 @@ impl Filesystem {
         }
 
         if self.csum.enabled {
-            if let Some((lo16, hi16)) =
-                self.csum.compute_inode_checksum(ino, generation, &raw)
-            {
+            if let Some((lo16, hi16)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
                 raw[0x7C..0x7E].copy_from_slice(&lo16.to_le_bytes());
                 if raw.len() >= 0x84 {
                     raw[0x82..0x84].copy_from_slice(&hi16.to_le_bytes());
@@ -1130,7 +1173,11 @@ impl Filesystem {
         block[0..4].copy_from_slice(&new_ino.to_le_bytes());
         block[4..6].copy_from_slice(&12u16.to_le_bytes());
         block[6] = 1; // name_len
-        block[7] = if has_ft { crate::dir::DirEntryType::Directory as u8 } else { 0 };
+        block[7] = if has_ft {
+            crate::dir::DirEntryType::Directory as u8
+        } else {
+            0
+        };
         block[8] = b'.';
 
         // ".." entry: rec_len absorbs the rest of the usable region.
@@ -1139,7 +1186,11 @@ impl Filesystem {
         let rec_len = (usable - off) as u16;
         block[off + 4..off + 6].copy_from_slice(&rec_len.to_le_bytes());
         block[off + 6] = 2;
-        block[off + 7] = if has_ft { crate::dir::DirEntryType::Directory as u8 } else { 0 };
+        block[off + 7] = if has_ft {
+            crate::dir::DirEntryType::Directory as u8
+        } else {
+            0
+        };
         block[off + 8] = b'.';
         block[off + 9] = b'.';
 
@@ -1151,7 +1202,7 @@ impl Filesystem {
             block[tail + 4..tail + 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
             block[tail + 6] = 0; // name_len
             block[tail + 7] = 0xDE; // file_type marker
-            // CRC32C over [0 .. bs - 12] salted by ino + gen.
+                                    // CRC32C over [0 .. bs - 12] salted by ino + gen.
             let mut c = crate::checksum::linux_crc32c(self.csum.seed, &new_ino.to_le_bytes());
             c = crate::checksum::linux_crc32c(c, &new_generation.to_le_bytes());
             c = crate::checksum::linux_crc32c(c, &block[..bs - 12]);
@@ -1162,13 +1213,7 @@ impl Filesystem {
     }
 
     /// Adjust `i_links_count` on a raw inode image. Recomputes CSUM.
-    fn patch_inode_nlink(
-        &self,
-        ino: u32,
-        raw: &mut [u8],
-        inode: &Inode,
-        delta: i32,
-    ) -> Result<()> {
+    fn patch_inode_nlink(&self, ino: u32, raw: &mut [u8], inode: &Inode, delta: i32) -> Result<()> {
         let new_count = (inode.links_count as i32 + delta).max(0) as u16;
         raw[0x1A..0x1C].copy_from_slice(&new_count.to_le_bytes());
         if self.csum.enabled {
@@ -1200,7 +1245,8 @@ impl Filesystem {
         }
 
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let parent_ino =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
         let (parent_inode, mut parent_raw) = self.read_inode_verified(parent_ino)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
@@ -1277,16 +1323,17 @@ impl Filesystem {
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut added = false;
         for logical in 0..parent_blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &parent_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) { 12 } else { 0 };
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+                12
+            } else {
+                0
+            };
             match crate::dir::add_entry_to_block(
                 &mut block,
                 new_ino,
@@ -1298,8 +1345,14 @@ impl Filesystem {
                 Ok(()) => {
                     if self.csum.enabled && reserved_tail == 12 {
                         let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-                        c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
+                        let mut c = crate::checksum::linux_crc32c(
+                            self.csum.seed,
+                            &parent_ino.to_le_bytes(),
+                        );
+                        c = crate::checksum::linux_crc32c(
+                            c,
+                            &parent_inode.generation.to_le_bytes(),
+                        );
                         c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                         block[end - 4..end].copy_from_slice(&c.to_le_bytes());
                     }
@@ -1354,8 +1407,7 @@ impl Filesystem {
         }
 
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let src_ino =
-            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, src)?;
+        let src_ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, src)?;
         let (src_inode, mut src_raw) = self.read_inode_verified(src_ino)?;
         if src_inode.is_dir() {
             // POSIX: hard-linking a directory is forbidden. Map to EISDIR
@@ -1430,8 +1482,10 @@ impl Filesystem {
         }
 
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let src_parent_ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &src_parent_path)?;
-        let dst_parent_ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &dst_parent_path)?;
+        let src_parent_ino =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &src_parent_path)?;
+        let dst_parent_ino =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &dst_parent_path)?;
         let (src_parent_inode, _) = self.read_inode_verified(src_parent_ino)?;
         let (dst_parent_inode, _) = self.read_inode_verified(dst_parent_ino)?;
         if !src_parent_inode.is_dir() || !dst_parent_inode.is_dir() {
@@ -1439,7 +1493,10 @@ impl Filesystem {
         }
 
         let src_ino = self.find_entry_in_dir(&src_parent_inode, src_name.as_bytes())?;
-        if self.find_entry_in_dir(&dst_parent_inode, dst_name.as_bytes()).is_ok() {
+        if self
+            .find_entry_in_dir(&dst_parent_inode, dst_name.as_bytes())
+            .is_ok()
+        {
             return Err(Error::AlreadyExists);
         }
 
@@ -1451,7 +1508,9 @@ impl Filesystem {
         if src_is_dir {
             let src_slash = format!("{}/", src.trim_end_matches('/'));
             if dst == src || dst.starts_with(&src_slash) {
-                return Err(Error::InvalidArgument("rename: cannot move directory into its own subtree"));
+                return Err(Error::InvalidArgument(
+                    "rename: cannot move directory into its own subtree",
+                ));
             }
         }
 
@@ -1513,16 +1572,17 @@ impl Filesystem {
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
         let n_blocks = parent_inode.size.div_ceil(bs as u64);
         for logical in 0..n_blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &parent_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) { 12 } else { 0 };
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+                12
+            } else {
+                0
+            };
             match crate::dir::add_entry_to_block(
                 &mut block,
                 target_ino,
@@ -1534,8 +1594,14 @@ impl Filesystem {
                 Ok(()) => {
                     if self.csum.enabled && reserved_tail == 12 {
                         let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
-                        c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
+                        let mut c = crate::checksum::linux_crc32c(
+                            self.csum.seed,
+                            &parent_ino.to_le_bytes(),
+                        );
+                        c = crate::checksum::linux_crc32c(
+                            c,
+                            &parent_inode.generation.to_le_bytes(),
+                        );
                         c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                         block[end - 4..end].copy_from_slice(&c.to_le_bytes());
                     }
@@ -1615,11 +1681,10 @@ impl Filesystem {
 
         // 4. Recompute parent inode CSUM and write it back.
         if self.csum.enabled {
-            if let Some((lo, hi)) = self.csum.compute_inode_checksum(
-                parent_ino,
-                parent_inode.generation,
-                &parent_raw,
-            ) {
+            if let Some((lo, hi)) =
+                self.csum
+                    .compute_inode_checksum(parent_ino, parent_inode.generation, &parent_raw)
+            {
                 parent_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
                 if parent_raw.len() >= 0x84 {
                     parent_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
@@ -1673,30 +1738,27 @@ impl Filesystem {
 
     /// Remove `name` from `parent_inode`'s linear directory blocks. Errors
     /// if the name isn't found in any block.
-    fn remove_dir_entry(
-        &self,
-        parent_ino: u32,
-        parent_inode: &Inode,
-        name: &[u8],
-    ) -> Result<()> {
+    fn remove_dir_entry(&self, parent_ino: u32, parent_inode: &Inode, name: &[u8]) -> Result<()> {
         let bs = self.sb.block_size();
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
         let n_blocks = parent_inode.size.div_ceil(bs as u64);
         for logical in 0..n_blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &parent_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) { 12 } else { 0 };
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+                12
+            } else {
+                0
+            };
             if crate::dir::remove_entry_from_block(&mut block, name, has_ft, reserved_tail)? {
                 if self.csum.enabled && reserved_tail == 12 {
                     let end = block.len();
-                    let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
+                    let mut c =
+                        crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
                     c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
                     c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                     block[end - 4..end].copy_from_slice(&c.to_le_bytes());
@@ -1715,13 +1777,8 @@ impl Filesystem {
     /// ino + generation, hence both are required.
     fn update_dotdot(&self, dir_ino: u32, dir_inode: &Inode, new_parent_ino: u32) -> Result<()> {
         let bs = self.sb.block_size();
-        let phys = crate::extent::map_logical(
-            &dir_inode.block,
-            self.dev.as_ref(),
-            bs,
-            0,
-        )?
-        .ok_or(Error::Corrupt("update_dotdot: dir block 0 missing"))?;
+        let phys = crate::extent::map_logical(&dir_inode.block, self.dev.as_ref(), bs, 0)?
+            .ok_or(Error::Corrupt("update_dotdot: dir block 0 missing"))?;
         let mut block = self.read_block(phys)?;
         if block.len() < 24 {
             return Err(Error::Corrupt("update_dotdot: dir block too small"));
@@ -1748,7 +1805,8 @@ impl Filesystem {
         }
         let (parent_path, base_name) = split_parent_and_base(path)?;
         let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
-        let parent_ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let parent_ino =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
         let (parent_inode, mut parent_raw) = self.read_inode_verified(parent_ino)?;
         if !parent_inode.is_dir() {
             return Err(Error::NotADirectory);
@@ -1764,12 +1822,9 @@ impl Filesystem {
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
         let blocks = target_inode.size.div_ceil(bs as u64);
         for logical in 0..blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &target_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&target_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let block = self.read_block(phys)?;
@@ -1809,16 +1864,17 @@ impl Filesystem {
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut removed = false;
         for logical in 0..parent_blocks {
-            let Some(phys) = crate::extent::map_logical(
-                &parent_inode.block,
-                self.dev.as_ref(),
-                bs,
-                logical,
-            )? else {
+            let Some(phys) =
+                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
                 continue;
             };
             let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) { 12 } else { 0 };
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+                12
+            } else {
+                0
+            };
             if crate::dir::remove_entry_from_block(
                 &mut block,
                 base_name.as_bytes(),
@@ -1827,7 +1883,8 @@ impl Filesystem {
             )? {
                 if self.csum.enabled && reserved_tail == 12 {
                     let end = block.len();
-                    let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
+                    let mut c =
+                        crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
                     c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
                     c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                     block[end - 4..end].copy_from_slice(&c.to_le_bytes());

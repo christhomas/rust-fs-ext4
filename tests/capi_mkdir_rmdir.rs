@@ -147,7 +147,10 @@ fn mkdir_refuses_on_ro_mount() {
     let ino = unsafe { ext4rs_mkdir(fs, path_c.as_ptr(), 0o755) };
     assert_eq!(ino, 0);
     let err = last_err_str();
-    assert!(err.contains("read-only") || err.contains("apply_mkdir"), "RO error: {err}");
+    assert!(
+        err.contains("read-only") || err.contains("apply_mkdir"),
+        "RO error: {err}"
+    );
     unsafe { ext4rs_umount(fs) };
 }
 
@@ -171,7 +174,10 @@ fn rmdir_removes_empty_directory_and_persists() {
 
     let fs2 = unsafe { ext4rs_mount(img_c.as_ptr()) };
     assert!(!fs2.is_null(), "remount: {}", last_err_str());
-    assert!(!path_exists(fs2, "/tmpdir"), "dir should stay gone after remount");
+    assert!(
+        !path_exists(fs2, "/tmpdir"),
+        "dir should stay gone after remount"
+    );
     unsafe { ext4rs_umount(fs2) };
 
     std::fs::remove_file(&img).ok();
@@ -259,9 +265,15 @@ fn mkdir_rmdir_null_inputs_do_not_crash() {
     assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
 
     let p = CString::new("/x").unwrap();
-    assert_eq!(unsafe { ext4rs_mkdir(std::ptr::null_mut(), p.as_ptr(), 0o755) }, 0);
+    assert_eq!(
+        unsafe { ext4rs_mkdir(std::ptr::null_mut(), p.as_ptr(), 0o755) },
+        0
+    );
     assert_eq!(unsafe { ext4rs_mkdir(fs, std::ptr::null(), 0o755) }, 0);
-    assert_eq!(unsafe { ext4rs_rmdir(std::ptr::null_mut(), p.as_ptr()) }, -1);
+    assert_eq!(
+        unsafe { ext4rs_rmdir(std::ptr::null_mut(), p.as_ptr()) },
+        -1
+    );
     assert_eq!(unsafe { ext4rs_rmdir(fs, std::ptr::null()) }, -1);
 
     unsafe { ext4rs_umount(fs) };

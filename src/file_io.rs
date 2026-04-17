@@ -19,7 +19,13 @@ use crate::inode::{Inode, InodeFlags};
 /// content lives in the inode's xattr region which the parsed `Inode` doesn't
 /// carry. Callers must use [`read_with_raw`] or [`read_inline`] instead;
 /// this function returns `Err(Corrupt)` on inline inodes.
-pub fn read(fs: &Filesystem, inode: &Inode, offset: u64, length: u64, out: &mut [u8]) -> Result<u64> {
+pub fn read(
+    fs: &Filesystem,
+    inode: &Inode,
+    offset: u64,
+    length: u64,
+    out: &mut [u8],
+) -> Result<u64> {
     if length == 0 || out.is_empty() {
         return Ok(0);
     }
@@ -36,7 +42,9 @@ pub fn read(fs: &Filesystem, inode: &Inode, offset: u64, length: u64, out: &mut 
     // Without EXTENTS, fall back would be the legacy indirect block scheme.
     // We don't support that in Phase 1 — modern mkfs always uses extents.
     if (inode.flags & InodeFlags::EXTENTS.bits()) == 0 {
-        return Err(Error::Corrupt("legacy indirect blocks not supported (use extents)"));
+        return Err(Error::Corrupt(
+            "legacy indirect blocks not supported (use extents)",
+        ));
     }
 
     // Clamp length to file size.
@@ -63,7 +71,12 @@ pub fn read(fs: &Filesystem, inode: &Inode, offset: u64, length: u64, out: &mut 
 
         let dst = &mut out[written as usize..written as usize + copy_len];
 
-        match extent::lookup(&inode.block, fs.dev.as_ref(), fs.sb.block_size(), logical_block)? {
+        match extent::lookup(
+            &inode.block,
+            fs.dev.as_ref(),
+            fs.sb.block_size(),
+            logical_block,
+        )? {
             None => {
                 // Sparse hole — fill with zeros.
                 dst.fill(0);
@@ -165,7 +178,9 @@ pub fn read_verified(
         ));
     }
     if (inode.flags & InodeFlags::EXTENTS.bits()) == 0 {
-        return Err(Error::Corrupt("legacy indirect blocks not supported (use extents)"));
+        return Err(Error::Corrupt(
+            "legacy indirect blocks not supported (use extents)",
+        ));
     }
     if offset >= inode.size {
         return Ok(0);
@@ -177,7 +192,11 @@ pub fn read_verified(
 
     let block_size = fs.sb.block_size() as u64;
     let bs32 = fs.sb.block_size();
-    let ctx = extent::ExtentVerifyCtx { ino, generation: inode.generation, csum: &fs.csum };
+    let ctx = extent::ExtentVerifyCtx {
+        ino,
+        generation: inode.generation,
+        csum: &fs.csum,
+    };
     let mut written: u64 = 0;
     let mut cur_offset = offset;
     let end_offset = offset + max_read;
@@ -190,7 +209,13 @@ pub fn read_verified(
         let copy_len = bytes_available_in_block.min(bytes_remaining);
         let dst = &mut out[written as usize..written as usize + copy_len];
 
-        match extent::lookup_verified(&inode.block, fs.dev.as_ref(), bs32, logical_block, Some(&ctx))? {
+        match extent::lookup_verified(
+            &inode.block,
+            fs.dev.as_ref(),
+            bs32,
+            logical_block,
+            Some(&ctx),
+        )? {
             None => dst.fill(0),
             Some(ext) if ext.uninitialized => dst.fill(0),
             Some(ext) => {

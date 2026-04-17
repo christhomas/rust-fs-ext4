@@ -8,10 +8,7 @@ use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::c_void;
 
-const IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 extern "C" fn read_from_vec(
     ctx: *mut c_void,
@@ -19,10 +16,14 @@ extern "C" fn read_from_vec(
     offset: u64,
     length: u64,
 ) -> std::os::raw::c_int {
-    if ctx.is_null() || buf.is_null() { return 1; }
+    if ctx.is_null() || buf.is_null() {
+        return 1;
+    }
     let bytes = unsafe { &*(ctx as *const Vec<u8>) };
     let end = (offset as usize).checked_add(length as usize);
-    if end.map_or(true, |e| e > bytes.len()) { return 2; }
+    if end.map_or(true, |e| e > bytes.len()) {
+        return 2;
+    }
     unsafe {
         std::ptr::copy_nonoverlapping(
             bytes.as_ptr().add(offset as usize),
@@ -47,7 +48,9 @@ fn mount_ro(bytes: &Vec<u8>) -> *mut ext4rs_fs_t {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 

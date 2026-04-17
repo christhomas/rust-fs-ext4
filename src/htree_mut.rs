@@ -82,7 +82,9 @@ fn read_leaf_entries(
         let cur_inode = u32::from_le_bytes(leaf[off..off + 4].try_into().unwrap());
         let rec_len = u16::from_le_bytes(leaf[off + 4..off + 6].try_into().unwrap()) as usize;
         if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > usable {
-            return Err(Error::CorruptDirEntry("bad rec_len during htree leaf split"));
+            return Err(Error::CorruptDirEntry(
+                "bad rec_len during htree leaf split",
+            ));
         }
 
         if cur_inode != 0 {
@@ -94,7 +96,9 @@ fn read_leaf_entries(
                 ((type_or_hi as usize) << 8) | name_len_lo as usize
             };
             if 8 + name_len > rec_len {
-                return Err(Error::CorruptDirEntry("name overflows rec_len in htree split"));
+                return Err(Error::CorruptDirEntry(
+                    "name overflows rec_len in htree split",
+                ));
             }
             let name = &leaf[off + 8..off + 8 + name_len];
             let h = name_hash(name, hash_version, hash_seed);
@@ -264,7 +268,13 @@ fn plan_insert_dx_entry_generic(
         .map(|p| p + 1)
         .unwrap_or(existing.len());
     let mut merged = existing.clone();
-    merged.insert(pos, DxEntry { hash: new_hash, block: new_block });
+    merged.insert(
+        pos,
+        DxEntry {
+            hash: new_hash,
+            block: new_block,
+        },
+    );
 
     // Emit updated block: preserve everything before cl_offset, bump count,
     // serialize the new entry array.
@@ -317,27 +327,31 @@ mod tests {
     #[test]
     fn leaf_split_balances_entries() {
         let leaf = make_populated_leaf(40, 4096, 0);
-        let split = plan_leaf_split(
-            &leaf,
-            HashVersion::HalfMd4,
-            &[0; 4],
-            true,
-            4096,
-            0,
-        )
-        .unwrap();
+        let split = plan_leaf_split(&leaf, HashVersion::HalfMd4, &[0; 4], true, 4096, 0).unwrap();
         // Both halves should be valid leaf blocks of the full size.
         assert_eq!(split.left_bytes.len(), 4096);
         assert_eq!(split.right_bytes.len(), 4096);
         // The split_out_hash sits at the boundary — every right-side entry
         // should rehash >= it, every left-side entry < it.
-        let left_entries = read_leaf_entries(&split.left_bytes, true, HashVersion::HalfMd4, &[0; 4], 0).unwrap();
-        let right_entries = read_leaf_entries(&split.right_bytes, true, HashVersion::HalfMd4, &[0; 4], 0).unwrap();
+        let left_entries =
+            read_leaf_entries(&split.left_bytes, true, HashVersion::HalfMd4, &[0; 4], 0).unwrap();
+        let right_entries =
+            read_leaf_entries(&split.right_bytes, true, HashVersion::HalfMd4, &[0; 4], 0).unwrap();
         for (h, _) in &left_entries {
-            assert!(h.major < split.split_out_hash, "left entry hash {} >= split_out {}", h.major, split.split_out_hash);
+            assert!(
+                h.major < split.split_out_hash,
+                "left entry hash {} >= split_out {}",
+                h.major,
+                split.split_out_hash
+            );
         }
         for (h, _) in &right_entries {
-            assert!(h.major >= split.split_out_hash, "right entry hash {} < split_out {}", h.major, split.split_out_hash);
+            assert!(
+                h.major >= split.split_out_hash,
+                "right entry hash {} < split_out {}",
+                h.major,
+                split.split_out_hash
+            );
         }
         // Both halves populated (not all-in-one).
         assert!(!left_entries.is_empty());
@@ -348,8 +362,7 @@ mod tests {
     fn leaf_split_rejects_trivial() {
         // Only one entry — split has no meaning.
         let leaf = make_populated_leaf(0, 4096, 0); // just the initial "a" seed
-        let err = plan_leaf_split(&leaf, HashVersion::HalfMd4, &[0; 4], true, 4096, 0)
-            .unwrap_err();
+        let err = plan_leaf_split(&leaf, HashVersion::HalfMd4, &[0; 4], true, 4096, 0).unwrap_err();
         match err {
             Error::Corrupt(msg) => assert!(msg.contains(">=2 entries")),
             _ => panic!("wrong error kind"),

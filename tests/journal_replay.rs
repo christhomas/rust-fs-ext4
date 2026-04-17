@@ -13,11 +13,11 @@
 //! filesystem's actual data, then replaying.
 
 use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::Filesystem;
 use ext4rs::jbd2::{self, JBD2_MAGIC_NUMBER};
 use ext4rs::journal;
 use ext4rs::journal_apply;
 use ext4rs::transaction::Transaction;
+use ext4rs::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
@@ -30,7 +30,9 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() { return None; }
+    if !std::path::Path::new(&src).exists() {
+        return None;
+    }
     // Unique-per-call: cargo runs test fns in parallel threads; a shared name
     // would race on create/delete.
     let dst = format!("/tmp/ext4rs_replay_{}_{n}_{}.img", std::process::id(), name);
@@ -42,7 +44,9 @@ fn copy_to_tmp(name: &str) -> Option<String> {
 fn writable_mount_preserves_read_path() {
     // A read-write-opened copy of ext4-basic.img must mount cleanly and
     // return the same sb info as a read-only mount.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open_rw");
     assert!(dev.is_writable());
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount rw");
@@ -55,7 +59,9 @@ fn writable_mount_preserves_read_path() {
 fn clean_journal_is_no_op() {
     // A freshly-built image has jsb.start == 0 (clean). replay_if_dirty
     // must return 0 and not attempt any writes.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open_rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let n = journal_apply::replay_if_dirty(&fs).expect("replay_if_dirty");
@@ -68,7 +74,9 @@ fn synthetic_dirty_journal_round_trip() {
     // End-to-end: inject a descriptor+data+commit sequence into the journal
     // file, bump jsb.start so walk() sees it as dirty, replay, and assert
     // the target fs block now holds the data we wrote.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
 
     let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
     let fs = Filesystem::mount(dev.clone()).expect("mount");
@@ -80,7 +88,9 @@ fn synthetic_dirty_journal_round_trip() {
     let jinode = ext4rs::inode::Inode::parse(&raw).expect("parse jinode");
 
     // Read the existing JBD2 superblock so we keep its features consistent.
-    let jsb = jbd2::read_superblock(&fs).expect("read jsb").expect("journal present");
+    let jsb = jbd2::read_superblock(&fs)
+        .expect("read jsb")
+        .expect("journal present");
 
     // Pick an fs block well past the superblock + BGD area to act as our
     // replay target. For 4 KiB-block ext4-basic.img with small fs, block
@@ -99,7 +109,8 @@ fn synthetic_dirty_journal_round_trip() {
     for (i, b) in payload.iter_mut().enumerate() {
         *b = payload_byte.wrapping_add((i & 0xFF) as u8);
     }
-    tx.add_write(target_fs_block, payload.clone()).expect("add_write");
+    tx.add_write(target_fs_block, payload.clone())
+        .expect("add_write");
     let blocks = tx.commit().expect("commit");
     assert_eq!(blocks.len(), 3, "desc + data + commit");
 
@@ -110,12 +121,14 @@ fn synthetic_dirty_journal_round_trip() {
         let phys = jbd2::journal_block_to_physical(&fs, &jinode, journal_logical)
             .expect("map journal block")
             .expect("mapped");
-        dev.write_at(phys * block_size, blk).expect("write journal slot");
+        dev.write_at(phys * block_size, blk)
+            .expect("write journal slot");
     }
 
     // Capture the target's pre-replay contents so we can assert the change.
     let mut before = vec![0u8; block_size as usize];
-    dev.read_at(target_fs_block * block_size, &mut before).unwrap();
+    dev.read_at(target_fs_block * block_size, &mut before)
+        .unwrap();
 
     // Rewrite the JBD2 superblock with jsb.start = 1 (log starts at journal
     // logical block 1). Compose a minimal dirty sb by reading + patching.
@@ -140,9 +153,13 @@ fn synthetic_dirty_journal_round_trip() {
 
     // Verify the target fs block now holds our payload.
     let mut after = vec![0u8; block_size as usize];
-    dev.read_at(target_fs_block * block_size, &mut after).unwrap();
+    dev.read_at(target_fs_block * block_size, &mut after)
+        .unwrap();
     assert_eq!(after, payload, "replay did not write the expected payload");
-    assert_ne!(before, after, "payload identical to pre-state — test is tautological");
+    assert_ne!(
+        before, after,
+        "payload identical to pre-state — test is tautological"
+    );
 
     drop(fs);
     fs::remove_file(path).ok();
@@ -152,7 +169,9 @@ fn synthetic_dirty_journal_round_trip() {
 fn read_only_device_skips_replay_silently() {
     // A read-only open on a clean image: replay_if_dirty returns 0 without
     // error even though write_at would fail.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open(&path).expect("open RO");
     assert!(!dev.is_writable());
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount RO");

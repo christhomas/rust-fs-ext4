@@ -54,7 +54,7 @@ fn htree_image_has_bigdir_with_256_files() {
         bigdir_inode.size,
         bigdir_inode.flags,
         bigdir_inode.has_extents(),
-        bigdir_inode.flags & 0x1000  // EXT4_INDEX_FL
+        bigdir_inode.flags & 0x1000 // EXT4_INDEX_FL
     );
 
     // bigdir should be htree-indexed (INDEX_FL = 0x1000).
@@ -63,7 +63,11 @@ fn htree_image_has_bigdir_with_256_files() {
 
     // Read all blocks of bigdir.
     let bigdir_data = file_io::read_all(&fs, &bigdir_inode).unwrap();
-    println!("bigdir data: {} bytes (= {} blocks)", bigdir_data.len(), bigdir_data.len() / block_size);
+    println!(
+        "bigdir data: {} bytes (= {} blocks)",
+        bigdir_data.len(),
+        bigdir_data.len() / block_size
+    );
 
     // For htree-indexed dirs, the FIRST block is the dx_root and CANNOT be
     // parsed as linear dir entries (well, it has fake "." and ".." but the
@@ -89,7 +93,10 @@ fn htree_image_has_bigdir_with_256_files() {
                     .count()
             );
         } else {
-            println!("  block {}: not parseable as linear (likely htree dx_node)", blk);
+            println!(
+                "  block {}: not parseable as linear (likely htree dx_node)",
+                blk
+            );
         }
     }
 

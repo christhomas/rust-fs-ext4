@@ -143,9 +143,7 @@ fn write_empty_clears_file_content() {
     assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
     assert!(stat_size(fs, path) > 0);
 
-    let n = unsafe {
-        ext4rs_write_file(fs, path_c.as_ptr(), std::ptr::null(), 0)
-    };
+    let n = unsafe { ext4rs_write_file(fs, path_c.as_ptr(), std::ptr::null(), 0) };
     assert_eq!(n, 0, "empty write: {}", last_err_str());
     assert_eq!(stat_size(fs, path), 0);
     unsafe { ext4rs_umount(fs) };
@@ -230,9 +228,7 @@ fn write_rejects_null_data_with_nonzero_len() {
     let fs = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
 
-    let n = unsafe {
-        ext4rs_write_file(fs, path_c.as_ptr(), std::ptr::null(), 42)
-    };
+    let n = unsafe { ext4rs_write_file(fs, path_c.as_ptr(), std::ptr::null(), 42) };
     assert_eq!(n, -1);
     unsafe { ext4rs_umount(fs) };
 

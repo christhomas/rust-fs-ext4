@@ -10,10 +10,7 @@ use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -29,7 +26,9 @@ fn scratch() -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -73,7 +72,10 @@ fn growing_write_file_does_not_leak_blocks() {
         after <= before,
         "free_blocks must not INCREASE after a grow write: before={before} after={after}"
     );
-    eprintln!("free_blocks: before={before} after={after} delta={}", before - after);
+    eprintln!(
+        "free_blocks: before={before} after={after} delta={}",
+        before - after
+    );
 
     unsafe { ext4rs_umount(fs_h) };
     let _ = fs::remove_file(&img);

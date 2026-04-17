@@ -13,10 +13,7 @@ use std::os::raw::c_char;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch() -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
@@ -32,7 +29,9 @@ fn scratch() -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -91,7 +90,10 @@ fn create_on_non_utf8_path_does_not_corrupt() {
         // Must not crash. Most likely fails (empty path can't be created).
         if ino != 0 {
             // If somehow succeeded, at least verify we didn't break the fs.
-            eprintln!("note: create on non-UTF-8 returned ino={ino}, last_err={}", last_err());
+            eprintln!(
+                "note: create on non-UTF-8 returned ino={ino}, last_err={}",
+                last_err()
+            );
         } else {
             assert_ne!(ext4rs_last_errno(), 0);
         }

@@ -28,7 +28,11 @@ fn root_inode_parses() {
     println!("  generation  = {}", ino.generation);
     println!("  ctime/mtime = {} / {}", ino.ctime, ino.mtime);
 
-    assert!(ino.is_dir(), "root inode should be a directory (mode=0o{:o})", ino.mode);
+    assert!(
+        ino.is_dir(),
+        "root inode should be a directory (mode=0o{:o})",
+        ino.mode
+    );
     assert!(ino.links_count > 0, "root should have >= 1 link");
     assert!(ino.size > 0, "root dir size should be > 0");
     assert!(ino.has_extents(), "modern ext4 formatter root must use extents");

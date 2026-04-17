@@ -5,8 +5,8 @@
 //! previously-failing threshold was ~100 entries on a 4 KiB-block fs.
 
 use ext4rs::block_io::FileDevice;
-use ext4rs::Filesystem;
 use ext4rs::path as path_mod;
+use ext4rs::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
@@ -19,7 +19,9 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() { return None; }
+    if !std::path::Path::new(&src).exists() {
+        return None;
+    }
     let dst = format!("/tmp/ext4rs_dgrow_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
@@ -32,7 +34,9 @@ fn resolve(fs: &Filesystem, path: &str) -> Option<u32> {
 
 #[test]
 fn apply_create_grows_parent_dir_past_first_block() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -44,9 +48,8 @@ fn apply_create_grows_parent_dir_past_first_block() {
     // ~24 bytes each = 4320 bytes > 4 KiB usable, forcing extension.
     for i in 0..180 {
         let name = format!("/grown_{i:03}.txt");
-        fs.apply_create(&name, 0o644).unwrap_or_else(|e| {
-            panic!("create {name} failed at i={i}: {e}")
-        });
+        fs.apply_create(&name, 0o644)
+            .unwrap_or_else(|e| panic!("create {name} failed at i={i}: {e}"));
     }
 
     // Root should now be larger (an extra block allocated via extend_dir_...).
@@ -68,7 +71,9 @@ fn apply_create_grows_parent_dir_past_first_block() {
 
 #[test]
 fn apply_mkdir_also_grows_parent() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -97,13 +102,16 @@ fn apply_mkdir_also_grows_parent() {
 
 #[test]
 fn grown_dir_survives_remount() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else { return };
+    let Some(path) = copy_to_tmp("ext4-basic.img") else {
+        return;
+    };
 
     {
         let dev = FileDevice::open_rw(&path).expect("open rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
         for i in 0..170 {
-            fs.apply_create(&format!("/x_{i:03}.log"), 0o644).expect("create");
+            fs.apply_create(&format!("/x_{i:03}.log"), 0o644)
+                .expect("create");
         }
     }
 
@@ -112,7 +120,10 @@ fn grown_dir_survives_remount() {
     // All 170 entries must resolve after a cold remount.
     for i in 0..170 {
         let name = format!("/x_{i:03}.log");
-        assert!(resolve(&fs, &name).is_some(), "lost entry after remount: {name}");
+        assert!(
+            resolve(&fs, &name).is_some(),
+            "lost entry after remount: {name}"
+        );
     }
 
     fs::remove_file(path).ok();

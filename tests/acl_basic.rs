@@ -41,9 +41,7 @@ fn read_inode_raw_bytes(fs: &Filesystem, ino: u32) -> Vec<u8> {
     block_data[off..off + inode_size].to_vec()
 }
 
-fn inode_reader(
-    fs: &Filesystem,
-) -> impl FnMut(u32) -> Result<Inode> + '_ {
+fn inode_reader(fs: &Filesystem) -> impl FnMut(u32) -> Result<Inode> + '_ {
     move |ino: u32| -> Result<Inode> {
         let (block, offset) = bgd::locate_inode(&fs.sb, &fs.groups, ino)?;
         let block_data = fs.read_block(block)?;
@@ -65,7 +63,9 @@ fn read_parsed(fs: &Filesystem, ino: u32) -> Inode {
 
 #[test]
 fn mode_only_file_has_three_short_entries() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     let ino = resolve(dev.as_ref(), &fs, "/mode_only.txt");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);
@@ -97,7 +97,9 @@ fn mode_only_file_has_three_short_entries() {
 
 #[test]
 fn named_user_and_group_entries_present() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     let ino = resolve(dev.as_ref(), &fs, "/named.txt");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);
@@ -125,13 +127,18 @@ fn named_user_and_group_entries_present() {
         .expect("GROUP entry for gid 2000");
     assert_eq!(group_2000.perm, ACL_READ);
 
-    let mask = entries.iter().find(|e| e.tag == AclTag::Mask).expect("MASK entry");
+    let mask = entries
+        .iter()
+        .find(|e| e.tag == AclTag::Mask)
+        .expect("MASK entry");
     assert_eq!(mask.perm, ACL_READ | ACL_WRITE | ACL_EXECUTE);
 }
 
 #[test]
 fn directory_has_access_and_default_acl() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     let ino = resolve(dev.as_ref(), &fs, "/acl_dir");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);
@@ -181,7 +188,9 @@ fn directory_has_access_and_default_acl() {
 
 #[test]
 fn plain_file_has_no_acl() {
-    let Some((dev, fs)) = open_or_skip() else { return; };
+    let Some((dev, fs)) = open_or_skip() else {
+        return;
+    };
     let ino = resolve(dev.as_ref(), &fs, "/plain.txt");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);
@@ -196,7 +205,10 @@ fn plain_file_has_no_acl() {
             kind,
         )
         .expect("read acl");
-        assert!(entries.is_none(), "/plain.txt {kind:?} should be absent: {entries:?}");
+        assert!(
+            entries.is_none(),
+            "/plain.txt {kind:?} should be absent: {entries:?}"
+        );
     }
 
     // Also double-check via xattr listing that the two system.posix_acl_* names

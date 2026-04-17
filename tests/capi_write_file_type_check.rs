@@ -10,10 +10,7 @@ use std::os::raw::c_void;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn scratch() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
@@ -29,7 +26,9 @@ fn scratch() -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error()).to_string_lossy().into_owned()
+        CStr::from_ptr(ext4rs_last_error())
+            .to_string_lossy()
+            .into_owned()
     }
 }
 
@@ -59,7 +58,9 @@ fn write_file_on_directory_fails_with_eisdir() {
     let mut count = 0;
     loop {
         let e = unsafe { ext4rs_dir_next(iter) };
-        if e.is_null() { break; }
+        if e.is_null() {
+            break;
+        }
         count += 1;
     }
     unsafe { ext4rs_dir_close(iter) };
@@ -119,9 +120,8 @@ fn write_file_missing_path_sets_enoent() {
 
 #[test]
 fn write_file_null_args_return_einval() {
-    let rc = unsafe {
-        ext4rs_write_file(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0)
-    };
+    let rc =
+        unsafe { ext4rs_write_file(std::ptr::null_mut(), std::ptr::null(), std::ptr::null(), 0) };
     assert_eq!(rc, -1);
     assert_eq!(ext4rs_last_errno(), 22);
 }
@@ -134,9 +134,7 @@ fn write_file_null_data_with_nonzero_len_is_einval() {
     assert!(!fs_h.is_null());
 
     let path = CString::new("/test.txt").unwrap();
-    let rc = unsafe {
-        ext4rs_write_file(fs_h, path.as_ptr(), std::ptr::null(), 4)
-    };
+    let rc = unsafe { ext4rs_write_file(fs_h, path.as_ptr(), std::ptr::null(), 4) };
     assert_eq!(rc, -1);
     assert_eq!(ext4rs_last_errno(), 22);
 
@@ -152,10 +150,13 @@ fn write_file_zero_len_replaces_with_empty() {
     assert!(!fs_h.is_null());
 
     let path = CString::new("/test.txt").unwrap();
-    let rc = unsafe {
-        ext4rs_write_file(fs_h, path.as_ptr(), std::ptr::null(), 0)
-    };
-    assert_eq!(rc, 0, "write_file with len=0 should succeed: {}", last_err());
+    let rc = unsafe { ext4rs_write_file(fs_h, path.as_ptr(), std::ptr::null(), 0) };
+    assert_eq!(
+        rc,
+        0,
+        "write_file with len=0 should succeed: {}",
+        last_err()
+    );
 
     // File should now be empty.
     let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
@@ -176,7 +177,9 @@ fn write_file_grows_content_beyond_original_size() {
 
     // Build a distinctive 32 KiB payload.
     let mut payload = Vec::with_capacity(32 * 1024);
-    for i in 0..32 * 1024 { payload.push((i & 0xFF) as u8); }
+    for i in 0..32 * 1024 {
+        payload.push((i & 0xFF) as u8);
+    }
 
     {
         let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
@@ -213,7 +216,11 @@ fn write_file_grows_content_beyond_original_size() {
             )
         };
         assert_eq!(n as usize, payload.len(), "read: {}", last_err());
-        assert_eq!(&buf[..payload.len()], payload.as_slice(), "content mismatch");
+        assert_eq!(
+            &buf[..payload.len()],
+            payload.as_slice(),
+            "content mismatch"
+        );
 
         unsafe { ext4rs_umount(fs_h) };
     }

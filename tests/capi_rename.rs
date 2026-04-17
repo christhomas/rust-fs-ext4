@@ -224,9 +224,18 @@ fn rename_null_inputs_do_not_crash() {
 
     let s = CString::new("/test.txt").unwrap();
     let d = CString::new("/renamed.txt").unwrap();
-    assert_eq!(unsafe { ext4rs_rename(std::ptr::null_mut(), s.as_ptr(), d.as_ptr()) }, -1);
-    assert_eq!(unsafe { ext4rs_rename(fs, std::ptr::null(), d.as_ptr()) }, -1);
-    assert_eq!(unsafe { ext4rs_rename(fs, s.as_ptr(), std::ptr::null()) }, -1);
+    assert_eq!(
+        unsafe { ext4rs_rename(std::ptr::null_mut(), s.as_ptr(), d.as_ptr()) },
+        -1
+    );
+    assert_eq!(
+        unsafe { ext4rs_rename(fs, std::ptr::null(), d.as_ptr()) },
+        -1
+    );
+    assert_eq!(
+        unsafe { ext4rs_rename(fs, s.as_ptr(), std::ptr::null()) },
+        -1
+    );
 
     unsafe { ext4rs_umount(fs) };
     std::fs::remove_file(&img).ok();

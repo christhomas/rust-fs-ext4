@@ -10,10 +10,7 @@ use ext4rs::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
-const TEST_IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-basic.img"
-);
+const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
 fn last_err_str() -> String {
     unsafe {
@@ -120,8 +117,16 @@ fn dir_open_root_lists_entries() {
     unsafe { ext4rs_dir_close(iter) };
 
     // Expect at minimum . .. lost+found and a user-created file
-    assert!(names.iter().any(|n| n == "."), "missing '.', got: {:?}", names);
-    assert!(names.iter().any(|n| n == ".."), "missing '..', got: {:?}", names);
+    assert!(
+        names.iter().any(|n| n == "."),
+        "missing '.', got: {:?}",
+        names
+    );
+    assert!(
+        names.iter().any(|n| n == ".."),
+        "missing '..', got: {:?}",
+        names
+    );
     assert!(!names.is_empty(), "no entries returned");
 
     unsafe { ext4rs_umount(fs) };
@@ -140,7 +145,9 @@ fn stat_non_root_path() {
     let mut found_file: Option<String> = None;
     loop {
         let de = unsafe { ext4rs_dir_next(iter) };
-        if de.is_null() { break; }
+        if de.is_null() {
+            break;
+        }
         // file_type 1 = RegFile
         if unsafe { (*de).file_type } == 1 {
             let name_ptr = unsafe { &(*de).name[0] as *const _ };
@@ -200,7 +207,11 @@ fn read_file_returns_expected_content() {
     if n > 0 {
         let content = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
         println!("/test.txt content: {:?} ({} bytes)", content, n);
-        assert!(content.contains("hello"), "expected 'hello' in {:?}", content);
+        assert!(
+            content.contains("hello"),
+            "expected 'hello' in {:?}",
+            content
+        );
     } else {
         // If the test image doesn't have /test.txt, at least verify the error path works
         eprintln!("skip: read_file returned {n}: {}", last_err_str());
