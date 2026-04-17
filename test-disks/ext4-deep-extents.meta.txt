@@ -1,0 +1,10 @@
+image: ext4-deep-extents.img
+features: extent,64bit,flex_bg,metadata_csum
+volume_label: deep-vol
+contents:
+  /sparse.bin  — 16 MB sparse file with single 'X' bytes every 64 KB
+                 (~245 extents — forces multi-level extent tree)
+  /dense.txt   — "control file\n" (13 bytes, single inline extent)
+test_targets:
+  - extent::lookup must descend through internal nodes for high logical blocks
+  - sparse holes should read as zero

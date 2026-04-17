@@ -1,0 +1,33 @@
+name: Release
+
+on:
+  push:
+    tags: ['v*']
+
+jobs:
+  build-macos-universal:
+    runs-on: macos-14
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: aarch64-apple-darwin,x86_64-apple-darwin
+      - name: Build universal static lib + xcframework
+        run: ./build.sh
+      - name: Package
+        run: |
+          VERSION="${GITHUB_REF_NAME}"
+          STAGE="libext4rs-${VERSION}-macos-universal"
+          mkdir -p "dist/${STAGE}/lib" "dist/${STAGE}/include"
+          cp dist/libext4rs.a "dist/${STAGE}/lib/"
+          cp include/ext4rs.h "dist/${STAGE}/include/"
+          cp README.md LICENSE CHANGELOG.md "dist/${STAGE}/"
+          tar -C dist -czf "dist/${STAGE}.tar.gz" "${STAGE}"
+          (cd dist && zip -r "ext4rs-${VERSION}.xcframework.zip" ext4rs.xcframework)
+      - name: Upload to GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          files: |
+            dist/libext4rs-*-macos-universal.tar.gz
+            dist/ext4rs-*.xcframework.zip
+          generate_release_notes: true

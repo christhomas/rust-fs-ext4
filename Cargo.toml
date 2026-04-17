@@ -1,0 +1,28 @@
+[package]
+name = "ext4rs"
+version = "0.1.0"
+edition = "2021"
+license = "MIT"
+description = "Pure-Rust ext4 filesystem driver. Exposes a C ABI (ext4rs_*) suitable for FFI from Swift/C/Go/etc."
+repository = "https://github.com/christhomas/ext4-rust"
+
+[lib]
+name = "ext4rs"
+crate-type = ["staticlib", "rlib"]
+
+[dependencies]
+crc32c = "0.6"
+bitflags = "2"
+
+[dev-dependencies]
+hex = "0.4"
+
+[profile.release]
+lto = true
+codegen-units = 1
+opt-level = 3
+panic = "unwind"  # required for catch_unwind at FFI boundary (see src/capi.rs)
+
+[profile.dev]
+opt-level = 1
+panic = "unwind"

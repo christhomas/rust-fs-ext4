@@ -1,0 +1,11 @@
+image: ext4-inline.img
+features: ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data
+volume_label: inline-vol
+contents:
+  /tiny.txt    — "tiny inline\n" (12 bytes, in i_block only)
+  /medium.txt  — 100x 'A' (100 bytes, overflows to system.data xattr)
+  /symlink     — symlink to "target/path/here"
+test_targets:
+  - read /tiny.txt returns full 12 bytes
+  - read /medium.txt returns full 100 bytes (i_block + xattr concat)
+  - readlink /symlink returns "target/path/here"

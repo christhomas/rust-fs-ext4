@@ -1,0 +1,9 @@
+image: ext4-csum-seed.img
+features: has_journal,extent,64bit,flex_bg,metadata_csum,metadata_csum_seed
+volume_label: csum-seed-vol
+contents:
+  /hello.txt   — "pi-style file\n" (14 bytes)
+  /etc/fstab   — "fake fstab\n" (11 bytes)
+notes:
+  INCOMPAT_CSUM_SEED stores the checksum seed in superblock instead of
+  deriving from UUID. Same flag that broke lwext4 on the Pi SD card.

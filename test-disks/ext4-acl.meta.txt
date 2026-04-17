@@ -1,0 +1,13 @@
+image: ext4-acl.img
+features: ext_attr,extent,64bit,filetype,dir_index,metadata_csum
+volume_label: acl-vol
+contents:
+  /mode_only.txt  — access ACL: u::rwx, g::r-x, o::r--
+  /named.txt      — access ACL: u::rwx, u:1000:rw-, g::r-x, g:2000:r--, m::rwx, o::r--
+  /acl_dir/       — access + default ACL (u::rwx g::r-x o::--x; d:u::rwx d:g::r-x d:o::---)
+  /plain.txt      — no ACL
+test_targets:
+  - system.posix_acl_access on /mode_only.txt decodes to 3 short entries
+  - system.posix_acl_access on /named.txt has User(1000) + Group(2000) entries
+  - /acl_dir has both system.posix_acl_access and system.posix_acl_default
+  - /plain.txt has neither acl xattr

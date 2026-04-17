@@ -1,0 +1,7 @@
+image: ext4-no-csum.img
+features: extent,64bit,filetype,dir_index,sparse_super (NO metadata_csum)
+volume_label: no-csum-vol
+contents:
+  /file.txt — "no checksum here\n" (17 bytes)
+notes:
+  Tests that we don't accidentally require checksums when the FS lacks them.

@@ -1,0 +1,11 @@
+image: ext4-largedir.img
+features: has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum,large_dir
+volume_label: largedir-vol
+contents:
+  /small.txt — "control\n" (8 bytes)
+  /huge/     — 70000 zero-length files (file_00001.txt .. file_70000.txt)
+               forces htree past its legacy 2-level cap (LARGEDIR ro_compat).
+test_targets:
+  - htree::lookup_leaf descends > 1 internal level to resolve /huge/file_NNNNN
+  - readdir of /huge returns 70002 entries (70000 + . + ..)
+  - random-sample stat on file_00001 / file_35000 / file_70000 all succeed

@@ -1,0 +1,11 @@
+image: ext4-xattr.img
+features: ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data
+volume_label: xattr-vol
+contents:
+  /tagged.txt    — "has xattrs\n"; xattrs: user.color=red, user.com.apple.FinderInfo=0xDEADBEEF
+  /tagged_dir/   — directory; xattrs: user.purpose=documents
+  /plain.txt     — "no xattrs here\n"; no xattrs
+test_targets:
+  - read user.color, user.com.apple.FinderInfo on /tagged.txt
+  - read user.purpose on /tagged_dir
+  - /plain.txt has empty xattr list
