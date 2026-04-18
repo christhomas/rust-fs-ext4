@@ -1369,3 +1369,43 @@ pub unsafe extern "C" fn ext4rs_utimens(
         }),
     )
 }
+
+/// Create a symbolic link at `linkpath` whose target is `target`. POSIX
+/// `symlink(target, linkpath)` semantics: `target` is the arbitrary string
+/// the symlink points to (can be absolute or relative, need not exist);
+/// `linkpath` is the path where the symlink is created. Parent of
+/// `linkpath` must exist and be a directory; `linkpath` itself must not
+/// already exist.
+///
+/// v1 limit: `target` must be ≤ 60 bytes (fast-symlink path). Longer
+/// targets return -1 with EINVAL + an explanatory `ext4rs_last_error`.
+///
+/// Returns the new inode number on success (> 0), or 0 on failure with
+/// details in `ext4rs_last_error`.
+#[no_mangle]
+pub unsafe extern "C" fn ext4rs_symlink(
+    fs: *mut ext4rs_fs_t,
+    target: *const c_char,
+    linkpath: *const c_char,
+) -> u32 {
+    ffi_guard(
+        0u32,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || target.is_null() || linkpath.is_null() {
+                set_err_msg("null fs/target/linkpath", EINVAL);
+                return 0u32;
+            }
+            let fs_ref = &(*fs).fs;
+            let target_str = cstr_to_str(target);
+            let linkpath_str = cstr_to_str(linkpath);
+            match fs_ref.apply_symlink(target_str, linkpath_str) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    set_err_from(&e, &format!("symlink {linkpath_str} -> {target_str}"));
+                    0u32
+                }
+            }
+        }),
+    )
+}

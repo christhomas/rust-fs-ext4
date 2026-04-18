@@ -774,6 +774,190 @@ impl Filesystem {
         Ok(new_ino)
     }
 
+    /// Create a symbolic link at `linkpath` whose target is `target`.
+    /// Mirrors POSIX `symlink(target, linkpath)`: allocates a fresh inode
+    /// with mode S_IFLNK, installs the target bytes, and adds a dir entry
+    /// at the link path.
+    ///
+    /// **Fast symlinks only for v1**: `target.len() <= 60`. Longer targets
+    /// need a data-block allocation like any regular file write, which is
+    /// doable but not landed yet — they return `Error::InvalidArgument`.
+    ///
+    /// Returns the new inode number on success, errors on name conflicts,
+    /// missing parent, RO mount, target too long.
+    pub fn apply_symlink(&self, target: &str, linkpath: &str) -> Result<u32> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        if target.is_empty() {
+            return Err(Error::InvalidArgument("symlink target is empty"));
+        }
+        if target.len() > 60 {
+            return Err(Error::InvalidArgument(
+                "symlink target > 60 bytes (slow-symlink path not implemented)",
+            ));
+        }
+        let (parent_path, base_name) = split_parent_and_base(linkpath)?;
+        if base_name.len() > 255 {
+            return Err(Error::NameTooLong);
+        }
+
+        // Resolve parent + refuse duplicate.
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let parent_ino_num =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let (parent_inode, _parent_raw) = self.read_inode_verified(parent_ino_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        if self
+            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
+            .is_ok()
+        {
+            return Err(Error::AlreadyExists);
+        }
+
+        // Allocate a new inode.
+        let parent_group = (parent_ino_num - 1) / self.sb.inodes_per_group;
+        let bs = self.sb.block_size();
+        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; bs as usize];
+            self.dev.read_at(block * bs as u64, &mut buf)?;
+            Ok(buf)
+        };
+        let plan = crate::alloc::plan_inode_allocation(
+            &self.sb,
+            &self.groups,
+            false,
+            parent_group,
+            &mut bitmap_reader,
+        )?;
+        let new_ino = plan.inode;
+
+        self.mark_inode_used(new_ino)?;
+        self.patch_bgd_counters(
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.patch_sb_counters(plan.sb.free_blocks_delta as i64, plan.sb.free_inodes_delta)?;
+
+        let raw = self.build_fast_symlink_inode(new_ino, target.as_bytes())?;
+        self.write_inode_raw(new_ino, &raw)?;
+
+        // Install dir entry.
+        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+        let parent_blocks = parent_inode.size.div_ceil(bs as u64);
+        let mut added = false;
+        for logical in 0..parent_blocks {
+            let Some(phys) =
+                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
+            else {
+                continue;
+            };
+            let mut block = self.read_block(phys)?;
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+                12
+            } else {
+                0
+            };
+            match crate::dir::add_entry_to_block(
+                &mut block,
+                new_ino,
+                base_name.as_bytes(),
+                crate::dir::DirEntryType::Symlink,
+                has_ft,
+                reserved_tail,
+            ) {
+                Ok(()) => {
+                    if self.csum.enabled && reserved_tail == 12 {
+                        let end = block.len();
+                        let mut c = crate::checksum::linux_crc32c(
+                            self.csum.seed,
+                            &parent_ino_num.to_le_bytes(),
+                        );
+                        c = crate::checksum::linux_crc32c(
+                            c,
+                            &parent_inode.generation.to_le_bytes(),
+                        );
+                        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
+                        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    }
+                    self.dev.write_at(phys * bs as u64, &block)?;
+                    added = true;
+                    break;
+                }
+                Err(Error::OutOfBounds) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        if !added {
+            self.extend_dir_and_add_entry(
+                parent_ino_num,
+                base_name.as_bytes(),
+                new_ino,
+                crate::dir::DirEntryType::Symlink,
+            )?;
+        }
+
+        self.dev.flush()?;
+        Ok(new_ino)
+    }
+
+    /// Compose a fresh fast-symlink inode image: `S_IFLNK | 0o777`, 1 link,
+    /// `i_size = target.len()`, 0 blocks, NO EXTENTS flag (fast symlinks
+    /// store their target directly in the 60-byte `i_block` area — no
+    /// extent tree).
+    fn build_fast_symlink_inode(&self, ino: u32, target: &[u8]) -> Result<Vec<u8>> {
+        debug_assert!(target.len() <= 60);
+        let inode_size = self.sb.inode_size as usize;
+        let mut raw = vec![0u8; inode_size];
+
+        // Symlinks are traditionally rwxrwxrwx — the OS enforces access on
+        // the *target*, not the symlink itself.
+        let mode_bits = crate::inode::S_IFLNK | 0o0777;
+        raw[0x00..0x02].copy_from_slice(&mode_bits.to_le_bytes());
+
+        // i_size = target length (low 32).
+        raw[0x04..0x08].copy_from_slice(&(target.len() as u32).to_le_bytes());
+
+        // i_links_count = 1.
+        raw[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
+
+        // i_flags = 0 (no EXTENTS — fast symlink stores target inline).
+        raw[0x20..0x24].copy_from_slice(&0u32.to_le_bytes());
+
+        // i_block at 0x28..0x64: target bytes, zero-padded.
+        let blk_off = 0x28;
+        raw[blk_off..blk_off + target.len()].copy_from_slice(target);
+
+        let now = now_unix_seconds();
+        raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
+        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
+        let generation =
+            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
+        raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
+
+        if inode_size >= 0x82 + 2 {
+            raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
+        }
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        Ok(raw)
+    }
+
     /// Compose a fresh regular-file inode image: `S_IFREG | mode`, 1 link,
     /// 0 size, 0 blocks, EXTENTS flag set with an empty 4-entry leaf root,
     /// timestamps = now, generation = process-id-derived counter, extra_isize

@@ -306,6 +306,13 @@ int ext4rs_chmod(ext4rs_fs_t *fs, const char *path, uint16_t mode);
 int ext4rs_chown(ext4rs_fs_t *fs, const char *path,
                   uint32_t uid, uint32_t gid);
 
+/* Create a symbolic link at `linkpath` whose target is `target`.
+ * POSIX symlink(target, linkpath) semantics. v1: fast-symlink only
+ * (target ≤ 60 bytes); longer targets return 0 with EINVAL. Returns
+ * the new symlink's inode number on success, 0 on failure. */
+uint32_t ext4rs_symlink(ext4rs_fs_t *fs, const char *target,
+                         const char *linkpath);
+
 /* Set the access + modification times on `path`. Each `*_sec` is a
  * POSIX seconds-since-epoch value; passing UINT32_MAX leaves that pair
  * unchanged (so `atime_sec == UINT32_MAX` touches only mtime, etc).
