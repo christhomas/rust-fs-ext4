@@ -1,5 +1,6 @@
-//! C ABI exports — MUST match `ext4bridge/ext4_bridge.h` exactly so this
-//! crate is a drop-in replacement for the C/lwext4 build.
+//! C ABI exports — MUST match `include/ext4rs.h` exactly. Consumers
+//! link `libext4rs.a` and #include that header; any signature change
+//! here requires the header to change in lockstep.
 //!
 //! Phase 1 (read-only) surface:
 //! - ext4rs_mount(device_path) -> *mut ext4rs_fs_t
@@ -138,7 +139,7 @@ pub extern "C" fn ext4rs_last_errno() -> c_int {
 }
 
 // ===========================================================================
-// ABI types — MUST match ext4bridge/ext4_bridge.h
+// ABI types — MUST match include/ext4rs.h
 // ===========================================================================
 
 /// File type (matches `ext4rs_file_type_t` in the header).

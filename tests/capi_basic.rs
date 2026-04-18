@@ -3,8 +3,8 @@
 //! Staticlibs don't re-export unmangled C symbols to integration tests, so
 //! instead of `extern "C" { ext4rs_mount ... }` we call the public items
 //! in `ext4rs::capi` directly. This verifies the *logic* behind the exports;
-//! the actual ABI surface is verified by the Swift FSKit layer linking
-//! libext4bridge.a at the end of the build.
+//! the actual ABI surface is verified by downstream consumers linking
+//! `libext4rs.a`.
 
 use ext4rs::capi::*;
 use std::ffi::{CStr, CString};
