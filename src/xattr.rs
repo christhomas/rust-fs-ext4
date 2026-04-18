@@ -223,6 +223,163 @@ fn parse_entries_block(block: &[u8], out: &mut Vec<XattrEntry>) -> Result<()> {
     Ok(())
 }
 
+/// Split a fully-qualified xattr name (e.g. `"user.com.apple.FinderInfo"`)
+/// into (name_index, suffix). Returns `None` if no known prefix matches.
+pub fn split_qualified_name(name: &str) -> Option<(u8, &str)> {
+    for (idx, prefix) in NAME_PREFIXES {
+        if let Some(rest) = name.strip_prefix(*prefix) {
+            return Some((*idx, rest));
+        }
+    }
+    None
+}
+
+/// Result of [`plan_remove_in_inode_region`]: the entry was either removed
+/// (bytes in place updated) or wasn't present.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum RemoveOutcome {
+    /// Region rewritten; caller must patch the inode checksum + write back.
+    Removed,
+    /// The name wasn't in this region.
+    NotFound,
+}
+
+/// Remove an xattr by fully-qualified name from the in-inode region.
+/// The `region` slice must span from the 4-byte magic (inclusive) to the
+/// end of the inode (exclusive of any later metadata). Returns `Removed`
+/// if the name was present and the bytes have been rewritten, `NotFound`
+/// otherwise. `Error::InvalidArgument` if the name lacks a known
+/// namespace prefix.
+pub fn plan_remove_in_inode_region(region: &mut [u8], name: &str) -> Result<RemoveOutcome> {
+    let Some((name_index, suffix)) = split_qualified_name(name) else {
+        return Err(Error::InvalidArgument(
+            "xattr name missing known namespace prefix",
+        ));
+    };
+    if region.len() < 4 {
+        return Ok(RemoveOutcome::NotFound);
+    }
+    let magic = u32::from_le_bytes(region[..4].try_into().unwrap());
+    if magic != EXT4_XATTR_MAGIC {
+        return Ok(RemoveOutcome::NotFound);
+    }
+
+    // Decode every entry (header + name + value bytes).
+    let entries = decode_in_inode_entries(&region[4..])?;
+    let before = entries.len();
+    let kept: Vec<DecodedEntry> = entries
+        .into_iter()
+        .filter(|e| !(e.name_index == name_index && e.name_bytes == suffix.as_bytes()))
+        .collect();
+    if kept.len() == before {
+        return Ok(RemoveOutcome::NotFound);
+    }
+
+    encode_in_inode_entries(region, &kept);
+    Ok(RemoveOutcome::Removed)
+}
+
+/// One fully-owned xattr entry decoded from an in-inode region.
+#[derive(Debug, Clone)]
+struct DecodedEntry {
+    name_index: u8,
+    name_bytes: Vec<u8>,
+    value: Vec<u8>,
+}
+
+/// Parse every entry out of the in-inode region's entries-area slice
+/// (starts immediately AFTER the 4-byte magic).
+fn decode_in_inode_entries(entries_buf: &[u8]) -> Result<Vec<DecodedEntry>> {
+    let mut out = Vec::new();
+    let mut pos = 0usize;
+    while pos + 16 <= entries_buf.len() {
+        let header = u32::from_le_bytes(entries_buf[pos..pos + 4].try_into().unwrap());
+        if header == 0 {
+            break;
+        }
+        let name_len = entries_buf[pos] as usize;
+        let name_index = entries_buf[pos + 1];
+        let value_offs =
+            u16::from_le_bytes(entries_buf[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        let value_size =
+            u32::from_le_bytes(entries_buf[pos + 8..pos + 12].try_into().unwrap()) as usize;
+        if pos + 16 + name_len > entries_buf.len() {
+            return Err(Error::Corrupt("xattr entry name overruns region"));
+        }
+        let name_bytes = entries_buf[pos + 16..pos + 16 + name_len].to_vec();
+        let value = if value_size == 0 {
+            Vec::new()
+        } else {
+            if value_offs + value_size > entries_buf.len() {
+                return Err(Error::Corrupt("xattr value out of range"));
+            }
+            entries_buf[value_offs..value_offs + value_size].to_vec()
+        };
+        out.push(DecodedEntry {
+            name_index,
+            name_bytes,
+            value,
+        });
+        pos += (16 + name_len + 3) & !3;
+    }
+    Ok(out)
+}
+
+/// Re-emit the in-inode region from a list of entries. Zeros the entire
+/// region, stamps magic at [0..4], packs entries forward from offset 4,
+/// and packs their values backward from the end. Leaves a u32 zero
+/// terminator after the last entry (implicit via the initial zero sweep).
+///
+/// Caller must size `region` large enough; this function is only called
+/// after `decode_in_inode_entries` produced the list so the byte budget
+/// is always ≤ the original region.
+fn encode_in_inode_entries(region: &mut [u8], entries: &[DecodedEntry]) {
+    for b in region.iter_mut() {
+        *b = 0;
+    }
+    region[..4].copy_from_slice(&EXT4_XATTR_MAGIC.to_le_bytes());
+    let entries_area = &mut region[4..];
+    let area_len = entries_area.len();
+
+    // Stable sort: kernel stores entries ordered by (name_index, name).
+    let mut sorted: Vec<&DecodedEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.name_index
+            .cmp(&b.name_index)
+            .then_with(|| a.name_bytes.cmp(&b.name_bytes))
+    });
+
+    let mut entry_cursor: usize = 0;
+    let mut value_cursor: usize = area_len;
+
+    for e in &sorted {
+        let name_len = e.name_bytes.len();
+        let entry_padded = (16 + name_len + 3) & !3;
+
+        let value_offs = if e.value.is_empty() {
+            0
+        } else {
+            let value_padded = (e.value.len() + 3) & !3;
+            value_cursor -= value_padded;
+            entries_area[value_cursor..value_cursor + e.value.len()].copy_from_slice(&e.value);
+            value_cursor
+        };
+
+        entries_area[entry_cursor] = name_len as u8;
+        entries_area[entry_cursor + 1] = e.name_index;
+        entries_area[entry_cursor + 2..entry_cursor + 4]
+            .copy_from_slice(&(value_offs as u16).to_le_bytes());
+        // e_value_inum at +4..+8 = 0 (no EA_INODE)
+        entries_area[entry_cursor + 8..entry_cursor + 12]
+            .copy_from_slice(&(e.value.len() as u32).to_le_bytes());
+        // e_hash at +12..+16 = 0 (in-inode hash is dedup-only)
+        entries_area[entry_cursor + 16..entry_cursor + 16 + name_len]
+            .copy_from_slice(&e.name_bytes);
+        entry_cursor += entry_padded;
+    }
+    // Terminator u32 at entry_cursor is already zero from the sweep.
+}
+
 /// Convenience: get a single xattr value by name. Returns `None` if not present.
 pub fn get(
     dev: &dyn BlockDevice,
@@ -245,5 +402,81 @@ mod tests {
         assert_eq!(prefix_for_index(1), Some("user."));
         assert_eq!(prefix_for_index(7), Some("system."));
         assert_eq!(prefix_for_index(99), None);
+    }
+
+    #[test]
+    fn split_qualified_name_roundtrip() {
+        assert_eq!(split_qualified_name("user.color"), Some((1, "color")));
+        assert_eq!(
+            split_qualified_name("user.com.apple.FinderInfo"),
+            Some((1, "com.apple.FinderInfo"))
+        );
+        assert_eq!(
+            split_qualified_name("security.selinux"),
+            Some((6, "selinux"))
+        );
+        assert_eq!(split_qualified_name("unknown.foo"), None);
+    }
+
+    /// Build a minimal in-inode region with two `user.*` entries, then remove
+    /// one by name. Verify the other survives and a readback decodes cleanly.
+    #[test]
+    fn remove_in_inode_roundtrips_one_of_two() {
+        // 96-byte region is plenty for two short entries (each ~24 bytes
+        // header+name + a handful of value bytes).
+        let mut region = vec![0u8; 96];
+        let entries = vec![
+            DecodedEntry {
+                name_index: 1,
+                name_bytes: b"color".to_vec(),
+                value: b"red".to_vec(),
+            },
+            DecodedEntry {
+                name_index: 1,
+                name_bytes: b"mood".to_vec(),
+                value: b"happy".to_vec(),
+            },
+        ];
+        encode_in_inode_entries(&mut region, &entries);
+
+        // Sanity: before-remove decode returns both entries.
+        let decoded = decode_in_inode_entries(&region[4..]).unwrap();
+        assert_eq!(decoded.len(), 2);
+
+        let outcome = plan_remove_in_inode_region(&mut region, "user.color").unwrap();
+        assert_eq!(outcome, RemoveOutcome::Removed);
+
+        let after = decode_in_inode_entries(&region[4..]).unwrap();
+        assert_eq!(after.len(), 1);
+        assert_eq!(after[0].name_bytes, b"mood");
+        assert_eq!(after[0].value, b"happy");
+    }
+
+    #[test]
+    fn remove_in_inode_returns_not_found_for_missing() {
+        let mut region = vec![0u8; 64];
+        let entries = vec![DecodedEntry {
+            name_index: 1,
+            name_bytes: b"color".to_vec(),
+            value: b"red".to_vec(),
+        }];
+        encode_in_inode_entries(&mut region, &entries);
+        let outcome = plan_remove_in_inode_region(&mut region, "user.mood").unwrap();
+        assert_eq!(outcome, RemoveOutcome::NotFound);
+    }
+
+    #[test]
+    fn remove_in_inode_unknown_prefix_is_einval() {
+        let mut region = vec![0u8; 64];
+        let err = plan_remove_in_inode_region(&mut region, "nope.name").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
+    }
+
+    #[test]
+    fn remove_in_inode_missing_magic_is_not_found() {
+        let mut region = vec![0u8; 64];
+        // all zeros → no magic
+        let outcome = plan_remove_in_inode_region(&mut region, "user.x").unwrap();
+        assert_eq!(outcome, RemoveOutcome::NotFound);
     }
 }

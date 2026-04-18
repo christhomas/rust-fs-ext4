@@ -313,6 +313,14 @@ int ext4rs_chown(ext4rs_fs_t *fs, const char *path,
 uint32_t ext4rs_symlink(ext4rs_fs_t *fs, const char *target,
                          const char *linkpath);
 
+/* Remove the extended attribute `name` from the inode at `path`.
+ * `name` must be fully-qualified (carry a known namespace prefix like
+ * "user." or "security."). v1: in-inode xattrs only; external-block
+ * removal surfaces EINVAL until the slow path lands. ENOENT when the
+ * name isn't present. Returns 0 on success, -1 on failure. */
+int ext4rs_removexattr(ext4rs_fs_t *fs, const char *path,
+                        const char *name);
+
 /* Set the access + modification times on `path`. Each `*_sec` is a
  * POSIX seconds-since-epoch value; passing UINT32_MAX leaves that pair
  * unchanged (so `atime_sec == UINT32_MAX` touches only mtime, etc).

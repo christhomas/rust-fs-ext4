@@ -378,6 +378,84 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Remove the extended attribute named `name` from the inode at `path`.
+    /// `name` must carry a known namespace prefix (e.g. `"user.color"`).
+    ///
+    /// v1 scope: **in-inode xattrs only.** The in-inode region (bytes
+    /// between `128 + i_extra_isize` and the end of the on-disk inode)
+    /// is decoded, the matching entry is dropped, and the region is
+    /// re-encoded in place. External xattr blocks (pointed at by
+    /// `i_file_acl`) are not mutated — if the entry lives there the call
+    /// returns `Error::InvalidArgument("external xattr block removal
+    /// not yet implemented")`.
+    ///
+    /// Returns:
+    /// - `Ok(())` if the entry was removed (region rewritten, inode csum
+    ///   patched, inode written back).
+    /// - `Error::NotFound` if the entry isn't present anywhere.
+    /// - `Error::InvalidArgument` on namespace-prefix issues or an
+    ///   external-block-only entry.
+    pub fn apply_removexattr(&self, path: &str, name: &str) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+
+        // Locate the in-inode xattr region (starts at 128 + i_extra_isize).
+        let inode_size = self.sb.inode_size as usize;
+        let i_extra_isize = if raw.len() >= 0x82 {
+            u16::from_le_bytes(raw[0x80..0x82].try_into().unwrap()) as usize
+        } else {
+            0
+        };
+        let region_start = 128 + i_extra_isize;
+        let region_end = inode_size.min(raw.len());
+        if region_start + 4 <= region_end {
+            let region = &mut raw[region_start..region_end];
+            match crate::xattr::plan_remove_in_inode_region(region, name)? {
+                crate::xattr::RemoveOutcome::Removed => {
+                    // Patch inode csum + write back.
+                    if self.csum.enabled {
+                        if let Some((lo, hi)) =
+                            self.csum
+                                .compute_inode_checksum(ino, inode.generation, &raw)
+                        {
+                            raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                            if raw.len() >= 0x84 {
+                                raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                            }
+                        }
+                    }
+                    self.write_inode_raw(ino, &raw)?;
+                    self.dev.flush()?;
+                    return Ok(());
+                }
+                crate::xattr::RemoveOutcome::NotFound => { /* check external */ }
+            }
+        }
+
+        // Not in-inode. If an external xattr block exists and has the
+        // entry, we currently don't support rewriting it — surface
+        // InvalidArgument rather than silently NotFound-ing.
+        if inode.file_acl != 0 {
+            let xs = crate::xattr::read_all(
+                self.dev.as_ref(),
+                &inode,
+                &raw,
+                self.sb.inode_size,
+                self.sb.block_size(),
+            )?;
+            if xs.iter().any(|e| e.name == name) {
+                return Err(Error::InvalidArgument(
+                    "external xattr block removal not yet implemented",
+                ));
+            }
+        }
+        Err(Error::NotFound)
+    }
+
     /// Set the access + modification times on `path`. Mirrors POSIX
     /// `utimensat(2)`: `atime_sec/nsec` and `mtime_sec/nsec` each replace
     /// the inode's atime/mtime. `ctime` is bumped to now (POSIX requires

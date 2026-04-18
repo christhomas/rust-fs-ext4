@@ -1421,3 +1421,40 @@ pub unsafe extern "C" fn ext4rs_symlink(
         }),
     )
 }
+
+/// Remove the extended attribute `name` from the inode at `path`. `name`
+/// must be fully-qualified (carry a known namespace prefix like `"user."`
+/// or `"security."`). v1 scope: in-inode xattrs only; external-block
+/// removal surfaces EINVAL until the slow path lands.
+///
+/// Returns 0 on success, -1 on failure with details in
+/// `ext4rs_last_error`. `ext4rs_last_errno` codes: ENOENT if the name
+/// isn't present, EINVAL on unknown prefix or external-block-only entry,
+/// EROFS on a read-only mount.
+#[no_mangle]
+pub unsafe extern "C" fn ext4rs_removexattr(
+    fs: *mut ext4rs_fs_t,
+    path: *const c_char,
+    name: *const c_char,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() || name.is_null() {
+                set_err_msg("null fs/path/name", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            let name_str = cstr_to_str(name);
+            match fs_ref.apply_removexattr(path_str, name_str) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("removexattr {path_str} {name_str}"));
+                    -1
+                }
+            }
+        }),
+    )
+}
