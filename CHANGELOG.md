@@ -2,7 +2,15 @@
 
 ## [Unreleased]
 
-_Nothing yet._
+### Build / CI
+
+- Test-disk fixtures now regenerate from scratch on any host with
+  `qemu-system-x86_64` + `libarchive-tools` (for `bsdtar`'s
+  ISO9660 writer). Drop-in `bash test-disks/build-ext4-feature-images.sh`
+  boots a short-lived Alpine Linux VM, runs ext4 formatter + friends
+  inside, writes the image matrix out via 9p. Replaces the earlier
+  docker-based path so macOS dev hosts don't need Docker Desktop.
+  CI (`ubuntu-latest`) runs this before `cargo test`.
 
 ## [0.1.0] — 2026-04-18
 

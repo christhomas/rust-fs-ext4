@@ -101,8 +101,17 @@ cargo test --release
 ```
 
 Integration tests use ext4 image fixtures under `test-disks/`.
-Regenerate them with `./test-disks/gen-test-disks.sh` (requires
-`ext4 formatter`).
+The fixtures are gitignored — regenerate them with:
+
+```sh
+bash test-disks/build-ext4-feature-images.sh
+```
+
+The generator runs standard formatter tools inside a
+short-lived Alpine Linux VM booted under `qemu-system-x86_64`, so
+the same script works on macOS, Linux, and in CI (no docker
+required). First run downloads the Alpine virt ISO + kernel (~75 MB,
+cached under `test-disks/.vm-cache/`).
 
 ## License
 
