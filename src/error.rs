@@ -33,6 +33,9 @@ pub enum Error {
     /// Path component longer than EXT4_NAME_LEN (255 bytes) — POSIX
     /// ENAMETOOLONG.
     NameTooLong,
+    /// Container (xattr in-inode region, xattr block, etc.) has no free
+    /// space for the requested entry — POSIX ENOSPC.
+    NoSpaceLeftOnDevice,
     /// Caller passed a malformed argument or attempted a semantically
     /// invalid mutation (POSIX EINVAL — e.g. truncate-grow, moving a dir
     /// into its own subtree, operating on a legacy non-EXTENTS inode).
@@ -78,6 +81,7 @@ impl std::fmt::Display for Error {
             Error::DirectoryNotEmpty => write!(f, "directory not empty"),
             Error::ReadOnly => write!(f, "read-only filesystem"),
             Error::NameTooLong => write!(f, "name too long"),
+            Error::NoSpaceLeftOnDevice => write!(f, "no space left on device"),
             Error::InvalidArgument(msg) => write!(f, "invalid argument: {msg}"),
             Error::InvalidInode(n) => write!(f, "invalid inode number {n}"),
             Error::InvalidBlock(n) => write!(f, "invalid block number {n}"),
@@ -108,6 +112,7 @@ impl Error {
             Error::DirectoryNotEmpty => ENOTEMPTY,
             Error::ReadOnly => EROFS,
             Error::NameTooLong => ENAMETOOLONG,
+            Error::NoSpaceLeftOnDevice => ENOSPC,
             Error::InvalidArgument(_) => EINVAL,
             Error::InvalidInode(_) | Error::InvalidBlock(_) | Error::OutOfBounds => EINVAL,
             Error::BadMagic { .. }
@@ -130,6 +135,7 @@ pub mod errno {
     pub const EISDIR: i32 = 21;
     pub const EINVAL: i32 = 22;
     pub const EROFS: i32 = 30;
+    pub const ENOSPC: i32 = 28;
     pub const ENAMETOOLONG: i32 = 63; // macOS POSIX value
     pub const ENOTSUP: i32 = 45;
     pub const ENOTEMPTY: i32 = 66; // macOS POSIX value
