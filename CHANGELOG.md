@@ -55,6 +55,3 @@ repo into a standalone crate.
 ### Origin
 
 - Imported from `github.com/christhomas/ext4-fskit@aaa63cf`.
-- Previous C ABI name `ext4_bridge_*` renamed to `ext4rs_*` to match
-  the crate identity and remove the "bridge" branding that referred
-  back to the deprecated C/lwext4 shim.

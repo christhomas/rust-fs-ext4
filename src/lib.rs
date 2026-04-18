@@ -1,8 +1,7 @@
 //! ext4rs — pure-Rust ext4 filesystem driver.
 //!
-//! Goal: drop-in replacement for `ext4bridge/` (C + lwext4). Exposes the
-//! same `ext4rs_*` C functions so the Swift FSKit layer remains
-//! unchanged — just relink with `libext4bridge.a` produced from this crate.
+//! Exposes a stable C ABI (`ext4rs_*`) via [`capi`] so FFI consumers
+//! (Swift/C/Go/…) can link `libext4rs.a` and `#include "ext4rs.h"`.
 //!
 //! Architecture (read-only Phase 1):
 //! - [`block_io`] — abstract trait for reading device blocks
@@ -14,7 +13,7 @@
 //! - [`dir`] — directory entries (linear and HTree)
 //! - [`hash`] — htree hash functions (legacy / half_md4 / tea)
 //! - [`fs`] — top-level filesystem handle, file/dir lookup, read API
-//! - [`capi`] — C ABI exports matching `ext4bridge/ext4_bridge.h`
+//! - [`capi`] — C ABI exports matching `include/ext4rs.h`
 
 #![allow(dead_code)]
 // many spec items not yet wired through
@@ -50,8 +49,7 @@ pub mod superblock;
 pub mod transaction;
 pub mod xattr;
 
-// Always compile the C ABI exports — `libext4bridge.a` must expose the same
-// symbols as the C/lwext4 build for drop-in linking.
+// C ABI exports — surface defined in `include/ext4rs.h`.
 pub mod capi;
 
 pub use error::{Error, Result};

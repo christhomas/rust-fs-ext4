@@ -20,8 +20,7 @@ const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.
 /// Reimplementation of the Linux `crc32c_le` used by ext4.
 /// Equivalent to `crc32c::crc32c_append(!initial, data)` xor-inverted back.
 fn linux_crc32c(initial: u32, data: &[u8]) -> u32 {
-    // ext4bridge already exposes this; pull it back via its public API.
-    // We chain by computing with the seed as the initial value.
+    // Chain by computing with the seed as the initial value.
     let mut h = initial;
     for chunk in data.chunks(1) {
         h = crc32c::crc32c_append(!h, chunk);

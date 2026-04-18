@@ -1,8 +1,9 @@
 /*
- * ext4_bridge.h — High-level C API bridging lwext4 to Swift/FSKit.
+ * ext4rs.h — C ABI for the ext4rs pure-Rust ext4 driver.
  *
- * This is the ONLY header that the Swift bridging header needs to import.
- * It provides a clean, Swift-friendly interface that hides lwext4 internals.
+ * Link against libext4rs.a and #include this header. UTF-8 paths,
+ * NULL / -1 / 0 failure sentinels with thread-local error details
+ * available via ext4rs_last_error() / ext4rs_last_errno().
  *
  * MIT License — see LICENSE
  */
