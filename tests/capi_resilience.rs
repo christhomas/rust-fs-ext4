@@ -143,9 +143,7 @@ fn truncated_image_rejected_cleanly() {
 #[test]
 fn zeroed_superblock_rejected_cleanly() {
     let p = corrupted_copy("zero-sb", |b| {
-        for i in 1024..2048 {
-            b[i] = 0;
-        }
+        b[1024..2048].fill(0);
     });
     hammer_all_entry_points(p.to_str().unwrap());
     let _ = fs::remove_file(&p);
@@ -156,9 +154,7 @@ fn trashed_bgd_area_handled_cleanly() {
     // Block group descriptor table follows the superblock, starting at
     // block 1 (offset 4096 for 4KB blocks). Poison 512 bytes of it.
     let p = corrupted_copy("bad-bgd", |b| {
-        for i in 4096..4608 {
-            b[i] = 0xAA;
-        }
+        b[4096..4608].fill(0xAA);
     });
     hammer_all_entry_points(p.to_str().unwrap());
     let _ = fs::remove_file(&p);
@@ -172,9 +168,7 @@ fn trashed_inode_table_handled_cleanly() {
     let p = corrupted_copy("bad-inode", |b| {
         let start = 36 * 4096;
         if start + 4096 < b.len() {
-            for i in start..(start + 4096) {
-                b[i] = 0xEE;
-            }
+            b[start..start + 4096].fill(0xEE);
         }
     });
     hammer_all_entry_points(p.to_str().unwrap());
@@ -230,7 +224,7 @@ extern "C" fn read_from_vec(
     }
     let bytes = unsafe { &*(ctx as *const Vec<u8>) };
     let end = (offset as usize).checked_add(length as usize);
-    if end.map_or(true, |e| e > bytes.len()) {
+    if end.is_none_or(|e| e > bytes.len()) {
         return 2;
     }
     unsafe {

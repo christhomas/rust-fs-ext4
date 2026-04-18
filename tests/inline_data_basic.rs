@@ -73,7 +73,7 @@ fn medium_inline_file_uses_xattr_overflow() {
         inode.flags,
         data.len().min(60)
     );
-    let expected: Vec<u8> = std::iter::repeat(b'A').take(100).collect();
+    let expected: Vec<u8> = std::iter::repeat_n(b'A', 100).collect();
     assert_eq!(inode.size, 100);
     assert_eq!(
         data,

@@ -31,7 +31,7 @@ fn linux_crc32c(initial: u32, data: &[u8]) -> u32 {
     let mut h2 = initial;
     h2 = !h2;
     h2 = crc32c::crc32c_append(h2, data);
-    !h2 ^ 0 // extra no-op to silence unused
+    !h2 // extra no-op to silence unused
 }
 
 #[test]

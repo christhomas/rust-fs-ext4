@@ -65,8 +65,7 @@ bitflags! {
 
 /// INCOMPAT bits we know how to handle (Phase 1 read-only goal).
 /// Anything else in feature_incompat means refuse-to-mount.
-pub const SUPPORTED_INCOMPAT: u32 = 0
-    | Incompat::FILETYPE.bits()
+pub const SUPPORTED_INCOMPAT: u32 = Incompat::FILETYPE.bits()
     | Incompat::EXTENTS.bits()
     | Incompat::BIT64.bits()
     | Incompat::FLEX_BG.bits()
@@ -80,8 +79,7 @@ pub const SUPPORTED_INCOMPAT: u32 = 0
     | Incompat::CASEFOLD.bits();
 
 /// RO_COMPAT bits we tolerate (since we mount read-only anyway).
-pub const SUPPORTED_RO_COMPAT: u32 = 0
-    | RoCompat::SPARSE_SUPER.bits()
+pub const SUPPORTED_RO_COMPAT: u32 = RoCompat::SPARSE_SUPER.bits()
     | RoCompat::LARGE_FILE.bits()
     | RoCompat::HUGE_FILE.bits()
     | RoCompat::GDT_CSUM.bits()

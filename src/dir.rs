@@ -275,7 +275,7 @@ pub fn add_entry_to_block(
     while off + 8 <= usable {
         let cur_inode = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()) as usize;
-        if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > usable {
+        if rec_len < 8 || !rec_len.is_multiple_of(4) || off + rec_len > usable {
             return Err(Error::CorruptDirEntry("bad rec_len during add"));
         }
 
@@ -350,7 +350,7 @@ pub fn remove_entry_from_block(
     while off + 8 <= usable {
         let cur_inode = u32::from_le_bytes(buf[off..off + 4].try_into().unwrap());
         let rec_len = u16::from_le_bytes(buf[off + 4..off + 6].try_into().unwrap()) as usize;
-        if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > usable {
+        if rec_len < 8 || !rec_len.is_multiple_of(4) || off + rec_len > usable {
             return Err(Error::CorruptDirEntry("bad rec_len during remove"));
         }
 

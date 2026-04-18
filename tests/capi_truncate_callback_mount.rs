@@ -22,7 +22,7 @@ extern "C" fn read_from_vec(
     }
     let bytes = unsafe { &*(ctx as *const Vec<u8>) };
     let end = (offset as usize).checked_add(length as usize);
-    if end.map_or(true, |e| e > bytes.len()) {
+    if end.is_none_or(|e| e > bytes.len()) {
         return 2;
     }
     unsafe {

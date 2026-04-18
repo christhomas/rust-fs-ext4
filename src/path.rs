@@ -131,6 +131,7 @@ fn find_entry(
 }
 
 /// Linear scan of every directory data block.
+#[allow(clippy::too_many_arguments)]
 fn find_entry_linear(
     dev: &dyn BlockDevice,
     _sb: &Superblock,
@@ -142,7 +143,7 @@ fn find_entry_linear(
     csum: &crate::checksum::Checksummer,
 ) -> Result<u32> {
     let dir_size = dir_inode.size;
-    let total_blocks = (dir_size + block_size as u64 - 1) / block_size as u64;
+    let total_blocks = dir_size.div_ceil(block_size as u64);
     let gen = dir_inode.generation;
 
     let mut block = vec![0u8; block_size as usize];
@@ -358,7 +359,7 @@ mod tests {
         // Find any regular file in root so we can stack a component after it.
         let root = reader(EXT4_ROOT_INODE).expect("root inode");
         let block_size = fs.sb.block_size();
-        let total_blocks = (root.size + block_size as u64 - 1) / block_size as u64;
+        let total_blocks = root.size.div_ceil(block_size as u64);
         let has_filetype = fs.sb.feature_incompat & crate::features::Incompat::FILETYPE.bits() != 0;
 
         let mut reg_file_name: Option<Vec<u8>> = None;

@@ -81,7 +81,7 @@ fn read_leaf_entries(
     while off + 8 <= usable {
         let cur_inode = u32::from_le_bytes(leaf[off..off + 4].try_into().unwrap());
         let rec_len = u16::from_le_bytes(leaf[off + 4..off + 6].try_into().unwrap()) as usize;
-        if rec_len < 8 || rec_len % 4 != 0 || off + rec_len > usable {
+        if rec_len < 8 || !rec_len.is_multiple_of(4) || off + rec_len > usable {
             return Err(Error::CorruptDirEntry(
                 "bad rec_len during htree leaf split",
             ));
@@ -279,7 +279,7 @@ fn plan_insert_dx_entry_generic(
     // Emit updated block: preserve everything before cl_offset, bump count,
     // serialize the new entry array.
     let mut out = block.to_vec();
-    let new_count = (cl.count + 1) as u16;
+    let new_count = cl.count + 1;
     out[cl_offset + 2..cl_offset + 4].copy_from_slice(&new_count.to_le_bytes());
     for (i, e) in merged.iter().enumerate() {
         let off = entries_start + i * DxEntry::SIZE;

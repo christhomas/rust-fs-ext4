@@ -16,7 +16,11 @@
 //! - [`fs`] — top-level filesystem handle, file/dir lookup, read API
 //! - [`capi`] — C ABI exports matching `ext4bridge/ext4_bridge.h`
 
-#![allow(dead_code)] // many spec items not yet wired through
+#![allow(dead_code)]
+// many spec items not yet wired through
+// `doc_lazy_continuation` disagrees with the existing numbered-list
+// indentation in several module preambles; the content is fine.
+#![allow(clippy::doc_lazy_continuation)]
 
 pub mod acl;
 pub mod alloc;

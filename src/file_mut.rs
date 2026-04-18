@@ -84,7 +84,7 @@ pub fn compute_write_range(offset: u64, length: u64, block_size: u32) -> Option<
     let bs = block_size as u64;
     let first = offset / bs;
     let last = (offset + length - 1) / bs;
-    let full_blocks = offset % bs == 0 && (offset + length) % bs == 0;
+    let full_blocks = offset.is_multiple_of(bs) && (offset + length).is_multiple_of(bs);
     Some(WriteBlockRange {
         first,
         last,

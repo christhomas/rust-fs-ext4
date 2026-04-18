@@ -52,7 +52,7 @@ const SIP_C: [u64; 4] = [
 
 #[inline]
 fn rotl(x: u64, b: u32) -> u64 {
-    (x << b) | (x >> (64 - b))
+    x.rotate_left(b)
 }
 
 #[inline]
@@ -126,7 +126,7 @@ pub fn casefold_name_hash(name: &[u8], seed: &[u32; 4]) -> NameHash {
         key[i * 4..i * 4 + 4].copy_from_slice(&seed[i].to_le_bytes());
     }
     let h64 = siphash_2_4(&folded, &key);
-    let major = ((h64 as u32) & !1) | 0; // clear low bit
+    let major = (h64 as u32) & !1; // clear low bit
     let minor = (h64 >> 32) as u32;
     NameHash { major, minor }
 }

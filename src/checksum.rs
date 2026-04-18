@@ -198,6 +198,22 @@ impl Checksummer {
         }
     }
 
+    /// Write the `ext4_extent_tail.et_checksum` u32 at the end of a freshly-
+    /// built extent index/leaf block. Mirrors `verify_extent_tail`: the CRC
+    /// covers `block[..len-4]`, chained seed → ino → generation → body.
+    /// No-op when checksums are disabled; returns true when it patched.
+    pub fn patch_extent_tail(&self, ino: u32, generation: u32, block: &mut [u8]) -> bool {
+        if !self.enabled || block.len() < 4 {
+            return false;
+        }
+        let end = block.len();
+        let mut c = linux_crc32c(self.seed, &ino.to_le_bytes());
+        c = linux_crc32c(c, &generation.to_le_bytes());
+        c = linux_crc32c(c, &block[..end - 4]);
+        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        true
+    }
+
     /// Compute the inode checksum as two u16 halves (lo=checksum_lo at 0x7C,
     /// hi=checksum_hi at 0x82). Returns `None` when checksums are disabled
     /// or the buffer is too short to patch. Callers use this after mutating
@@ -292,6 +308,35 @@ mod tests {
         expected = linux_crc32c(expected, &block[..end - 4]);
         block[end - 4..end].copy_from_slice(&expected.to_le_bytes());
         assert!(c.verify_extent_tail(7, 9, &block));
+    }
+
+    #[test]
+    fn patch_extent_tail_is_verify_inverse() {
+        let c = Checksummer {
+            seed: 0xFEEDFACE,
+            enabled: true,
+        };
+        let mut block = vec![0u8; 4096];
+        // Synthetic leaf header + one entry so the body is interesting.
+        block[0..12].copy_from_slice(&[0x0A, 0xF3, 1, 0, 0x54, 0x01, 0, 0, 1, 2, 3, 4]);
+        block[12..24].copy_from_slice(&[0, 0, 0, 0, 5, 0, 0, 0, 0, 0, 0xE8, 0x03]);
+        let patched = c.patch_extent_tail(42, 0xABCDEF01, &mut block);
+        assert!(patched);
+        assert!(c.verify_extent_tail(42, 0xABCDEF01, &block));
+        // Tampering with body invalidates.
+        block[200] ^= 0xFF;
+        assert!(!c.verify_extent_tail(42, 0xABCDEF01, &block));
+    }
+
+    #[test]
+    fn patch_extent_tail_disabled_is_noop() {
+        let c = Checksummer {
+            seed: 0,
+            enabled: false,
+        };
+        let mut block = vec![0u8; 64];
+        assert!(!c.patch_extent_tail(1, 1, &mut block));
+        assert_eq!(&block[..], &[0u8; 64]);
     }
 
     #[test]

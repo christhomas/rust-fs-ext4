@@ -166,6 +166,134 @@ pub fn plan_insert_extent(root: &[u8], new: Extent) -> Result<Vec<ExtentMutation
     Ok(vec![ExtentMutation::WriteRoot { bytes: new_root }])
 }
 
+/// Layout for a promote-leaf-to-depth-1 operation: the new leaf block that
+/// holds the five entries (four old + the new one), and the rewritten inline
+/// root that indexes it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct PromotionPlan {
+    /// Full-block bytes for the freshly-allocated leaf node. Header at the
+    /// start, sorted leaf entries, zeros to end. If `reserved_tail_csum` was
+    /// true the last 4 bytes are reserved for the caller to patch with
+    /// `checksum.patch_extent_tail`.
+    pub leaf_bytes: Vec<u8>,
+    /// 60 bytes of the new inline root: depth=1, entries=1, single index
+    /// entry whose logical_block = 0 and leaf_block = the physical block the
+    /// caller allocated for `leaf_bytes`.
+    pub new_root_bytes: Vec<u8>,
+}
+
+/// Build a depth-0 leaf block (full `block_size` bytes). Reserves 4 tail
+/// bytes for the ext4_extent_tail CRC when `reserved_tail_csum` is true.
+fn build_leaf_block(
+    generation: u32,
+    extents: &[Extent],
+    block_size: usize,
+    reserved_tail_csum: bool,
+) -> Vec<u8> {
+    let mut out = vec![0u8; block_size];
+    let header_body_len = block_size.saturating_sub(if reserved_tail_csum { 4 } else { 0 });
+    let max_entries = ((header_body_len - EXT4_EXT_NODE_SIZE) / EXT4_EXT_NODE_SIZE) as u16;
+    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[2..4].copy_from_slice(&(extents.len() as u16).to_le_bytes());
+    out[4..6].copy_from_slice(&max_entries.to_le_bytes());
+    out[6..8].copy_from_slice(&0u16.to_le_bytes()); // depth=0 (leaf)
+    out[8..12].copy_from_slice(&generation.to_le_bytes());
+    for (i, e) in extents.iter().enumerate() {
+        let off = EXT4_EXT_NODE_SIZE * (1 + i);
+        out[off..off + EXT4_EXT_NODE_SIZE].copy_from_slice(&encode_extent(e));
+    }
+    out
+}
+
+/// Build a 60-byte depth-1 inline root containing a single index entry
+/// pointing at `leaf_phys` (logical 0).
+fn build_depth1_index_root(generation: u32, leaf_phys: u64) -> Vec<u8> {
+    let mut out = vec![0u8; 60];
+    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[2..4].copy_from_slice(&1u16.to_le_bytes()); // entries=1
+    out[4..6].copy_from_slice(&4u16.to_le_bytes()); // max=4 (inline root)
+    out[6..8].copy_from_slice(&1u16.to_le_bytes()); // depth=1
+    out[8..12].copy_from_slice(&generation.to_le_bytes());
+    let ei_block: u32 = 0;
+    let ei_leaf_lo = (leaf_phys & 0xFFFF_FFFF) as u32;
+    let ei_leaf_hi = ((leaf_phys >> 32) & 0xFFFF) as u16;
+    out[12..16].copy_from_slice(&ei_block.to_le_bytes());
+    out[16..20].copy_from_slice(&ei_leaf_lo.to_le_bytes());
+    out[20..22].copy_from_slice(&ei_leaf_hi.to_le_bytes());
+    out
+}
+
+/// Plan a depth-0 → depth-1 promotion. The caller must have already seen
+/// `LEAF_FULL_NEEDS_PROMOTION` from `plan_insert_extent` and allocated one
+/// fresh filesystem block to hold the new leaf.
+///
+/// Produces:
+///   - `leaf_bytes`: the entire new leaf block (`block_size` bytes) containing
+///     all existing extents + `new`, sorted and merge-compatible with the
+///     existing layout. Last 4 bytes are reserved for the caller to patch
+///     with `checksum.patch_extent_tail` when metadata_csum is on.
+///   - `new_root_bytes`: 60 bytes, depth=1, one index entry → `new_leaf_phys`.
+///
+/// Errors if `root` is not a leaf (depth != 0) — the multi-level split case
+/// is a further task. Also rejects overlaps with existing entries.
+pub fn plan_promote_leaf(
+    root: &[u8],
+    new: Extent,
+    block_size: usize,
+    new_leaf_phys: u64,
+    reserved_tail_csum: bool,
+) -> Result<PromotionPlan> {
+    let (header, mut entries) = read_leaf_entries(root)?;
+
+    for e in &entries {
+        let e_end = e.logical_block as u64 + e.length as u64;
+        let n_end = new.logical_block as u64 + new.length as u64;
+        if !(n_end <= e.logical_block as u64 || new.logical_block as u64 >= e_end) {
+            return Err(Error::CorruptExtentTree("extent overlaps existing"));
+        }
+    }
+
+    let pos = entries
+        .iter()
+        .position(|e| e.logical_block as u64 > new.logical_block as u64)
+        .unwrap_or(entries.len());
+    entries.insert(pos, new);
+
+    if pos > 0 && are_contiguous(&entries[pos - 1], &entries[pos]) {
+        let right = entries.remove(pos);
+        entries[pos - 1].length += right.length;
+    }
+    let merged_pos = entries
+        .iter()
+        .position(|e| {
+            e.logical_block == new.logical_block
+                || ((e.logical_block as u64) < new.logical_block as u64
+                    && (e.logical_block as u64 + e.length as u64) > new.logical_block as u64)
+        })
+        .unwrap_or(entries.len().saturating_sub(1));
+    if merged_pos + 1 < entries.len()
+        && are_contiguous(&entries[merged_pos], &entries[merged_pos + 1])
+    {
+        let right = entries.remove(merged_pos + 1);
+        entries[merged_pos].length += right.length;
+    }
+
+    let leaf_capacity_bytes = block_size.saturating_sub(if reserved_tail_csum { 4 } else { 0 });
+    let leaf_max = ((leaf_capacity_bytes - EXT4_EXT_NODE_SIZE) / EXT4_EXT_NODE_SIZE) as u16;
+    if entries.len() as u16 > leaf_max {
+        return Err(Error::CorruptExtentTree(
+            "plan_promote_leaf: entry count exceeds leaf capacity",
+        ));
+    }
+
+    let leaf_bytes = build_leaf_block(header.generation, &entries, block_size, reserved_tail_csum);
+    let new_root_bytes = build_depth1_index_root(header.generation, new_leaf_phys);
+    Ok(PromotionPlan {
+        leaf_bytes,
+        new_root_bytes,
+    })
+}
+
 /// Plan a split of `entries[idx]` at logical block `split_at` — the entry is
 /// replaced by two halves [`start..split_at`, `split_at..end`]. The caller
 /// uses this when partially overwriting or converting part of an uninit run.
@@ -417,6 +545,100 @@ mod tests {
         let back = read_back(bytes);
         assert_eq!(back.len(), 1);
         assert_eq!(back[0].logical_block, 10);
+    }
+
+    #[test]
+    fn promote_leaf_moves_entries_into_new_leaf_block() {
+        let root = mk_root(&[
+            ext(0, 5, 1000, false),
+            ext(100, 5, 2000, false),
+            ext(200, 5, 3000, false),
+            ext(300, 5, 4000, false),
+        ]);
+        let plan = plan_promote_leaf(&root, ext(500, 5, 5000, false), 4096, 900_000, true).unwrap();
+
+        assert_eq!(plan.new_root_bytes.len(), 60);
+        let hdr = ExtentHeader::parse(&plan.new_root_bytes).unwrap();
+        assert_eq!(hdr.depth, 1);
+        assert_eq!(hdr.entries, 1);
+        assert_eq!(hdr.max, 4);
+        let idx = crate::extent::ExtentIdx::parse(
+            &plan.new_root_bytes[EXT4_EXT_NODE_SIZE..2 * EXT4_EXT_NODE_SIZE],
+        )
+        .unwrap();
+        assert_eq!(idx.logical_block, 0);
+        assert_eq!(idx.leaf_block, 900_000);
+
+        assert_eq!(plan.leaf_bytes.len(), 4096);
+        let leaf_hdr = ExtentHeader::parse(&plan.leaf_bytes).unwrap();
+        assert_eq!(leaf_hdr.depth, 0);
+        assert_eq!(leaf_hdr.entries, 5);
+        let expected_max = ((4096 - 12 - 4) / 12) as u16;
+        assert_eq!(leaf_hdr.max, expected_max);
+        let parsed = read_back(&plan.leaf_bytes[..12 + 5 * 12]);
+        assert_eq!(parsed.len(), 5);
+        let logs: Vec<u32> = parsed.iter().map(|e| e.logical_block).collect();
+        assert_eq!(logs, vec![0, 100, 200, 300, 500]);
+    }
+
+    #[test]
+    fn promote_leaf_rejects_overlap() {
+        let root = mk_root(&[
+            ext(0, 5, 1000, false),
+            ext(100, 5, 2000, false),
+            ext(200, 5, 3000, false),
+            ext(300, 5, 4000, false),
+        ]);
+        let err = plan_promote_leaf(&root, ext(2, 5, 9000, false), 4096, 500, true).unwrap_err();
+        match err {
+            Error::CorruptExtentTree(m) => assert!(m.contains("overlaps")),
+            _ => panic!("wrong error kind"),
+        }
+    }
+
+    #[test]
+    fn promote_leaf_preserves_generation() {
+        let extents = [
+            ext(0, 5, 1000, false),
+            ext(100, 5, 2000, false),
+            ext(200, 5, 3000, false),
+            ext(300, 5, 4000, false),
+        ];
+        let header = ExtentHeader {
+            magic: EXT4_EXT_MAGIC,
+            entries: 4,
+            max: 4,
+            depth: 0,
+            generation: 0xDEAD_BEEF,
+        };
+        let root = build_root(&header, &extents, 60);
+        let plan = plan_promote_leaf(&root, ext(500, 5, 5000, false), 4096, 777, false).unwrap();
+        assert_eq!(
+            ExtentHeader::parse(&plan.new_root_bytes)
+                .unwrap()
+                .generation,
+            0xDEAD_BEEF
+        );
+        assert_eq!(
+            ExtentHeader::parse(&plan.leaf_bytes).unwrap().generation,
+            0xDEAD_BEEF
+        );
+    }
+
+    #[test]
+    fn promote_leaf_merges_when_contiguous_with_new() {
+        let root = mk_root(&[
+            ext(0, 5, 1000, false),
+            ext(100, 5, 2000, false),
+            ext(200, 5, 3000, false),
+            ext(300, 5, 4000, false),
+        ]);
+        let plan = plan_promote_leaf(&root, ext(305, 5, 4005, false), 4096, 123, false).unwrap();
+        let leaf_hdr = ExtentHeader::parse(&plan.leaf_bytes).unwrap();
+        assert_eq!(leaf_hdr.entries, 4);
+        let parsed = read_back(&plan.leaf_bytes[..12 + 4 * 12]);
+        assert_eq!(parsed[3].logical_block, 300);
+        assert_eq!(parsed[3].length, 10);
     }
 
     #[test]

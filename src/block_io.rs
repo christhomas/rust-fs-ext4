@@ -122,14 +122,21 @@ impl BlockDevice for FileDevice {
     }
 }
 
+/// Read callback: fill `buf` starting at byte `offset`.
+pub type ReadCb = Box<dyn Fn(u64, &mut [u8]) -> std::io::Result<()> + Send + Sync>;
+/// Write callback: write `buf` starting at byte `offset`.
+pub type WriteCb = Box<dyn Fn(u64, &[u8]) -> std::io::Result<()> + Send + Sync>;
+/// Flush callback.
+pub type FlushCb = Box<dyn Fn() -> std::io::Result<()> + Send + Sync>;
+
 /// Callback-backed device — used when the host process owns the fd
 /// (e.g. FSBlockDeviceResource via the C bridge). Optional write callback;
 /// set to `None` for read-only.
 pub struct CallbackDevice {
     pub size: u64,
-    pub read: Box<dyn Fn(u64, &mut [u8]) -> std::io::Result<()> + Send + Sync>,
-    pub write: Option<Box<dyn Fn(u64, &[u8]) -> std::io::Result<()> + Send + Sync>>,
-    pub flush: Option<Box<dyn Fn() -> std::io::Result<()> + Send + Sync>>,
+    pub read: ReadCb,
+    pub write: Option<WriteCb>,
+    pub flush: Option<FlushCb>,
 }
 
 impl BlockDevice for CallbackDevice {

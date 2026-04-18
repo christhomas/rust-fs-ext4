@@ -341,10 +341,7 @@ unsafe fn mount_with_callbacks_inner(cfg: *const ext4rs_blockdev_cfg_t) -> *mut 
                 )
             };
             if rc != 0 {
-                Err(std::io::Error::new(
-                    std::io::ErrorKind::Other,
-                    format!("callback returned {rc}"),
-                ))
+                Err(std::io::Error::other(format!("callback returned {rc}")))
             } else {
                 Ok(())
             }
@@ -562,7 +559,7 @@ fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<ext4rs_dire
         return Ok(entries);
     }
 
-    let total_blocks = (inode.size + block_size as u64 - 1) / block_size as u64;
+    let total_blocks = inode.size.div_ceil(block_size as u64);
     let mut block_buf = vec![0u8; block_size as usize];
 
     for logical in 0..total_blocks {

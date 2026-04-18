@@ -461,7 +461,7 @@ impl Filesystem {
             return Err(Error::ReadOnly);
         }
         let (parent_path, base_name) = split_parent_and_base(path)?;
-        if base_name.as_bytes().len() > 255 {
+        if base_name.len() > 255 {
             return Err(Error::NameTooLong);
         }
 
@@ -615,7 +615,7 @@ impl Filesystem {
         use std::sync::atomic::{AtomicU32, Ordering};
         static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
         let generation =
-            (std::process::id() as u32).wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
+            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
         raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
 
         // i_extra_isize at 0x80..0x82 — 32 is the modern default (room for
@@ -856,7 +856,7 @@ impl Filesystem {
     /// caller pairs this with a `patch_bgd_counters` + `patch_sb_counters` call
     /// so BGD free_inodes_count and SB free_inodes_count land together.
     fn free_inode_slot(&self, ino: u32) -> Result<()> {
-        let ipg = self.sb.inodes_per_group as u32;
+        let ipg = self.sb.inodes_per_group;
         let gi = ((ino - 1) / ipg) as usize;
         if gi >= self.groups.len() {
             return Err(Error::InvalidInode(ino));
@@ -880,7 +880,7 @@ impl Filesystem {
     /// Set the inode bitmap bit for `ino`. Paired with `patch_bgd_counters`
     /// (`free_inodes_delta = -1` and, for dirs, `used_dirs_delta = +1`).
     fn mark_inode_used(&self, ino: u32) -> Result<()> {
-        let ipg = self.sb.inodes_per_group as u32;
+        let ipg = self.sb.inodes_per_group;
         let gi = ((ino - 1) / ipg) as usize;
         if gi >= self.groups.len() {
             return Err(Error::InvalidInode(ino));
@@ -1135,7 +1135,7 @@ impl Filesystem {
         use std::sync::atomic::{AtomicU32, Ordering};
         static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
         let generation =
-            (std::process::id() as u32).wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
+            std::process::id().wrapping_add(GEN_COUNTER.fetch_add(1, Ordering::Relaxed));
         raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
 
         if inode_size >= 0x82 + 2 {
@@ -1240,7 +1240,7 @@ impl Filesystem {
             return Err(Error::ReadOnly);
         }
         let (parent_path, base_name) = split_parent_and_base(path)?;
-        if base_name.as_bytes().len() > 255 {
+        if base_name.len() > 255 {
             return Err(Error::NameTooLong);
         }
 
@@ -1402,7 +1402,7 @@ impl Filesystem {
             return Err(Error::ReadOnly);
         }
         let (dst_parent_path, dst_name) = split_parent_and_base(dst)?;
-        if dst_name.as_bytes().len() > 255 {
+        if dst_name.len() > 255 {
             return Err(Error::NameTooLong);
         }
 
@@ -1477,7 +1477,7 @@ impl Filesystem {
 
         let (src_parent_path, src_name) = split_parent_and_base(src)?;
         let (dst_parent_path, dst_name) = split_parent_and_base(dst)?;
-        if dst_name.as_bytes().len() > 255 {
+        if dst_name.len() > 255 {
             return Err(Error::NameTooLong);
         }
 
@@ -1655,28 +1655,81 @@ impl Filesystem {
         )?;
         let new_phys = plan.first_block;
 
-        // 2. Insert extent into parent's inline extent root.
+        // 2. Insert extent into parent's inline extent root. If the root is
+        //    saturated at depth 0, promote to depth 1 by allocating a fresh
+        //    leaf block, moving all entries into it, and writing a single
+        //    index entry into the inline root.
         let new_extent = crate::extent::Extent {
             logical_block: new_logical_block as u32,
             length: 1,
             physical_block: new_phys,
             uninitialized: false,
         };
-        let muts = crate::extent_mut::plan_insert_extent(&parent_inode.block, new_extent)?;
-        let new_root = muts
-            .into_iter()
-            .find_map(|m| match m {
-                crate::extent_mut::ExtentMutation::WriteRoot { bytes } => Some(bytes),
-                _ => None,
-            })
-            .ok_or(Error::Corrupt(
-                "extend_dir_and_add_entry: plan produced no WriteRoot",
-            ))?;
+        let (new_root, leaf_meta_alloc) =
+            match crate::extent_mut::plan_insert_extent(&parent_inode.block, new_extent) {
+                Ok(muts) => {
+                    let root = muts
+                        .into_iter()
+                        .find_map(|m| match m {
+                            crate::extent_mut::ExtentMutation::WriteRoot { bytes } => Some(bytes),
+                            _ => None,
+                        })
+                        .ok_or(Error::Corrupt(
+                            "extend_dir_and_add_entry: plan produced no WriteRoot",
+                        ))?;
+                    (root, None)
+                }
+                Err(Error::CorruptExtentTree(msg)) if msg.contains("LEAF_FULL_NEEDS_PROMOTION") => {
+                    // Commit the data-block allocation NOW so the next plan picks
+                    // a different run (plan_block_allocation reads the bitmap).
+                    self.mark_block_run_used(new_phys, 1)?;
+                    self.patch_bgd_counters(
+                        plan.bgd.group_idx as usize,
+                        plan.bgd.free_blocks_delta,
+                        plan.bgd.free_inodes_delta,
+                        plan.bgd.used_dirs_delta,
+                    )?;
+                    self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+
+                    // Second allocation: the leaf node block.
+                    let mut reader2 = |block: u64| -> Result<Vec<u8>> {
+                        let mut buf = vec![0u8; bs as usize];
+                        self.dev.read_at(block * bs_u64, &mut buf)?;
+                        Ok(buf)
+                    };
+                    let meta_plan = crate::alloc::plan_block_allocation(
+                        &self.sb,
+                        &self.groups,
+                        1,
+                        parent_group,
+                        &mut reader2,
+                    )?;
+                    let leaf_meta_phys = meta_plan.first_block;
+
+                    let promo = crate::extent_mut::plan_promote_leaf(
+                        &parent_inode.block,
+                        new_extent,
+                        bs as usize,
+                        leaf_meta_phys,
+                        self.csum.enabled,
+                    )?;
+                    let mut leaf = promo.leaf_bytes;
+                    if self.csum.enabled {
+                        self.csum
+                            .patch_extent_tail(parent_ino, parent_inode.generation, &mut leaf);
+                    }
+                    self.dev.write_at(leaf_meta_phys * bs_u64, &leaf)?;
+                    (promo.new_root_bytes, Some(meta_plan))
+                }
+                Err(e) => return Err(e),
+            };
         Self::patch_inode_block_area(&mut parent_raw, &new_root)?;
 
-        // 3. Patch size (+= block_size) and i_blocks (+ sectors).
+        // 3. Patch size (+= block_size) and i_blocks. On the promotion path
+        //    the inode claims both the data block AND the leaf-node block.
+        let blocks_consumed: u64 = 1 + if leaf_meta_alloc.is_some() { 1 } else { 0 };
         let new_size = parent_inode.size + bs_u64;
-        let new_blocks = parent_inode.blocks + (bs_u64 / 512);
+        let new_blocks = parent_inode.blocks + (bs_u64 / 512) * blocks_consumed;
         Self::patch_inode_size_and_blocks(&mut parent_raw, new_size, new_blocks)?;
 
         // 4. Recompute parent inode CSUM and write it back.
@@ -1723,15 +1776,32 @@ impl Filesystem {
         }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
-        // 6. Commit block allocator side-effects.
-        self.mark_block_run_used(new_phys, 1)?;
-        self.patch_bgd_counters(
-            plan.bgd.group_idx as usize,
-            plan.bgd.free_blocks_delta,
-            plan.bgd.free_inodes_delta,
-            plan.bgd.used_dirs_delta,
-        )?;
-        self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        // 6. Commit block allocator side-effects. On the promotion path the
+        //    data-block allocation was already committed above; here we only
+        //    commit the leaf-node allocation. On the simple path we commit the
+        //    data block as usual.
+        if let Some(meta_plan) = leaf_meta_alloc {
+            self.mark_block_run_used(meta_plan.first_block, 1)?;
+            self.patch_bgd_counters(
+                meta_plan.bgd.group_idx as usize,
+                meta_plan.bgd.free_blocks_delta,
+                meta_plan.bgd.free_inodes_delta,
+                meta_plan.bgd.used_dirs_delta,
+            )?;
+            self.patch_sb_counters(
+                meta_plan.sb.free_blocks_delta,
+                meta_plan.sb.free_inodes_delta,
+            )?;
+        } else {
+            self.mark_block_run_used(new_phys, 1)?;
+            self.patch_bgd_counters(
+                plan.bgd.group_idx as usize,
+                plan.bgd.free_blocks_delta,
+                plan.bgd.free_inodes_delta,
+                plan.bgd.used_dirs_delta,
+            )?;
+            self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        }
 
         Ok(())
     }

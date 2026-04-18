@@ -103,9 +103,9 @@ impl Superblock {
         let desc_size = if desc_size == 0 { 32 } else { desc_size };
 
         let mut hash_seed = [0u32; 4];
-        for i in 0..4 {
+        for (i, slot) in hash_seed.iter_mut().enumerate() {
             let off = 0xEC + i * 4;
-            hash_seed[i] = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
+            *slot = u32::from_le_bytes(raw[off..off + 4].try_into().unwrap());
         }
         let default_hash_version = raw[0xFC];
 
@@ -153,7 +153,7 @@ impl Superblock {
 
     /// Number of block groups.
     pub fn block_group_count(&self) -> u64 {
-        (self.blocks_count + self.blocks_per_group as u64 - 1) / self.blocks_per_group as u64
+        self.blocks_count.div_ceil(self.blocks_per_group as u64)
     }
 
     /// Whether the 64BIT incompat feature is enabled.
