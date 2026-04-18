@@ -962,20 +962,15 @@ pub unsafe extern "C" fn ext4rs_truncate(
                 set_err_msg(&format!("truncate {path_str}: not a regular file"), EINVAL);
                 return -1;
             }
-            // Growing via truncate isn't supported (sparse-grow was trivial but
-            // unused by current callers). Surface EINVAL rather than letting
-            // apply_truncate_shrink return Error::Corrupt → EIO.
-            if new_size > inode.size {
-                set_err_msg(
-                    &format!(
-                        "truncate {path_str}: grow not supported ({new_size} > {})",
-                        inode.size
-                    ),
-                    EINVAL,
-                );
-                return -1;
-            }
-            match fs_ref.apply_truncate_shrink(ino, new_size) {
+            // Dispatch to grow (sparse) or shrink based on direction. At
+            // equality either path works; grow wins since it only bumps
+            // timestamps.
+            let res = if new_size >= inode.size {
+                fs_ref.apply_truncate_grow(ino, new_size)
+            } else {
+                fs_ref.apply_truncate_shrink(ino, new_size)
+            };
+            match res {
                 Ok(()) => 0,
                 Err(e) => {
                     set_err_from(&e, &format!("truncate {path_str} -> {new_size}"));

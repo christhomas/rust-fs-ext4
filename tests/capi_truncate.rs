@@ -118,7 +118,11 @@ fn truncate_on_ro_mount_returns_minus_one() {
 }
 
 #[test]
-fn truncate_growing_is_rejected() {
+fn truncate_growing_succeeds_via_sparse_path() {
+    // Regression: earlier this test asserted that grow was REJECTED. The
+    // sparse-grow path is now implemented (see capi_truncate_grow.rs for the
+    // full suite). This test holds the line that the old rejection is gone
+    // and the size grows when asked.
     let img = scratch_image();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
@@ -127,14 +131,12 @@ fn truncate_growing_is_rejected() {
     assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
     let original = stat_size(fs, "/test.txt");
 
-    // Ask for a larger size — should be rejected with -1 per the truncate-
-    // grow branch in apply_truncate_shrink.
     let rc = unsafe { ext4rs_truncate(fs, path_c.as_ptr(), original + 4096) };
-    assert_eq!(rc, -1, "grow-truncate must fail");
+    assert_eq!(rc, 0, "grow-truncate now succeeds via sparse path");
     assert_eq!(
         stat_size(fs, "/test.txt"),
-        original,
-        "size must be unchanged"
+        original + 4096,
+        "size must reflect grow"
     );
 
     unsafe { ext4rs_umount(fs) };

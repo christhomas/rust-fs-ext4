@@ -250,6 +250,46 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Extend a file to `new_size`. The new range is a sparse hole — ext4's
+    /// extent tree treats unmapped logical blocks as zeros, so no extent
+    /// mutation and no block allocation are required. Only `i_size`,
+    /// `i_mtime`, `i_ctime`, and the inode checksum change.
+    ///
+    /// Caller (capi dispatch) guarantees `new_size >= inode.size`. If
+    /// `new_size == inode.size` this is a no-op that still bumps the
+    /// timestamps — matches `truncate(2)` semantics.
+    pub fn apply_truncate_grow(&self, ino: u32, new_size: u64) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+        if new_size < inode.size {
+            return Err(Error::InvalidArgument(
+                "apply_truncate_grow: new_size < old_size (use apply_truncate_shrink)",
+            ));
+        }
+        Self::patch_inode_size_and_blocks(&mut raw, new_size, inode.blocks)?;
+
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
+        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self
+                .csum
+                .compute_inode_checksum(ino, inode.generation, &raw)
+            {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(ino, &raw)?;
+        self.dev.flush()?;
+        Ok(())
+    }
+
     /// Change the permission bits on `path`. Only the low 12 bits of `mode`
     /// (`S_ISUID|S_ISGID|S_ISVTX` plus rwx/rwx/rwx) are applied; the file-type
     /// bits (`S_IFMT`) are preserved from the existing inode.

@@ -59,10 +59,10 @@ fn truncate_on_directory_should_fail_with_eisdir() {
 }
 
 #[test]
-fn truncate_grow_fails_with_einval() {
-    // Growing a file with truncate isn't supported. The apply layer returns
-    // Error::Corrupt which would map to EIO; the capi wrapper should
-    // surface EINVAL instead so FSKit callers get a meaningful error.
+fn truncate_grow_succeeds_via_sparse_path() {
+    // Grow is now supported via the sparse path: i_size grows, no block
+    // allocation, reads of the new tail return zeros. Kept as a type-check
+    // test so future changes to truncate semantics surface here.
     let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
@@ -74,13 +74,12 @@ fn truncate_grow_fails_with_einval() {
     let original = attr.size;
 
     let rc = unsafe { ext4rs_truncate(fs_h, path.as_ptr(), original + 4096) };
-    assert_eq!(rc, -1);
-    assert_eq!(
-        ext4rs_last_errno(),
-        22,
-        "expected EINVAL for grow, got {}",
-        ext4rs_last_errno()
-    );
+    assert_eq!(rc, 0, "grow now succeeds via sparse path");
+    assert_eq!(ext4rs_last_errno(), 0);
+
+    let mut after: ext4rs_attr_t = unsafe { std::mem::zeroed() };
+    unsafe { ext4rs_stat(fs_h, path.as_ptr(), &mut after) };
+    assert_eq!(after.size, original + 4096);
 
     unsafe { ext4rs_umount(fs_h) };
     let _ = fs::remove_file(&img);
