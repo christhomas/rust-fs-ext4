@@ -4,6 +4,9 @@ on:
   push:
     tags: ['v*']
 
+permissions:
+  contents: write  # create the GitHub Release + upload assets
+
 jobs:
   build-macos-universal:
     runs-on: macos-14
