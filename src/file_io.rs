@@ -88,7 +88,10 @@ pub fn read(
             Some(ext) => {
                 // Map logical to physical and read.
                 let physical_block = ext.map(logical_block);
-                let phys_byte_offset = physical_block * block_size + off_in_block as u64;
+                let phys_byte_offset = physical_block
+                    .checked_mul(block_size)
+                    .and_then(|b| b.checked_add(off_in_block as u64))
+                    .ok_or(Error::CorruptExtentTree("physical block offset overflow"))?;
                 fs.dev.read_at(phys_byte_offset, dst)?;
             }
         }
@@ -220,7 +223,10 @@ pub fn read_verified(
             Some(ext) if ext.uninitialized => dst.fill(0),
             Some(ext) => {
                 let physical_block = ext.map(logical_block);
-                let phys_byte_offset = physical_block * block_size + off_in_block as u64;
+                let phys_byte_offset = physical_block
+                    .checked_mul(block_size)
+                    .and_then(|b| b.checked_add(off_in_block as u64))
+                    .ok_or(Error::CorruptExtentTree("physical block offset overflow"))?;
                 fs.dev.read_at(phys_byte_offset, dst)?;
             }
         }
