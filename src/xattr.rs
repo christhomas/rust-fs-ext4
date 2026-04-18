@@ -593,8 +593,8 @@ mod tests {
             .into_iter()
             .map(|e| (e.name_bytes.clone(), e.value))
             .collect();
-        assert_eq!(by_name.get(&b"color".to_vec()).unwrap(), b"blue");
-        assert_eq!(by_name.get(&b"mood".to_vec()).unwrap(), b"happy");
+        assert_eq!(by_name.get(b"color".as_slice()).unwrap(), b"blue");
+        assert_eq!(by_name.get(b"mood".as_slice()).unwrap(), b"happy");
     }
 
     #[test]
