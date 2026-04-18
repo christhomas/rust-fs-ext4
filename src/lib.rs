@@ -1,7 +1,7 @@
 //! ext4rs — pure-Rust ext4 filesystem driver.
 //!
-//! Exposes a stable C ABI (`ext4rs_*`) via [`capi`] so FFI consumers
-//! (Swift/C/Go/…) can link `libext4rs.a` and `#include "ext4rs.h"`.
+//! Exposes a stable C ABI (`fs_ext4_*`) via [`capi`] so FFI consumers
+//! (Swift/C/Go/…) can link `libfs_ext4.a` and `#include "fs_ext4.h"`.
 //!
 //! Architecture (read-only Phase 1):
 //! - [`block_io`] — abstract trait for reading device blocks
@@ -13,7 +13,7 @@
 //! - [`dir`] — directory entries (linear and HTree)
 //! - [`hash`] — htree hash functions (legacy / half_md4 / tea)
 //! - [`fs`] — top-level filesystem handle, file/dir lookup, read API
-//! - [`capi`] — C ABI exports matching `include/ext4rs.h`
+//! - [`capi`] — C ABI exports matching `include/fs_ext4.h`
 
 #![allow(dead_code)]
 // many spec items not yet wired through
@@ -49,7 +49,7 @@ pub mod superblock;
 pub mod transaction;
 pub mod xattr;
 
-// C ABI exports — surface defined in `include/ext4rs.h`.
+// C ABI exports — surface defined in `include/fs_ext4.h`.
 pub mod capi;
 
 pub use error::{Error, Result};

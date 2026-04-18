@@ -2,11 +2,11 @@
 //!
 //! Complements @3's capi_truncate.rs by adding a volume-level assertion:
 //! after shrinking a file, the free_blocks counter returned by
-//! ext4rs_get_volume_info should increase by at least the freed
+//! fs_ext4_get_volume_info should increase by at least the freed
 //! extent count. Locks in the "freeing the tail really frees blocks"
 //! invariant at the C ABI boundary.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -19,7 +19,7 @@ fn scratch() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_truncate_frees_{}_{n}.img",
+        "/tmp/fs_ext4_capi_truncate_frees_{}_{n}.img",
         std::process::id()
     ));
     let bytes = fs::read(SRC).expect("read src");
@@ -31,7 +31,7 @@ fn scratch() -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        let p = ext4rs_last_error();
+        let p = fs_ext4_last_error();
         if p.is_null() {
             return String::new();
         }
@@ -39,9 +39,9 @@ fn last_err() -> String {
     }
 }
 
-fn free_blocks(fs: *mut ext4rs_fs_t) -> u64 {
-    let mut info: ext4rs_volume_info_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe { ext4rs_get_volume_info(fs, &mut info) };
+fn free_blocks(fs: *mut fs_ext4_fs_t) -> u64 {
+    let mut info: fs_ext4_volume_info_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { fs_ext4_get_volume_info(fs, &mut info) };
     assert_eq!(rc, 0, "get_volume_info: {}", last_err());
     info.free_blocks
 }
@@ -52,12 +52,12 @@ fn truncate_to_zero_increases_free_blocks() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
 
-    let fs = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_err());
 
     let before = free_blocks(fs);
 
-    let rc = unsafe { ext4rs_truncate(fs, path_c.as_ptr(), 0) };
+    let rc = unsafe { fs_ext4_truncate(fs, path_c.as_ptr(), 0) };
     assert_eq!(rc, 0, "truncate: {}", last_err());
 
     let after = free_blocks(fs);
@@ -74,7 +74,7 @@ fn truncate_to_zero_increases_free_blocks() {
         after - before
     );
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
     let _ = fs::remove_file(&img);
 }
 
@@ -89,26 +89,26 @@ fn truncate_does_not_leak_blocks_across_remount() {
     let path_c = CString::new("/test.txt").unwrap();
 
     let baseline = {
-        let fs = unsafe { ext4rs_mount(img_c.as_ptr()) };
+        let fs = unsafe { fs_ext4_mount(img_c.as_ptr()) };
         assert!(!fs.is_null());
         let n = free_blocks(fs);
-        unsafe { ext4rs_umount(fs) };
+        unsafe { fs_ext4_umount(fs) };
         n
     };
 
     {
-        let fs = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+        let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
         assert!(!fs.is_null(), "mount_rw: {}", last_err());
-        let rc = unsafe { ext4rs_truncate(fs, path_c.as_ptr(), 0) };
+        let rc = unsafe { fs_ext4_truncate(fs, path_c.as_ptr(), 0) };
         assert_eq!(rc, 0, "truncate: {}", last_err());
-        unsafe { ext4rs_umount(fs) };
+        unsafe { fs_ext4_umount(fs) };
     }
 
     let after_remount = {
-        let fs = unsafe { ext4rs_mount(img_c.as_ptr()) };
+        let fs = unsafe { fs_ext4_mount(img_c.as_ptr()) };
         assert!(!fs.is_null(), "remount ro: {}", last_err());
         let n = free_blocks(fs);
-        unsafe { ext4rs_umount(fs) };
+        unsafe { fs_ext4_umount(fs) };
         n
     };
 

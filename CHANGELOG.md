@@ -17,17 +17,17 @@
 First public release. Extracted from the internal ext4-fskit research
 repo into a standalone crate.
 
-### C ABI — `ext4rs_*`
+### C ABI — `fs_ext4_*`
 
-- Lifecycle: `ext4rs_mount`, `ext4rs_mount_with_callbacks`,
-  `ext4rs_mount_rw`, `ext4rs_umount`, `ext4rs_get_volume_info`.
-- Metadata: `ext4rs_stat`, `ext4rs_last_error`, `ext4rs_last_errno`.
-- Directories: `ext4rs_dir_open`, `ext4rs_dir_next`, `ext4rs_dir_close`.
-- Files: `ext4rs_read_file`, `ext4rs_readlink`, `ext4rs_listxattr`,
-  `ext4rs_getxattr`.
-- Write ops: `ext4rs_create`, `ext4rs_unlink`, `ext4rs_mkdir`,
-  `ext4rs_rmdir`, `ext4rs_rename`, `ext4rs_link`, `ext4rs_write_file`,
-  `ext4rs_truncate`.
+- Lifecycle: `fs_ext4_mount`, `fs_ext4_mount_with_callbacks`,
+  `fs_ext4_mount_rw`, `fs_ext4_umount`, `fs_ext4_get_volume_info`.
+- Metadata: `fs_ext4_stat`, `fs_ext4_last_error`, `fs_ext4_last_errno`.
+- Directories: `fs_ext4_dir_open`, `fs_ext4_dir_next`, `fs_ext4_dir_close`.
+- Files: `fs_ext4_read_file`, `fs_ext4_readlink`, `fs_ext4_listxattr`,
+  `fs_ext4_getxattr`.
+- Write ops: `fs_ext4_create`, `fs_ext4_unlink`, `fs_ext4_mkdir`,
+  `fs_ext4_rmdir`, `fs_ext4_rename`, `fs_ext4_link`, `fs_ext4_write_file`,
+  `fs_ext4_truncate`.
 
 ### Driver features
 

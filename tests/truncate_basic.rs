@@ -4,9 +4,9 @@
 //! extent-mutation apply → bitmap bit clear → inode patch. Uses a writable
 //! copy of ext4-basic.img so no other tests see the mutation.
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::path as path_mod;
-use ext4rs::Filesystem;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::path as path_mod;
+use fs_ext4::Filesystem;
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
     let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
@@ -28,7 +28,7 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     if !std::path::Path::new(&src).exists() {
         return None;
     }
-    let dst = format!("/tmp/ext4rs_trunc_{}_{n}_{}.img", std::process::id(), name);
+    let dst = format!("/tmp/fs_ext4_trunc_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
 }

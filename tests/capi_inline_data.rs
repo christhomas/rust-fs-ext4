@@ -5,10 +5,10 @@
 //!   /medium.txt — 100x 'A' (overflows into system.data xattr)
 //!   /symlink    — symlink to "target/path/here"
 //!
-//! Before the inline_data wiring in capi.rs, ext4rs_read_file returned 0
+//! Before the inline_data wiring in capi.rs, fs_ext4_read_file returned 0
 //! for any file with INLINE_DATA_FL set. These tests lock in the fix.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
@@ -16,7 +16,7 @@ const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-i
 
 fn last_err_str() -> String {
     unsafe {
-        let p = ext4rs_last_error();
+        let p = fs_ext4_last_error();
         if p.is_null() {
             return "<null>".into();
         }
@@ -24,9 +24,9 @@ fn last_err_str() -> String {
     }
 }
 
-fn mount() -> *mut ext4rs_fs_t {
+fn mount() -> *mut fs_ext4_fs_t {
     let path = CString::new(TEST_IMAGE).unwrap();
-    let fs = unsafe { ext4rs_mount(path.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null(), "mount failed: {}", last_err_str());
     fs
 }
@@ -38,7 +38,7 @@ fn reads_tiny_inline_file_full_content() {
 
     let mut buf = [0u8; 64];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             path.as_ptr(),
             buf.as_mut_ptr() as *mut c_void,
@@ -49,7 +49,7 @@ fn reads_tiny_inline_file_full_content() {
     assert_eq!(n, 12, "tiny.txt should be 12 bytes: {}", last_err_str());
     assert_eq!(&buf[..12], b"tiny inline\n");
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -59,7 +59,7 @@ fn reads_medium_inline_file_with_xattr_overflow() {
 
     let mut buf = [0u8; 128];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             path.as_ptr(),
             buf.as_mut_ptr() as *mut c_void,
@@ -75,7 +75,7 @@ fn reads_medium_inline_file_with_xattr_overflow() {
     );
     assert!(buf[..100].iter().all(|&b| b == b'A'), "content mismatch");
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -84,11 +84,11 @@ fn inline_read_respects_offset_and_length() {
     let path = CString::new("/medium.txt").unwrap();
 
     let mut buf = [0u8; 32];
-    let n = unsafe { ext4rs_read_file(fs, path.as_ptr(), buf.as_mut_ptr() as *mut c_void, 50, 10) };
+    let n = unsafe { fs_ext4_read_file(fs, path.as_ptr(), buf.as_mut_ptr() as *mut c_void, 50, 10) };
     assert_eq!(n, 10);
     assert!(buf[..10].iter().all(|&b| b == b'A'));
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -98,7 +98,7 @@ fn inline_read_past_eof_returns_zero() {
 
     let mut buf = [0u8; 16];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             path.as_ptr(),
             buf.as_mut_ptr() as *mut c_void,
@@ -108,7 +108,7 @@ fn inline_read_past_eof_returns_zero() {
     };
     assert_eq!(n, 0, "reading past EOF should return 0 bytes");
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -117,10 +117,10 @@ fn inline_data_symlink_readlink() {
     let path = CString::new("/symlink").unwrap();
 
     let mut buf = [0u8; 128];
-    let rc = unsafe { ext4rs_readlink(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
+    let rc = unsafe { fs_ext4_readlink(fs, path.as_ptr(), buf.as_mut_ptr() as *mut i8, buf.len()) };
     assert_eq!(rc, 0, "readlink failed: {}", last_err_str());
     let end = buf.iter().position(|&b| b == 0).unwrap_or(buf.len());
     assert_eq!(&buf[..end], b"target/path/here");
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }

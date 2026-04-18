@@ -1,40 +1,40 @@
-//! C ABI exports — MUST match `include/ext4rs.h` exactly. Consumers
-//! link `libext4rs.a` and #include that header; any signature change
+//! C ABI exports — MUST match `include/fs_ext4.h` exactly. Consumers
+//! link `libfs_ext4.a` and #include that header; any signature change
 //! here requires the header to change in lockstep.
 //!
 //! Phase 1 (read-only) surface:
-//! - ext4rs_mount(device_path) -> *mut ext4rs_fs_t
-//! - ext4rs_mount_with_callbacks(cfg) -> *mut ext4rs_fs_t
-//! - ext4rs_umount(fs)
-//! - ext4rs_get_volume_info(fs, info) -> int
-//! - ext4rs_stat(fs, path, attr) -> int
-//! - ext4rs_dir_open(fs, path) -> *mut iter
-//! - ext4rs_dir_next(iter) -> *const dirent
-//! - ext4rs_dir_close(iter)
-//! - ext4rs_read_file(fs, ...) -> i64 (extents + inline_data)
-//! - ext4rs_readlink(fs, path, buf, bufsize) -> int
-//! - ext4rs_listxattr(fs, path, buf, bufsize) -> i64
-//! - ext4rs_getxattr(fs, path, name, buf, bufsize) -> i64
-//! - ext4rs_last_error() -> *const c_char
-//! - ext4rs_last_errno() -> c_int          (POSIX errno companion to last_error)
+//! - fs_ext4_mount(device_path) -> *mut fs_ext4_fs_t
+//! - fs_ext4_mount_with_callbacks(cfg) -> *mut fs_ext4_fs_t
+//! - fs_ext4_umount(fs)
+//! - fs_ext4_get_volume_info(fs, info) -> int
+//! - fs_ext4_stat(fs, path, attr) -> int
+//! - fs_ext4_dir_open(fs, path) -> *mut iter
+//! - fs_ext4_dir_next(iter) -> *const dirent
+//! - fs_ext4_dir_close(iter)
+//! - fs_ext4_read_file(fs, ...) -> i64 (extents + inline_data)
+//! - fs_ext4_readlink(fs, path, buf, bufsize) -> int
+//! - fs_ext4_listxattr(fs, path, buf, bufsize) -> i64
+//! - fs_ext4_getxattr(fs, path, name, buf, bufsize) -> i64
+//! - fs_ext4_last_error() -> *const c_char
+//! - fs_ext4_last_errno() -> c_int          (POSIX errno companion to last_error)
 //!
 //! Phase 4 (write path, in progress):
-//! - ext4rs_mount_rw(device_path) -> *mut ext4rs_fs_t
-//! - ext4rs_truncate(fs, path, new_size) -> int (shrink + sparse grow)
-//! - ext4rs_symlink(fs, target, linkpath) -> u32 inode (fast + slow path)
-//! - ext4rs_chmod(fs, path, mode) -> int
-//! - ext4rs_chown(fs, path, uid, gid) -> int
-//! - ext4rs_utimens(fs, path, atime_sec, atime_nsec, mtime_sec, mtime_nsec) -> int
-//! - ext4rs_unlink(fs, path) -> int
-//! - ext4rs_write_file(fs, path, data, len) -> i64 (save-as replace body)
+//! - fs_ext4_mount_rw(device_path) -> *mut fs_ext4_fs_t
+//! - fs_ext4_truncate(fs, path, new_size) -> int (shrink + sparse grow)
+//! - fs_ext4_symlink(fs, target, linkpath) -> u32 inode (fast + slow path)
+//! - fs_ext4_chmod(fs, path, mode) -> int
+//! - fs_ext4_chown(fs, path, uid, gid) -> int
+//! - fs_ext4_utimens(fs, path, atime_sec, atime_nsec, mtime_sec, mtime_nsec) -> int
+//! - fs_ext4_unlink(fs, path) -> int
+//! - fs_ext4_write_file(fs, path, data, len) -> i64 (save-as replace body)
 //!
 //! Memory ownership rules (from ntfsbridge precedent, documented in docs/ext4-rs-capi.md):
-//! - `ext4rs_fs_t*` is owned by the caller. Freed via `ext4rs_umount`
+//! - `fs_ext4_fs_t*` is owned by the caller. Freed via `fs_ext4_umount`
 //!   (use for both `mount`, `mount_with_callbacks`, and `mount_rw` handles).
-//! - `ext4rs_dir_iter_t*` is owned by the caller. Freed via `ext4rs_dir_close`.
-//! - `ext4rs_dir_next` returns a pointer into the iterator's internal buffer;
-//!   valid until the next `ext4rs_dir_next` or `ext4rs_dir_close` call.
-//! - `ext4rs_last_error` / `ext4rs_last_errno` read thread-local
+//! - `fs_ext4_dir_iter_t*` is owned by the caller. Freed via `fs_ext4_dir_close`.
+//! - `fs_ext4_dir_next` returns a pointer into the iterator's internal buffer;
+//!   valid until the next `fs_ext4_dir_next` or `fs_ext4_dir_close` call.
+//! - `fs_ext4_last_error` / `fs_ext4_last_errno` read thread-local
 //!   storage; valid until the next FFI call on the same thread.
 
 #![allow(non_camel_case_types)]
@@ -125,7 +125,7 @@ fn ffi_guard<T>(fail: T, body: impl FnOnce() -> T + std::panic::UnwindSafe) -> T
 /// Get the last error message for the current thread.
 /// Returns a pointer valid until the next FFI call on this thread.
 #[no_mangle]
-pub extern "C" fn ext4rs_last_error() -> *const c_char {
+pub extern "C" fn fs_ext4_last_error() -> *const c_char {
     LAST_ERROR.with(|cell| cell.borrow().as_ptr())
 }
 
@@ -134,18 +134,18 @@ pub extern "C" fn ext4rs_last_error() -> *const c_char {
 /// Codes: ENOENT (2), EIO (5), ENOTDIR (20), EINVAL (22), ENOTSUP (45),
 /// or any errno surfaced by the underlying I/O layer.
 #[no_mangle]
-pub extern "C" fn ext4rs_last_errno() -> c_int {
+pub extern "C" fn fs_ext4_last_errno() -> c_int {
     LAST_ERRNO.with(|cell| *cell.borrow())
 }
 
 // ===========================================================================
-// ABI types — MUST match include/ext4rs.h
+// ABI types — MUST match include/fs_ext4.h
 // ===========================================================================
 
-/// File type (matches `ext4rs_file_type_t` in the header).
+/// File type (matches `fs_ext4_file_type_t` in the header).
 #[repr(C)]
 #[derive(Copy, Clone)]
-pub enum ext4rs_file_type_t {
+pub enum fs_ext4_file_type_t {
     Unknown = 0,
     RegFile = 1,
     Dir = 2,
@@ -156,9 +156,9 @@ pub enum ext4rs_file_type_t {
     Symlink = 7,
 }
 
-/// File/directory attributes (matches `ext4rs_attr_t`).
+/// File/directory attributes (matches `fs_ext4_attr_t`).
 #[repr(C)]
-pub struct ext4rs_attr_t {
+pub struct fs_ext4_attr_t {
     pub inode: u32,
     pub mode: u16,
     pub uid: u32,
@@ -169,21 +169,21 @@ pub struct ext4rs_attr_t {
     pub ctime: u32,
     pub crtime: u32,
     pub link_count: u16,
-    pub file_type: ext4rs_file_type_t,
+    pub file_type: fs_ext4_file_type_t,
 }
 
-/// Directory entry (matches `ext4rs_dirent_t`).
+/// Directory entry (matches `fs_ext4_dirent_t`).
 #[repr(C)]
-pub struct ext4rs_dirent_t {
+pub struct fs_ext4_dirent_t {
     pub inode: u32,
     pub file_type: u8,
     pub name_len: u8,
     pub name: [c_char; 256],
 }
 
-/// Volume info (matches `ext4rs_volume_info_t`).
+/// Volume info (matches `fs_ext4_volume_info_t`).
 #[repr(C)]
-pub struct ext4rs_volume_info_t {
+pub struct fs_ext4_volume_info_t {
     pub volume_name: [c_char; 16],
     pub block_size: u32,
     pub total_blocks: u64,
@@ -192,15 +192,15 @@ pub struct ext4rs_volume_info_t {
     pub free_inodes: u32,
 }
 
-/// Block device read callback (matches `ext4rs_read_fn`).
-pub type ext4rs_read_fn = Option<
+/// Block device read callback (matches `fs_ext4_read_fn`).
+pub type fs_ext4_read_fn = Option<
     unsafe extern "C" fn(context: *mut c_void, buf: *mut c_void, offset: u64, length: u64) -> c_int,
 >;
 
-/// Callback-based mount config (matches `ext4rs_blockdev_cfg_t`).
+/// Callback-based mount config (matches `fs_ext4_blockdev_cfg_t`).
 #[repr(C)]
-pub struct ext4rs_blockdev_cfg_t {
-    pub read: ext4rs_read_fn,
+pub struct fs_ext4_blockdev_cfg_t {
+    pub read: fs_ext4_read_fn,
     pub context: *mut c_void,
     pub size_bytes: u64,
     pub block_size: u32,
@@ -210,19 +210,19 @@ pub struct ext4rs_blockdev_cfg_t {
 // Opaque handle types
 // ===========================================================================
 
-/// Opaque mounted filesystem handle. The caller treats this as `ext4rs_fs_t*`.
-pub struct ext4rs_fs_t {
+/// Opaque mounted filesystem handle. The caller treats this as `fs_ext4_fs_t*`.
+pub struct fs_ext4_fs_t {
     fs: Filesystem,
 }
 
-/// Opaque directory iterator handle. The caller treats this as `ext4rs_dir_iter_t*`.
-pub struct ext4rs_dir_iter_t {
+/// Opaque directory iterator handle. The caller treats this as `fs_ext4_dir_iter_t*`.
+pub struct fs_ext4_dir_iter_t {
     /// Pre-collected entries (Phase 1 simplicity — streaming can come later).
-    entries: Vec<ext4rs_dirent_t>,
+    entries: Vec<fs_ext4_dirent_t>,
     /// Current position in `entries`.
     position: usize,
     /// Last returned entry — backing storage for the pointer returned from `_dir_next`.
-    current: ext4rs_dirent_t,
+    current: fs_ext4_dirent_t,
 }
 
 // ===========================================================================
@@ -237,22 +237,22 @@ unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
     CStr::from_ptr(p).to_str().unwrap_or("")
 }
 
-/// Convert POSIX mode bits to `ext4rs_file_type_t`.
-fn mode_to_file_type(mode: u16) -> ext4rs_file_type_t {
+/// Convert POSIX mode bits to `fs_ext4_file_type_t`.
+fn mode_to_file_type(mode: u16) -> fs_ext4_file_type_t {
     match mode & S_IFMT {
-        S_IFREG => ext4rs_file_type_t::RegFile,
-        S_IFDIR => ext4rs_file_type_t::Dir,
-        S_IFLNK => ext4rs_file_type_t::Symlink,
-        S_IFCHR => ext4rs_file_type_t::ChrDev,
-        S_IFBLK => ext4rs_file_type_t::BlkDev,
-        S_IFIFO => ext4rs_file_type_t::Fifo,
-        S_IFSOCK => ext4rs_file_type_t::Sock,
-        _ => ext4rs_file_type_t::Unknown,
+        S_IFREG => fs_ext4_file_type_t::RegFile,
+        S_IFDIR => fs_ext4_file_type_t::Dir,
+        S_IFLNK => fs_ext4_file_type_t::Symlink,
+        S_IFCHR => fs_ext4_file_type_t::ChrDev,
+        S_IFBLK => fs_ext4_file_type_t::BlkDev,
+        S_IFIFO => fs_ext4_file_type_t::Fifo,
+        S_IFSOCK => fs_ext4_file_type_t::Sock,
+        _ => fs_ext4_file_type_t::Unknown,
     }
 }
 
-/// Fill an `ext4rs_attr_t` from an inode.
-fn fill_attr(out: &mut ext4rs_attr_t, ino: u32, inode: &Inode) {
+/// Fill an `fs_ext4_attr_t` from an inode.
+fn fill_attr(out: &mut fs_ext4_attr_t, ino: u32, inode: &Inode) {
     out.inode = ino;
     out.mode = inode.mode & 0x0FFF; // keep permission bits
     out.uid = inode.uid;
@@ -272,7 +272,7 @@ fn fill_attr(out: &mut ext4rs_attr_t, ino: u32, inode: &Inode) {
 
 /// Mount an ext4 filesystem from a device path. Returns NULL on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_mount(device_path: *const c_char) -> *mut ext4rs_fs_t {
+pub unsafe extern "C" fn fs_ext4_mount(device_path: *const c_char) -> *mut fs_ext4_fs_t {
     ffi_guard(
         std::ptr::null_mut(),
         AssertUnwindSafe(|| {
@@ -292,7 +292,7 @@ pub unsafe extern "C" fn ext4rs_mount(device_path: *const c_char) -> *mut ext4rs
             };
 
             match Filesystem::mount(dev) {
-                Ok(fs) => Box::into_raw(Box::new(ext4rs_fs_t { fs })),
+                Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
                 Err(e) => {
                     set_err_from(&e, &format!("mount {path}"));
                     std::ptr::null_mut()
@@ -304,16 +304,16 @@ pub unsafe extern "C" fn ext4rs_mount(device_path: *const c_char) -> *mut ext4rs
 
 /// Mount via a caller-supplied read callback.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_mount_with_callbacks(
-    cfg: *const ext4rs_blockdev_cfg_t,
-) -> *mut ext4rs_fs_t {
+pub unsafe extern "C" fn fs_ext4_mount_with_callbacks(
+    cfg: *const fs_ext4_blockdev_cfg_t,
+) -> *mut fs_ext4_fs_t {
     ffi_guard(
         std::ptr::null_mut(),
         AssertUnwindSafe(|| mount_with_callbacks_inner(cfg)),
     )
 }
 
-unsafe fn mount_with_callbacks_inner(cfg: *const ext4rs_blockdev_cfg_t) -> *mut ext4rs_fs_t {
+unsafe fn mount_with_callbacks_inner(cfg: *const fs_ext4_blockdev_cfg_t) -> *mut fs_ext4_fs_t {
     clear_last_error();
     if cfg.is_null() {
         set_err_msg("null cfg", EINVAL);
@@ -358,7 +358,7 @@ unsafe fn mount_with_callbacks_inner(cfg: *const ext4rs_blockdev_cfg_t) -> *mut 
     };
 
     match Filesystem::mount(Arc::new(dev) as Arc<dyn BlockDevice>) {
-        Ok(fs) => Box::into_raw(Box::new(ext4rs_fs_t { fs })),
+        Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
         Err(e) => {
             set_err_from(&e, "mount (callback)");
             std::ptr::null_mut()
@@ -368,7 +368,7 @@ unsafe fn mount_with_callbacks_inner(cfg: *const ext4rs_blockdev_cfg_t) -> *mut 
 
 /// Unmount and free the filesystem handle.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_umount(fs: *mut ext4rs_fs_t) {
+pub unsafe extern "C" fn fs_ext4_umount(fs: *mut fs_ext4_fs_t) {
     ffi_guard(
         (),
         AssertUnwindSafe(|| {
@@ -385,9 +385,9 @@ pub unsafe extern "C" fn ext4rs_umount(fs: *mut ext4rs_fs_t) {
 
 /// Fill `info` with volume statistics. Returns 0 on success, -1 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_get_volume_info(
-    fs: *mut ext4rs_fs_t,
-    info: *mut ext4rs_volume_info_t,
+pub unsafe extern "C" fn fs_ext4_get_volume_info(
+    fs: *mut fs_ext4_fs_t,
+    info: *mut fs_ext4_volume_info_t,
 ) -> c_int {
     ffi_guard(
         -1,
@@ -401,7 +401,7 @@ pub unsafe extern "C" fn ext4rs_get_volume_info(
             let info = &mut *info;
 
             // Zero the struct
-            std::ptr::write_bytes(info as *mut ext4rs_volume_info_t, 0, 1);
+            std::ptr::write_bytes(info as *mut fs_ext4_volume_info_t, 0, 1);
 
             // Copy volume name (up to 16 bytes incl. NUL)
             let name_bytes = fs.sb.volume_name.as_bytes();
@@ -450,10 +450,10 @@ fn resolve_path(fs: &Filesystem, path: &str) -> Result<u32> {
 
 /// Stat a path. Returns 0 on success, -1 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_stat(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_stat(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
-    attr: *mut ext4rs_attr_t,
+    attr: *mut fs_ext4_attr_t,
 ) -> c_int {
     ffi_guard(
         -1,
@@ -491,10 +491,10 @@ pub unsafe extern "C" fn ext4rs_stat(
 
 /// Open a directory for iteration. Returns NULL on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_dir_open(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_dir_open(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
-) -> *mut ext4rs_dir_iter_t {
+) -> *mut fs_ext4_dir_iter_t {
     ffi_guard(
         std::ptr::null_mut(),
         AssertUnwindSafe(|| {
@@ -534,7 +534,7 @@ pub unsafe extern "C" fn ext4rs_dir_open(
                 }
             };
 
-            let iter = Box::new(ext4rs_dir_iter_t {
+            let iter = Box::new(fs_ext4_dir_iter_t {
                 entries,
                 position: 0,
                 current: std::mem::zeroed(),
@@ -544,8 +544,8 @@ pub unsafe extern "C" fn ext4rs_dir_open(
     )
 }
 
-/// Read all directory entries from an inode into `ext4rs_dirent_t`s.
-fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<ext4rs_dirent_t>> {
+/// Read all directory entries from an inode into `fs_ext4_dirent_t`s.
+fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<fs_ext4_dirent_t>> {
     if !inode.has_extents() {
         return Err(Error::Corrupt("legacy (non-extent) dirs not yet supported"));
     }
@@ -583,7 +583,7 @@ fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<ext4rs_dire
 }
 
 /// Convert a parsed DirEntry to the C ABI dirent struct.
-fn dir_entry_to_bridge(e: &dir::DirEntry) -> ext4rs_dirent_t {
+fn dir_entry_to_bridge(e: &dir::DirEntry) -> fs_ext4_dirent_t {
     let mut name = [0i8; 256];
     let copy_len = e.name.len().min(255);
     for (i, &b) in e.name[..copy_len].iter().enumerate() {
@@ -602,7 +602,7 @@ fn dir_entry_to_bridge(e: &dir::DirEntry) -> ext4rs_dirent_t {
         DirEntryType::Unknown => 0,
     };
 
-    ext4rs_dirent_t {
+    fs_ext4_dirent_t {
         inode: e.inode,
         file_type,
         name_len: copy_len as u8,
@@ -612,7 +612,7 @@ fn dir_entry_to_bridge(e: &dir::DirEntry) -> ext4rs_dirent_t {
 
 /// Get the next dir entry. Returns NULL at end or on error.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_dir_next(iter: *mut ext4rs_dir_iter_t) -> *const ext4rs_dirent_t {
+pub unsafe extern "C" fn fs_ext4_dir_next(iter: *mut fs_ext4_dir_iter_t) -> *const fs_ext4_dirent_t {
     ffi_guard(
         std::ptr::null(),
         AssertUnwindSafe(|| {
@@ -625,7 +625,7 @@ pub unsafe extern "C" fn ext4rs_dir_next(iter: *mut ext4rs_dir_iter_t) -> *const
             }
             // Copy into the iterator's `current` buffer so the returned pointer
             // remains valid until the next _dir_next / _dir_close call.
-            iter.current = ext4rs_dirent_t {
+            iter.current = fs_ext4_dirent_t {
                 inode: iter.entries[iter.position].inode,
                 file_type: iter.entries[iter.position].file_type,
                 name_len: iter.entries[iter.position].name_len,
@@ -639,7 +639,7 @@ pub unsafe extern "C" fn ext4rs_dir_next(iter: *mut ext4rs_dir_iter_t) -> *const
 
 /// Close a directory iterator.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_dir_close(iter: *mut ext4rs_dir_iter_t) {
+pub unsafe extern "C" fn fs_ext4_dir_close(iter: *mut fs_ext4_dir_iter_t) {
     ffi_guard(
         (),
         AssertUnwindSafe(|| {
@@ -652,8 +652,8 @@ pub unsafe extern "C" fn ext4rs_dir_close(iter: *mut ext4rs_dir_iter_t) {
 
 /// Read bytes from a file. Returns bytes read, or -1 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_read_file(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_read_file(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     buf: *mut c_void,
     offset: u64,
@@ -707,8 +707,8 @@ pub unsafe extern "C" fn ext4rs_read_file(
 /// Handles both fast symlinks (target stored inline in i_block, size < 60 bytes)
 /// and long symlinks (target stored in data blocks, read via file_io).
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_readlink(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_readlink(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     buf: *mut c_char,
     bufsize: usize,
@@ -776,8 +776,8 @@ pub unsafe extern "C" fn ext4rs_readlink(
 /// List xattr names for a path. NUL-separated, fully-qualified.
 /// Returns required total bytes (so callers can probe with NULL/0).
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_listxattr(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_listxattr(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     buf: *mut c_char,
     bufsize: usize,
@@ -847,8 +847,8 @@ pub unsafe extern "C" fn ext4rs_listxattr(
 /// Get a single xattr value by fully-qualified name.
 /// Returns value size (so callers can probe with NULL/0), or -1 if missing / error.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_getxattr(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_getxattr(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     name: *const c_char,
     buf: *mut c_void,
@@ -920,8 +920,8 @@ pub unsafe extern "C" fn ext4rs_getxattr(
 // ===========================================================================
 
 /// Truncate a file to `new_size`. Only valid when the device was mounted
-/// R/W (e.g. via `ext4rs_mount_rw`). Returns 0 on success, -1 on failure
-/// with details in `ext4rs_last_error`.
+/// R/W (e.g. via `fs_ext4_mount_rw`). Returns 0 on success, -1 on failure
+/// with details in `fs_ext4_last_error`.
 ///
 /// Both directions are supported:
 /// - **Shrink** (`new_size < inode.size`): frees the dropped extents,
@@ -935,8 +935,8 @@ pub unsafe extern "C" fn ext4rs_getxattr(
 /// Refuses directories (POSIX EISDIR); refuses symlinks and special
 /// files (EINVAL).
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_truncate(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_truncate(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     new_size: u64,
 ) -> c_int {
@@ -996,15 +996,15 @@ pub unsafe extern "C" fn ext4rs_truncate(
 
 /// Remove a file entry at `path`. Requires a R/W mount.
 ///
-/// Refuses directories (caller should use a future `ext4rs_rmdir`).
+/// Refuses directories (caller should use a future `fs_ext4_rmdir`).
 /// Decrements `i_links_count`; if the count reaches zero the inode's data
 /// blocks are freed, its bitmap slot is cleared, and the inode body is
 /// zeroed with `i_dtime = now` (matching the kernel's unlink convention).
 ///
 /// Returns 0 on success, -1 on failure with details in
-/// `ext4rs_last_error`.
+/// `fs_ext4_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_unlink(fs: *mut ext4rs_fs_t, path: *const c_char) -> c_int {
+pub unsafe extern "C" fn fs_ext4_unlink(fs: *mut fs_ext4_fs_t, path: *const c_char) -> c_int {
     ffi_guard(
         -1,
         AssertUnwindSafe(|| {
@@ -1029,13 +1029,13 @@ pub unsafe extern "C" fn ext4rs_unlink(fs: *mut ext4rs_fs_t, path: *const c_char
 /// Create a new empty regular file at `path` with permission bits `mode`
 /// (e.g. 0o644). Parent must exist and be a directory; path must not already
 /// exist. Returns the allocated inode number on success (> 0), or 0 on failure
-/// with details in `ext4rs_last_error`.
+/// with details in `fs_ext4_last_error`.
 ///
 /// We return `u32` rather than `c_int` so Swift sees a plain uint32_t —
 /// matches the convention for other inode-returning exports.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_create(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_create(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     mode: u16,
 ) -> u32 {
@@ -1069,8 +1069,8 @@ pub unsafe extern "C" fn ext4rs_create(
 /// This is the "save-as" path: atomic replacement of a file's body.
 /// Appends, sparse writes, and partial overwrites are follow-up work.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_write_file(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_write_file(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     data: *const c_void,
     len: u64,
@@ -1089,7 +1089,7 @@ pub unsafe extern "C" fn ext4rs_write_file(
             }
             let fs_ref = &(*fs).fs;
             let path_str = cstr_to_str(path);
-            // Type guard at the capi level — mirrors ext4rs_truncate so the
+            // Type guard at the capi level — mirrors fs_ext4_truncate so the
             // caller gets EISDIR/EINVAL instead of Error::Corrupt → EIO when
             // the target is the wrong kind of file.
             let ino = match resolve_path(fs_ref, path_str) {
@@ -1133,11 +1133,11 @@ pub unsafe extern "C" fn ext4rs_write_file(
     )
 }
 
-/// Mount an ext4 filesystem read-write. Companion to `ext4rs_mount`.
+/// Mount an ext4 filesystem read-write. Companion to `fs_ext4_mount`.
 /// Returns NULL on failure. A successful mount will replay a dirty journal
 /// before returning.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_mount_rw(device_path: *const c_char) -> *mut ext4rs_fs_t {
+pub unsafe extern "C" fn fs_ext4_mount_rw(device_path: *const c_char) -> *mut fs_ext4_fs_t {
     ffi_guard(
         std::ptr::null_mut(),
         AssertUnwindSafe(|| {
@@ -1155,7 +1155,7 @@ pub unsafe extern "C" fn ext4rs_mount_rw(device_path: *const c_char) -> *mut ext
                 }
             };
             match Filesystem::mount(dev) {
-                Ok(fs) => Box::into_raw(Box::new(ext4rs_fs_t { fs })),
+                Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
                 Err(e) => {
                     set_err_from(&e, &format!("mount_rw {path}"));
                     std::ptr::null_mut()
@@ -1170,8 +1170,8 @@ pub unsafe extern "C" fn ext4rs_mount_rw(device_path: *const c_char) -> *mut ext
 /// parent must be a directory. Increments the shared inode's
 /// `i_links_count`. Returns 0 on success, -1 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_link(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_link(
+    fs: *mut fs_ext4_fs_t,
     src: *const c_char,
     dst: *const c_char,
 ) -> c_int {
@@ -1202,8 +1202,8 @@ pub unsafe extern "C" fn ext4rs_link(
 /// adjust both parents' `i_links_count`. Dest must NOT already exist —
 /// overwrite-on-rename is a follow-up. Returns 0 on success, -1 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_rename(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_rename(
+    fs: *mut fs_ext4_fs_t,
     src: *const c_char,
     dst: *const c_char,
 ) -> c_int {
@@ -1233,7 +1233,7 @@ pub unsafe extern "C" fn ext4rs_rename(
 /// 12 bits used; file-type bits are set automatically). Returns the new
 /// directory's inode number on success, 0 on failure.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_mkdir(fs: *mut ext4rs_fs_t, path: *const c_char, mode: u16) -> u32 {
+pub unsafe extern "C" fn fs_ext4_mkdir(fs: *mut fs_ext4_fs_t, path: *const c_char, mode: u16) -> u32 {
     ffi_guard(
         0u32,
         AssertUnwindSafe(|| {
@@ -1257,9 +1257,9 @@ pub unsafe extern "C" fn ext4rs_mkdir(fs: *mut ext4rs_fs_t, path: *const c_char,
 
 /// Remove an empty directory at `path`. Fails if the directory contains
 /// entries other than `.` and `..`. Returns 0 on success, -1 on failure
-/// with details in `ext4rs_last_error`.
+/// with details in `fs_ext4_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_rmdir(fs: *mut ext4rs_fs_t, path: *const c_char) -> c_int {
+pub unsafe extern "C" fn fs_ext4_rmdir(fs: *mut fs_ext4_fs_t, path: *const c_char) -> c_int {
     ffi_guard(
         -1,
         AssertUnwindSafe(|| {
@@ -1285,10 +1285,10 @@ pub unsafe extern "C" fn ext4rs_rmdir(fs: *mut ext4rs_fs_t, path: *const c_char)
 /// (suid/sgid/sticky + rwx/rwx/rwx) are applied; file-type bits (`S_IFMT`)
 /// are preserved from the existing inode. Bumps `i_ctime`.
 ///
-/// Returns 0 on success, -1 on failure with details in `ext4rs_last_error`.
+/// Returns 0 on success, -1 on failure with details in `fs_ext4_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_chmod(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_chmod(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     mode: u16,
 ) -> c_int {
@@ -1317,10 +1317,10 @@ pub unsafe extern "C" fn ext4rs_chmod(
 /// for either parameter leaves that value unchanged (matches Linux chown(2)
 /// "-1 means leave alone" convention). Bumps `i_ctime`.
 ///
-/// Returns 0 on success, -1 on failure with details in `ext4rs_last_error`.
+/// Returns 0 on success, -1 on failure with details in `fs_ext4_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_chown(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_chown(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     uid: u32,
     gid: u32,
@@ -1352,10 +1352,10 @@ pub unsafe extern "C" fn ext4rs_chown(
 /// only when i_extra_isize covers them). Bumps i_ctime.
 ///
 /// Returns 0 on success, -1 on failure with details in
-/// `ext4rs_last_error`.
+/// `fs_ext4_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_utimens(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_utimens(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     atime_sec: u32,
     atime_nsec: u32,
@@ -1391,13 +1391,13 @@ pub unsafe extern "C" fn ext4rs_utimens(
 /// already exist.
 ///
 /// v1 limit: `target` must be ≤ 60 bytes (fast-symlink path). Longer
-/// targets return -1 with EINVAL + an explanatory `ext4rs_last_error`.
+/// targets return -1 with EINVAL + an explanatory `fs_ext4_last_error`.
 ///
 /// Returns the new inode number on success (> 0), or 0 on failure with
-/// details in `ext4rs_last_error`.
+/// details in `fs_ext4_last_error`.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_symlink(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_symlink(
+    fs: *mut fs_ext4_fs_t,
     target: *const c_char,
     linkpath: *const c_char,
 ) -> u32 {
@@ -1429,12 +1429,12 @@ pub unsafe extern "C" fn ext4rs_symlink(
 /// removal surfaces EINVAL until the slow path lands.
 ///
 /// Returns 0 on success, -1 on failure with details in
-/// `ext4rs_last_error`. `ext4rs_last_errno` codes: ENOENT if the name
+/// `fs_ext4_last_error`. `fs_ext4_last_errno` codes: ENOENT if the name
 /// isn't present, EINVAL on unknown prefix or external-block-only entry,
 /// EROFS on a read-only mount.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_removexattr(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_removexattr(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     name: *const c_char,
 ) -> c_int {
@@ -1468,12 +1468,12 @@ pub unsafe extern "C" fn ext4rs_removexattr(
 /// too small; external-block spill is not implemented.
 ///
 /// Returns 0 on success, -1 on failure with details in
-/// `ext4rs_last_error`. `ext4rs_last_errno` codes: EINVAL on unknown
+/// `fs_ext4_last_error`. `fs_ext4_last_errno` codes: EINVAL on unknown
 /// prefix or null args, ENAMETOOLONG on >255-byte suffix, ENOSPC on
 /// in-inode overflow, EROFS on RO mount.
 #[no_mangle]
-pub unsafe extern "C" fn ext4rs_setxattr(
-    fs: *mut ext4rs_fs_t,
+pub unsafe extern "C" fn fs_ext4_setxattr(
+    fs: *mut fs_ext4_fs_t,
     path: *const c_char,
     name: *const c_char,
     value: *const c_void,

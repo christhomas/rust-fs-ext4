@@ -1,10 +1,10 @@
-//! Integration tests for `ext4rs_setxattr` (in-inode path).
+//! Integration tests for `fs_ext4_setxattr` (in-inode path).
 //!
 //! Uses `test-disks/ext4-xattr.img` which has an existing tagged file at
 //! `/tagged.txt` (user.color=red, user.com.apple.FinderInfo) and a plain
 //! file at `/plain.txt` with no xattrs.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -17,7 +17,7 @@ fn scratch(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_setxattr_{tag}_{}_{n}.img",
+        "/tmp/fs_ext4_capi_setxattr_{tag}_{}_{n}.img",
         std::process::id()
     ));
     let bytes = fs::read(SRC).expect("read src");
@@ -29,16 +29,16 @@ fn scratch(tag: &str) -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error())
+        CStr::from_ptr(fs_ext4_last_error())
             .to_string_lossy()
             .into_owned()
     }
 }
 
-fn get_xattr(fs: *mut ext4rs_fs_t, path: &str, name: &str) -> Option<Vec<u8>> {
+fn get_xattr(fs: *mut fs_ext4_fs_t, path: &str, name: &str) -> Option<Vec<u8>> {
     let p = CString::new(path).unwrap();
     let n = CString::new(name).unwrap();
-    let probe = unsafe { ext4rs_getxattr(fs, p.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) };
+    let probe = unsafe { fs_ext4_getxattr(fs, p.as_ptr(), n.as_ptr(), std::ptr::null_mut(), 0) };
     if probe < 0 {
         return None;
     }
@@ -47,7 +47,7 @@ fn get_xattr(fs: *mut ext4rs_fs_t, path: &str, name: &str) -> Option<Vec<u8>> {
     }
     let mut buf = vec![0u8; probe as usize];
     let got = unsafe {
-        ext4rs_getxattr(
+        fs_ext4_getxattr(
             fs,
             p.as_ptr(),
             n.as_ptr(),
@@ -69,11 +69,11 @@ fn setxattr_creates_new_entry_on_plain_file() {
     let name_c = CString::new("user.tag").unwrap();
     let value = b"review";
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null(), "mount_rw: {}", last_err());
 
     let rc = unsafe {
-        ext4rs_setxattr(
+        fs_ext4_setxattr(
             fs_h,
             path_c.as_ptr(),
             name_c.as_ptr(),
@@ -82,12 +82,12 @@ fn setxattr_creates_new_entry_on_plain_file() {
         )
     };
     assert_eq!(rc, 0, "setxattr: {}", last_err());
-    assert_eq!(ext4rs_last_errno(), 0);
+    assert_eq!(fs_ext4_last_errno(), 0);
 
     let got = get_xattr(fs_h, "/plain.txt", "user.tag").unwrap();
     assert_eq!(got, value);
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -98,7 +98,7 @@ fn setxattr_replaces_existing_entry() {
     let path_c = CString::new("/tagged.txt").unwrap();
     let name_c = CString::new("user.color").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     // Before: user.color=red.
@@ -112,7 +112,7 @@ fn setxattr_replaces_existing_entry() {
     // original region was packed.
     let new = b"sky";
     let rc = unsafe {
-        ext4rs_setxattr(
+        fs_ext4_setxattr(
             fs_h,
             path_c.as_ptr(),
             name_c.as_ptr(),
@@ -129,7 +129,7 @@ fn setxattr_replaces_existing_entry() {
     // Other xattr (FinderInfo) must survive.
     assert!(get_xattr(fs_h, "/tagged.txt", "user.com.apple.FinderInfo").is_some());
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -141,10 +141,10 @@ fn setxattr_persists_across_remount() {
     let name_c = CString::new("user.label").unwrap();
     let value = b"persisted";
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
     let rc = unsafe {
-        ext4rs_setxattr(
+        fs_ext4_setxattr(
             fs_h,
             path_c.as_ptr(),
             name_c.as_ptr(),
@@ -153,13 +153,13 @@ fn setxattr_persists_across_remount() {
         )
     };
     assert_eq!(rc, 0);
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
 
-    let fs2 = unsafe { ext4rs_mount(img_c.as_ptr()) };
+    let fs2 = unsafe { fs_ext4_mount(img_c.as_ptr()) };
     assert!(!fs2.is_null(), "remount failed — csum not patched?");
     let got = get_xattr(fs2, "/plain.txt", "user.label").unwrap();
     assert_eq!(got, value);
-    unsafe { ext4rs_umount(fs2) };
+    unsafe { fs_ext4_umount(fs2) };
     let _ = fs::remove_file(&img);
 }
 
@@ -170,11 +170,11 @@ fn setxattr_unknown_prefix_returns_einval() {
     let path_c = CString::new("/plain.txt").unwrap();
     let name_c = CString::new("strange.name").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
     let value = b"x";
     let rc = unsafe {
-        ext4rs_setxattr(
+        fs_ext4_setxattr(
             fs_h,
             path_c.as_ptr(),
             name_c.as_ptr(),
@@ -183,8 +183,8 @@ fn setxattr_unknown_prefix_returns_einval() {
         )
     };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 22);
-    unsafe { ext4rs_umount(fs_h) };
+    assert_eq!(fs_ext4_last_errno(), 22);
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -198,10 +198,10 @@ fn setxattr_huge_value_returns_enospc() {
     let name_c = CString::new("user.huge").unwrap();
     let value = vec![0xABu8; 512];
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
     let rc = unsafe {
-        ext4rs_setxattr(
+        fs_ext4_setxattr(
             fs_h,
             path_c.as_ptr(),
             name_c.as_ptr(),
@@ -210,8 +210,8 @@ fn setxattr_huge_value_returns_enospc() {
         )
     };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 28, "ENOSPC expected");
-    unsafe { ext4rs_umount(fs_h) };
+    assert_eq!(fs_ext4_last_errno(), 28, "ENOSPC expected");
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -219,12 +219,12 @@ fn setxattr_huge_value_returns_enospc() {
 fn setxattr_null_args_return_einval() {
     let img = scratch("null");
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
     let p = CString::new("/plain.txt").unwrap();
     let n = CString::new("user.x").unwrap();
     let rc = unsafe {
-        ext4rs_setxattr(
+        fs_ext4_setxattr(
             fs_h,
             std::ptr::null(),
             n.as_ptr(),
@@ -233,9 +233,9 @@ fn setxattr_null_args_return_einval() {
         )
     };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 22);
+    assert_eq!(fs_ext4_last_errno(), 22);
     let rc = unsafe {
-        ext4rs_setxattr(
+        fs_ext4_setxattr(
             fs_h,
             p.as_ptr(),
             std::ptr::null(),
@@ -244,7 +244,7 @@ fn setxattr_null_args_return_einval() {
         )
     };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 22);
-    unsafe { ext4rs_umount(fs_h) };
+    assert_eq!(fs_ext4_last_errno(), 22);
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }

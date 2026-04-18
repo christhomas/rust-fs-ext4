@@ -5,32 +5,32 @@
 //! dir_open/dir_next path walks the full listing via linear leaf scan even
 //! though the directory is indexed — no entries lost, no duplicates.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::path::Path;
 
 const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-htree.img");
 
-fn mount_or_skip() -> Option<*mut ext4rs_fs_t> {
+fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
     if !Path::new(IMAGE).exists() {
         eprintln!("skip: {IMAGE} not built");
         return None;
     }
     let p = CString::new(IMAGE).unwrap();
-    let fs = unsafe { ext4rs_mount(p.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
     if fs.is_null() {
         return None;
     }
     Some(fs)
 }
 
-fn list_dir(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
+fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
     let p = CString::new(path).unwrap();
-    let iter = unsafe { ext4rs_dir_open(fs, p.as_ptr()) };
+    let iter = unsafe { fs_ext4_dir_open(fs, p.as_ptr()) };
     assert!(!iter.is_null(), "dir_open({path}) returned null");
     let mut names = Vec::new();
     loop {
-        let e = unsafe { ext4rs_dir_next(iter) };
+        let e = unsafe { fs_ext4_dir_next(iter) };
         if e.is_null() {
             break;
         }
@@ -41,7 +41,7 @@ fn list_dir(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
             .collect();
         names.push(String::from_utf8_lossy(&bytes).into_owned());
     }
-    unsafe { ext4rs_dir_close(iter) };
+    unsafe { fs_ext4_dir_close(iter) };
     names
 }
 
@@ -61,7 +61,7 @@ fn bigdir_lists_all_256_files_plus_dot_entries() {
     );
     assert!(names.iter().any(|n| n == "."), "missing .");
     assert!(names.iter().any(|n| n == ".."), "missing ..");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -74,7 +74,7 @@ fn bigdir_has_no_duplicate_entries() {
     sorted.sort();
     sorted.dedup();
     assert_eq!(sorted.len(), names.len(), "duplicate entries detected");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -86,12 +86,12 @@ fn bigdir_stat_every_file_succeeds() {
     for name in names.iter().filter(|n| n.starts_with("file_")) {
         let path = format!("/bigdir/{name}");
         let c = CString::new(path.clone()).unwrap();
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs, c.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };
         assert_eq!(rc, 0, "stat({path}) failed");
         assert!(attr.inode > 0);
     }
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -109,9 +109,9 @@ fn specific_htree_lookups_hit_via_path() {
         let name = real[idx.min(real.len() - 1)];
         let path = format!("/bigdir/{name}");
         let c = CString::new(path.clone()).unwrap();
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs, c.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };
         assert_eq!(rc, 0, "stat({path}) failed");
     }
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }

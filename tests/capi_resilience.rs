@@ -8,10 +8,10 @@
 //! Strategy: take a known-good image, copy it into tmp, deterministically
 //! flip bytes in specific critical regions, then invoke the full C ABI on
 //! it. All paths must either succeed (with sane results) or return the
-//! sentinel error with `ext4rs_last_errno() != 0` and a non-empty
-//! `ext4rs_last_error()`.
+//! sentinel error with `fs_ext4_last_errno() != 0` and a non-empty
+//! `fs_ext4_last_error()`.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::os::raw::c_void;
@@ -21,7 +21,7 @@ const GOOD_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-b
 
 fn last_err() -> String {
     unsafe {
-        let p = ext4rs_last_error();
+        let p = fs_ext4_last_error();
         if p.is_null() {
             return String::new();
         }
@@ -48,11 +48,11 @@ fn corrupted_copy(label: &str, mutate: impl FnOnce(&mut Vec<u8>)) -> PathBuf {
 /// return cleanly (no UB, no abort).
 fn hammer_all_entry_points(path: &str) {
     let c_path = CString::new(path).unwrap();
-    let fs = unsafe { ext4rs_mount(c_path.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(c_path.as_ptr()) };
 
     if fs.is_null() {
         // Mount rejected — verify error plumbing worked.
-        let errno = ext4rs_last_errno();
+        let errno = fs_ext4_last_errno();
         assert_ne!(errno, 0, "mount failed but errno is 0 for {path}");
         assert!(
             !last_err().is_empty(),
@@ -67,31 +67,31 @@ fn hammer_all_entry_points(path: &str) {
     let nope = CString::new("/does-not-exist").unwrap();
 
     // Volume info.
-    let mut info: ext4rs_volume_info_t = unsafe { std::mem::zeroed() };
-    let _ = unsafe { ext4rs_get_volume_info(fs, &mut info) };
+    let mut info: fs_ext4_volume_info_t = unsafe { std::mem::zeroed() };
+    let _ = unsafe { fs_ext4_get_volume_info(fs, &mut info) };
 
     // Stat variants.
-    let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-    let _ = unsafe { ext4rs_stat(fs, root.as_ptr(), &mut attr) };
-    let _ = unsafe { ext4rs_stat(fs, any.as_ptr(), &mut attr) };
-    let _ = unsafe { ext4rs_stat(fs, nope.as_ptr(), &mut attr) };
+    let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+    let _ = unsafe { fs_ext4_stat(fs, root.as_ptr(), &mut attr) };
+    let _ = unsafe { fs_ext4_stat(fs, any.as_ptr(), &mut attr) };
+    let _ = unsafe { fs_ext4_stat(fs, nope.as_ptr(), &mut attr) };
 
     // Directory walk.
-    let iter = unsafe { ext4rs_dir_open(fs, root.as_ptr()) };
+    let iter = unsafe { fs_ext4_dir_open(fs, root.as_ptr()) };
     if !iter.is_null() {
         loop {
-            let e = unsafe { ext4rs_dir_next(iter) };
+            let e = unsafe { fs_ext4_dir_next(iter) };
             if e.is_null() {
                 break;
             }
         }
-        unsafe { ext4rs_dir_close(iter) };
+        unsafe { fs_ext4_dir_close(iter) };
     }
 
     // File read.
     let mut buf = [0u8; 256];
     let _ = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             any.as_ptr(),
             buf.as_mut_ptr() as *mut c_void,
@@ -101,21 +101,21 @@ fn hammer_all_entry_points(path: &str) {
     };
 
     // xattrs.
-    let _ = unsafe { ext4rs_listxattr(fs, any.as_ptr(), std::ptr::null_mut(), 0) };
+    let _ = unsafe { fs_ext4_listxattr(fs, any.as_ptr(), std::ptr::null_mut(), 0) };
     let nm = CString::new("user.whatever").unwrap();
-    let _ = unsafe { ext4rs_getxattr(fs, any.as_ptr(), nm.as_ptr(), std::ptr::null_mut(), 0) };
+    let _ = unsafe { fs_ext4_getxattr(fs, any.as_ptr(), nm.as_ptr(), std::ptr::null_mut(), 0) };
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
 fn known_good_image_baseline() {
     // Sanity check — the unmodified image must mount cleanly.
     let c = CString::new(GOOD_IMAGE).unwrap();
-    let fs = unsafe { ext4rs_mount(c.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(c.as_ptr()) };
     assert!(!fs.is_null(), "baseline mount failed: {}", last_err());
-    assert_eq!(ext4rs_last_errno(), 0);
-    unsafe { ext4rs_umount(fs) };
+    assert_eq!(fs_ext4_last_errno(), 0);
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -212,7 +212,7 @@ fn fully_zeroed_image_rejected_cleanly() {
 // ---------------------------------------------------------------------------
 
 /// A read callback that serves bytes from a Vec pointed to by `ctx`.
-/// Matches the `ext4rs_read_fn` signature.
+/// Matches the `fs_ext4_read_fn` signature.
 extern "C" fn read_from_vec(
     ctx: *mut c_void,
     buf: *mut c_void,
@@ -237,14 +237,14 @@ extern "C" fn read_from_vec(
     0
 }
 
-fn mount_callback(bytes: &Vec<u8>) -> *mut ext4rs_fs_t {
-    let cfg = ext4rs_blockdev_cfg_t {
+fn mount_callback(bytes: &Vec<u8>) -> *mut fs_ext4_fs_t {
+    let cfg = fs_ext4_blockdev_cfg_t {
         read: Some(read_from_vec),
         context: bytes as *const Vec<u8> as *mut c_void,
         size_bytes: bytes.len() as u64,
         block_size: 512,
     };
-    unsafe { ext4rs_mount_with_callbacks(&cfg) }
+    unsafe { fs_ext4_mount_with_callbacks(&cfg) }
 }
 
 #[test]
@@ -252,8 +252,8 @@ fn callback_mount_succeeds_on_good_image() {
     let bytes = fs::read(GOOD_IMAGE).unwrap();
     let fs = mount_callback(&bytes);
     assert!(!fs.is_null(), "callback mount failed: {}", last_err());
-    assert_eq!(ext4rs_last_errno(), 0);
-    unsafe { ext4rs_umount(fs) };
+    assert_eq!(fs_ext4_last_errno(), 0);
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -264,15 +264,15 @@ fn callback_mount_rejects_corrupted_bytes_cleanly() {
     bytes[1024 + 57] = 0;
     let fs = mount_callback(&bytes);
     assert!(fs.is_null(), "corrupted callback mount must fail");
-    assert_ne!(ext4rs_last_errno(), 0);
+    assert_ne!(fs_ext4_last_errno(), 0);
     assert!(!last_err().is_empty());
 }
 
 #[test]
 fn callback_mount_null_cfg_returns_einval() {
-    let fs = unsafe { ext4rs_mount_with_callbacks(std::ptr::null()) };
+    let fs = unsafe { fs_ext4_mount_with_callbacks(std::ptr::null()) };
     assert!(fs.is_null());
-    assert_eq!(ext4rs_last_errno(), 22); // EINVAL
+    assert_eq!(fs_ext4_last_errno(), 22); // EINVAL
 }
 
 #[test]
@@ -286,29 +286,29 @@ fn callback_mount_with_failing_read_fn_rejected_cleanly() {
     ) -> std::os::raw::c_int {
         5 // pretend EIO
     }
-    let cfg = ext4rs_blockdev_cfg_t {
+    let cfg = fs_ext4_blockdev_cfg_t {
         read: Some(always_fail),
         context: std::ptr::null_mut(),
         size_bytes: 16 * 1024 * 1024,
         block_size: 512,
     };
-    let fs_ptr = unsafe { ext4rs_mount_with_callbacks(&cfg) };
+    let fs_ptr = unsafe { fs_ext4_mount_with_callbacks(&cfg) };
     assert!(fs_ptr.is_null(), "mount must fail when callback errors");
-    assert_ne!(ext4rs_last_errno(), 0);
+    assert_ne!(fs_ext4_last_errno(), 0);
     assert!(!last_err().is_empty());
 }
 
 #[test]
 fn callback_mount_null_read_fn_returns_einval() {
-    let cfg = ext4rs_blockdev_cfg_t {
+    let cfg = fs_ext4_blockdev_cfg_t {
         read: None,
         context: std::ptr::null_mut(),
         size_bytes: 0,
         block_size: 512,
     };
-    let fs = unsafe { ext4rs_mount_with_callbacks(&cfg) };
+    let fs = unsafe { fs_ext4_mount_with_callbacks(&cfg) };
     assert!(fs.is_null());
-    assert_eq!(ext4rs_last_errno(), 22); // EINVAL
+    assert_eq!(fs_ext4_last_errno(), 22); // EINVAL
 }
 
 // ---------------------------------------------------------------------------
@@ -319,17 +319,17 @@ fn callback_mount_null_read_fn_returns_einval() {
 fn umount_null_pointer_is_a_no_op() {
     // Swift could double-free if a mount retry reuses a stale pointer.
     // Passing null must not panic or crash — just return cleanly.
-    unsafe { ext4rs_umount(std::ptr::null_mut()) };
+    unsafe { fs_ext4_umount(std::ptr::null_mut()) };
 }
 
 #[test]
 fn dir_close_null_pointer_is_a_no_op() {
-    unsafe { ext4rs_dir_close(std::ptr::null_mut()) };
+    unsafe { fs_ext4_dir_close(std::ptr::null_mut()) };
 }
 
 #[test]
 fn dir_next_null_pointer_returns_null() {
-    let p = unsafe { ext4rs_dir_next(std::ptr::null_mut()) };
+    let p = unsafe { fs_ext4_dir_next(std::ptr::null_mut()) };
     assert!(p.is_null());
 }
 
@@ -339,12 +339,12 @@ fn ntfs_image_mounted_as_ext4_rejected_cleanly() {
     // Must fail at mount with a clear error — never blunder into garbage.
     let ntfs_image = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ntfs-basic.img");
     let c = CString::new(ntfs_image).unwrap();
-    let fs = unsafe { ext4rs_mount(c.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(c.as_ptr()) };
     assert!(
         fs.is_null(),
         "mount of an NTFS image must NOT succeed as ext4"
     );
-    let errno = ext4rs_last_errno();
+    let errno = fs_ext4_last_errno();
     assert_ne!(errno, 0, "rejected mount must have non-zero errno");
     let err = last_err();
     assert!(

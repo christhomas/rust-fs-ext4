@@ -7,9 +7,9 @@
 //! the magic check), and confirm `Filesystem::mount` returns
 //! `Error::BadChecksum`.
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::error::Error;
-use ext4rs::fs::Filesystem;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::error::Error;
+use fs_ext4::fs::Filesystem;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 

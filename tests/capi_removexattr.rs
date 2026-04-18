@@ -1,11 +1,11 @@
-//! Integration tests for `ext4rs_removexattr` (in-inode path).
+//! Integration tests for `fs_ext4_removexattr` (in-inode path).
 //!
 //! Uses `test-disks/ext4-xattr.img` which has:
 //!   /tagged.txt   — user.color=red, user.com.apple.FinderInfo=0xDEADBEEF
 //!   /tagged_dir/  — user.purpose=documents
 //!   /plain.txt    — no xattrs
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -18,7 +18,7 @@ fn scratch(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_rmxattr_{tag}_{}_{n}.img",
+        "/tmp/fs_ext4_capi_rmxattr_{tag}_{}_{n}.img",
         std::process::id()
     ));
     let bytes = fs::read(SRC).expect("read src");
@@ -30,21 +30,21 @@ fn scratch(tag: &str) -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error())
+        CStr::from_ptr(fs_ext4_last_error())
             .to_string_lossy()
             .into_owned()
     }
 }
 
-fn list_xattrs(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
+fn list_xattrs(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
     let p = CString::new(path).unwrap();
-    let probe = unsafe { ext4rs_listxattr(fs, p.as_ptr(), std::ptr::null_mut(), 0) };
+    let probe = unsafe { fs_ext4_listxattr(fs, p.as_ptr(), std::ptr::null_mut(), 0) };
     assert!(probe >= 0, "listxattr probe: {}", last_err());
     if probe == 0 {
         return Vec::new();
     }
     let mut buf = vec![0u8; probe as usize];
-    let got = unsafe { ext4rs_listxattr(fs, p.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
+    let got = unsafe { fs_ext4_listxattr(fs, p.as_ptr(), buf.as_mut_ptr() as *mut _, buf.len()) };
     assert!(got >= 0);
     buf.split(|&b| b == 0)
         .filter(|s| !s.is_empty())
@@ -59,7 +59,7 @@ fn remove_existing_xattr_succeeds() {
     let path_c = CString::new("/tagged.txt").unwrap();
     let name_c = CString::new("user.color").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null(), "mount_rw: {}", last_err());
 
     let before = list_xattrs(fs_h, "/tagged.txt");
@@ -68,9 +68,9 @@ fn remove_existing_xattr_succeeds() {
         "expected user.color in {before:?}"
     );
 
-    let rc = unsafe { ext4rs_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
+    let rc = unsafe { fs_ext4_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
     assert_eq!(rc, 0, "removexattr: {}", last_err());
-    assert_eq!(ext4rs_last_errno(), 0);
+    assert_eq!(fs_ext4_last_errno(), 0);
 
     let after = list_xattrs(fs_h, "/tagged.txt");
     assert!(
@@ -83,7 +83,7 @@ fn remove_existing_xattr_succeeds() {
         "FinderInfo should survive, got {after:?}"
     );
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -94,17 +94,17 @@ fn remove_xattr_persists_across_remount() {
     let path_c = CString::new("/tagged.txt").unwrap();
     let name_c = CString::new("user.color").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
-    let rc = unsafe { ext4rs_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
+    let rc = unsafe { fs_ext4_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
     assert_eq!(rc, 0);
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
 
-    let fs2 = unsafe { ext4rs_mount(img_c.as_ptr()) };
+    let fs2 = unsafe { fs_ext4_mount(img_c.as_ptr()) };
     assert!(!fs2.is_null(), "remount failed — csum not patched?");
     let after = list_xattrs(fs2, "/tagged.txt");
     assert!(!after.iter().any(|n| n == "user.color"));
-    unsafe { ext4rs_umount(fs2) };
+    unsafe { fs_ext4_umount(fs2) };
     let _ = fs::remove_file(&img);
 }
 
@@ -115,12 +115,12 @@ fn remove_missing_xattr_returns_enoent() {
     let path_c = CString::new("/tagged.txt").unwrap();
     let name_c = CString::new("user.does_not_exist").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
-    let rc = unsafe { ext4rs_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
+    let rc = unsafe { fs_ext4_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 2, "ENOENT expected");
-    unsafe { ext4rs_umount(fs_h) };
+    assert_eq!(fs_ext4_last_errno(), 2, "ENOENT expected");
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -131,12 +131,12 @@ fn remove_on_file_without_xattrs_returns_enoent() {
     let path_c = CString::new("/plain.txt").unwrap();
     let name_c = CString::new("user.anything").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
-    let rc = unsafe { ext4rs_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
+    let rc = unsafe { fs_ext4_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 2);
-    unsafe { ext4rs_umount(fs_h) };
+    assert_eq!(fs_ext4_last_errno(), 2);
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -147,12 +147,12 @@ fn remove_unknown_namespace_prefix_returns_einval() {
     let path_c = CString::new("/tagged.txt").unwrap();
     let name_c = CString::new("weird.prefix").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
-    let rc = unsafe { ext4rs_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
+    let rc = unsafe { fs_ext4_removexattr(fs_h, path_c.as_ptr(), name_c.as_ptr()) };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 22);
-    unsafe { ext4rs_umount(fs_h) };
+    assert_eq!(fs_ext4_last_errno(), 22);
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -160,16 +160,16 @@ fn remove_unknown_namespace_prefix_returns_einval() {
 fn remove_null_args_return_einval() {
     let img = scratch("null");
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
     let name_c = CString::new("user.x").unwrap();
     let path_c = CString::new("/tagged.txt").unwrap();
-    let rc = unsafe { ext4rs_removexattr(fs_h, std::ptr::null(), name_c.as_ptr()) };
+    let rc = unsafe { fs_ext4_removexattr(fs_h, std::ptr::null(), name_c.as_ptr()) };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 22);
-    let rc = unsafe { ext4rs_removexattr(fs_h, path_c.as_ptr(), std::ptr::null()) };
+    assert_eq!(fs_ext4_last_errno(), 22);
+    let rc = unsafe { fs_ext4_removexattr(fs_h, path_c.as_ptr(), std::ptr::null()) };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 22);
-    unsafe { ext4rs_umount(fs_h) };
+    assert_eq!(fs_ext4_last_errno(), 22);
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }

@@ -183,7 +183,7 @@ mod tests {
         use std::sync::atomic::{AtomicU32, Ordering};
         static COUNTER: AtomicU32 = AtomicU32::new(0);
         let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let path = format!("/tmp/ext4rs_block_io_test_{}_{n}.img", std::process::id());
+        let path = format!("/tmp/fs_ext4_block_io_test_{}_{n}.img", std::process::id());
         let mut f = File::create(&path).unwrap();
         f.write_all(bytes).unwrap();
         path

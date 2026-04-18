@@ -2,9 +2,9 @@
 
 use std::sync::Arc;
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::inode::Inode;
-use ext4rs::Filesystem;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::inode::Inode;
+use fs_ext4::Filesystem;
 
 const TEST_IMAGE: &str = "test-disks/ext4-basic.img";
 

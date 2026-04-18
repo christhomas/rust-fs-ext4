@@ -1,7 +1,7 @@
 //! Verify names longer than EXT4_NAME_LEN (255 bytes) are refused with
 //! POSIX ENAMETOOLONG (63) across the write-path C ABI.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
@@ -14,7 +14,7 @@ fn scratch() -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
     let n = C.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_nametoolong_{}_{n}.img",
+        "/tmp/fs_ext4_capi_nametoolong_{}_{n}.img",
         std::process::id()
     ));
     let mut out = fs::File::create(&dst).unwrap();
@@ -35,15 +35,15 @@ fn long_name(n: usize) -> String {
 fn create_with_name_longer_than_255_returns_enametoolong() {
     let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     let path = CString::new(long_name(256)).unwrap();
-    let ino = unsafe { ext4rs_create(fs_h, path.as_ptr(), 0o644) };
+    let ino = unsafe { fs_ext4_create(fs_h, path.as_ptr(), 0o644) };
     assert_eq!(ino, 0, "create with 256-char name must fail");
-    assert_eq!(ext4rs_last_errno(), 63, "ENAMETOOLONG expected");
+    assert_eq!(fs_ext4_last_errno(), 63, "ENAMETOOLONG expected");
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -51,15 +51,15 @@ fn create_with_name_longer_than_255_returns_enametoolong() {
 fn mkdir_with_name_longer_than_255_returns_enametoolong() {
     let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     let path = CString::new(long_name(300)).unwrap();
-    let ino = unsafe { ext4rs_mkdir(fs_h, path.as_ptr(), 0o755) };
+    let ino = unsafe { fs_ext4_mkdir(fs_h, path.as_ptr(), 0o755) };
     assert_eq!(ino, 0);
-    assert_eq!(ext4rs_last_errno(), 63, "ENAMETOOLONG expected");
+    assert_eq!(fs_ext4_last_errno(), 63, "ENAMETOOLONG expected");
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -68,14 +68,14 @@ fn name_at_the_limit_is_accepted() {
     // Exactly 255 chars — should work.
     let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     let path = CString::new(long_name(255)).unwrap();
-    let ino = unsafe { ext4rs_create(fs_h, path.as_ptr(), 0o644) };
+    let ino = unsafe { fs_ext4_create(fs_h, path.as_ptr(), 0o644) };
     assert_ne!(ino, 0, "255-char name should be accepted");
-    assert_eq!(ext4rs_last_errno(), 0);
+    assert_eq!(fs_ext4_last_errno(), 0);
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }

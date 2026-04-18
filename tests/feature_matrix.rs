@@ -5,13 +5,13 @@
 //! these tests are the best proxy we have for "will this mount under FSKit?"
 //! without running Xcode.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
 fn last_err() -> String {
     unsafe {
-        let p = ext4rs_last_error();
+        let p = fs_ext4_last_error();
         if p.is_null() {
             return "<null>".into();
         }
@@ -28,15 +28,15 @@ fn image_path(name: &str) -> CString {
     .unwrap()
 }
 
-fn list_dir(fs: *mut ext4rs_fs_t, path: &str) -> Vec<(String, u8)> {
+fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<(String, u8)> {
     let p = CString::new(path).unwrap();
-    let iter = unsafe { ext4rs_dir_open(fs, p.as_ptr()) };
+    let iter = unsafe { fs_ext4_dir_open(fs, p.as_ptr()) };
     if iter.is_null() {
         panic!("dir_open {path}: {}", last_err());
     }
     let mut entries = Vec::new();
     loop {
-        let de = unsafe { ext4rs_dir_next(iter) };
+        let de = unsafe { fs_ext4_dir_next(iter) };
         if de.is_null() {
             break;
         }
@@ -45,15 +45,15 @@ fn list_dir(fs: *mut ext4rs_fs_t, path: &str) -> Vec<(String, u8)> {
         let name = unsafe { CStr::from_ptr(name_ptr).to_string_lossy().into_owned() };
         entries.push((name, ft));
     }
-    unsafe { ext4rs_dir_close(iter) };
+    unsafe { fs_ext4_dir_close(iter) };
     entries
 }
 
-fn read_file_to_string(fs: *mut ext4rs_fs_t, path: &str, max: usize) -> Option<String> {
+fn read_file_to_string(fs: *mut fs_ext4_fs_t, path: &str, max: usize) -> Option<String> {
     let p = CString::new(path).unwrap();
     let mut buf = vec![0u8; max];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             p.as_ptr(),
             buf.as_mut_ptr() as *mut c_void,
@@ -75,7 +75,7 @@ fn read_file_to_string(fs: *mut ext4rs_fs_t, path: &str, max: usize) -> Option<S
 #[test]
 fn htree_readdir_returns_all_256_files() {
     let path = image_path("ext4-htree.img");
-    let fs = unsafe { ext4rs_mount(path.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     if fs.is_null() {
         eprintln!("skip ext4-htree.img: {}", last_err());
         return;
@@ -94,7 +94,7 @@ fn htree_readdir_returns_all_256_files() {
         entries.iter().take(5).collect::<Vec<_>>()
     );
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -102,19 +102,19 @@ fn htree_lookup_specific_file() {
     // path::lookup currently uses linear scan. Should work even without htree
     // fast-path (just O(n) instead of O(log n)).
     let path = image_path("ext4-htree.img");
-    let fs = unsafe { ext4rs_mount(path.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     if fs.is_null() {
         eprintln!("skip ext4-htree.img: {}", last_err());
         return;
     }
 
     let p = CString::new("/bigdir/file_128.txt").unwrap();
-    let mut attr = unsafe { std::mem::zeroed::<ext4rs_attr_t>() };
-    let rc = unsafe { ext4rs_stat(fs, p.as_ptr(), &mut attr) };
+    let mut attr = unsafe { std::mem::zeroed::<fs_ext4_attr_t>() };
+    let rc = unsafe { fs_ext4_stat(fs, p.as_ptr(), &mut attr) };
     assert_eq!(rc, 0, "stat /bigdir/file_128.txt: {}", last_err());
-    assert_eq!(attr.file_type as u32, ext4rs_file_type_t::RegFile as u32);
+    assert_eq!(attr.file_type as u32, fs_ext4_file_type_t::RegFile as u32);
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -124,7 +124,7 @@ fn htree_lookup_specific_file() {
 #[test]
 fn csum_seed_image_mounts() {
     let path = image_path("ext4-csum-seed.img");
-    let fs = unsafe { ext4rs_mount(path.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(
         !fs.is_null(),
         "CSUM_SEED image failed to mount: {}",
@@ -149,7 +149,7 @@ fn csum_seed_image_mounts() {
         fstab
     );
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -159,7 +159,7 @@ fn csum_seed_image_mounts() {
 #[test]
 fn deep_extent_tree_sparse_file() {
     let path = image_path("ext4-deep-extents.img");
-    let fs = unsafe { ext4rs_mount(path.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     if fs.is_null() {
         eprintln!("skip ext4-deep-extents.img: {}", last_err());
         return;
@@ -174,7 +174,7 @@ fn deep_extent_tree_sparse_file() {
     let p = CString::new("/sparse.bin").unwrap();
     let mut buf = vec![0u8; 128 * 1024];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             p.as_ptr(),
             buf.as_mut_ptr() as *mut c_void,
@@ -191,7 +191,7 @@ fn deep_extent_tree_sparse_file() {
     assert_eq!(buf[1000], 0, "expected 0 in sparse region");
     assert_eq!(buf[65000], 0, "expected 0 before next 'X'");
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -201,7 +201,7 @@ fn deep_extent_tree_sparse_file() {
 #[test]
 fn no_csum_image_mounts() {
     let path = image_path("ext4-no-csum.img");
-    let fs = unsafe { ext4rs_mount(path.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(
         !fs.is_null(),
         "no-csum image failed to mount: {}",
@@ -216,7 +216,7 @@ fn no_csum_image_mounts() {
         content
     );
 
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -233,14 +233,14 @@ fn all_images_report_volume_info() {
         "ext4-no-csum.img",
     ] {
         let path = image_path(img);
-        let fs = unsafe { ext4rs_mount(path.as_ptr()) };
+        let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
         if fs.is_null() {
             eprintln!("{img} failed to mount: {}", last_err());
             continue;
         }
 
-        let mut info = unsafe { std::mem::zeroed::<ext4rs_volume_info_t>() };
-        let rc = unsafe { ext4rs_get_volume_info(fs, &mut info) };
+        let mut info = unsafe { std::mem::zeroed::<fs_ext4_volume_info_t>() };
+        let rc = unsafe { fs_ext4_get_volume_info(fs, &mut info) };
         assert_eq!(rc, 0, "{img} get_volume_info failed: {}", last_err());
         // Block size varies per image (1K, 2K, or 4K depending on mkfs defaults)
         assert!(
@@ -250,6 +250,6 @@ fn all_images_report_volume_info() {
         );
         assert!(info.total_blocks > 0, "{img} total_blocks == 0");
 
-        unsafe { ext4rs_umount(fs) };
+        unsafe { fs_ext4_umount(fs) };
     }
 }

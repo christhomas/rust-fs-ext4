@@ -2,7 +2,7 @@
 //! free_blocks in the volume. Mirrors capi_truncate_frees_blocks.rs for
 //! the complementary direction.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -16,7 +16,7 @@ fn scratch() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_wf_alloc_{}_{n}.img",
+        "/tmp/fs_ext4_capi_wf_alloc_{}_{n}.img",
         std::process::id()
     ));
     let mut out = fs::File::create(&dst).unwrap();
@@ -26,15 +26,15 @@ fn scratch() -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error())
+        CStr::from_ptr(fs_ext4_last_error())
             .to_string_lossy()
             .into_owned()
     }
 }
 
-fn free_blocks(fs_h: *mut ext4rs_fs_t) -> u64 {
-    let mut info: ext4rs_volume_info_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe { ext4rs_get_volume_info(fs_h, &mut info) };
+fn free_blocks(fs_h: *mut fs_ext4_fs_t) -> u64 {
+    let mut info: fs_ext4_volume_info_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { fs_ext4_get_volume_info(fs_h, &mut info) };
     assert_eq!(rc, 0, "get_volume_info: {}", last_err());
     info.free_blocks
 }
@@ -53,12 +53,12 @@ fn growing_write_file_does_not_leak_blocks() {
 
     let payload: Vec<u8> = (0..128 * 1024).map(|i| (i & 0xFF) as u8).collect();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     let before = free_blocks(fs_h);
     let rc = unsafe {
-        ext4rs_write_file(
+        fs_ext4_write_file(
             fs_h,
             path_c.as_ptr(),
             payload.as_ptr() as *const c_void,
@@ -77,7 +77,7 @@ fn growing_write_file_does_not_leak_blocks() {
         before - after
     );
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -90,14 +90,14 @@ fn truncate_to_zero_then_write_recovers_blocks() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
 
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     let payload: Vec<u8> = vec![0x42u8; 64 * 1024];
 
     // Grow.
     let n = unsafe {
-        ext4rs_write_file(
+        fs_ext4_write_file(
             fs_h,
             path_c.as_ptr(),
             payload.as_ptr() as *const c_void,
@@ -108,7 +108,7 @@ fn truncate_to_zero_then_write_recovers_blocks() {
     let after_grow = free_blocks(fs_h);
 
     // Truncate back to zero.
-    let rc = unsafe { ext4rs_truncate(fs_h, path_c.as_ptr(), 0) };
+    let rc = unsafe { fs_ext4_truncate(fs_h, path_c.as_ptr(), 0) };
     assert_eq!(rc, 0, "truncate: {}", last_err());
     let after_shrink = free_blocks(fs_h);
 
@@ -119,6 +119,6 @@ fn truncate_to_zero_then_write_recovers_blocks() {
         "shrink should not decrease free: grow={after_grow} shrink={after_shrink}"
     );
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }

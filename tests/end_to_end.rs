@@ -3,12 +3,12 @@
 //! This proves the full read path works: superblock → BGD → inode → extents
 //! → file_io. Uses the existing test image (no new images required).
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::dir::{self, DirEntryType};
-use ext4rs::file_io;
-use ext4rs::fs::Filesystem;
-use ext4rs::inode::Inode;
-use ext4rs::superblock::SUPERBLOCK_OFFSET;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::dir::{self, DirEntryType};
+use fs_ext4::file_io;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::Inode;
+use fs_ext4::superblock::SUPERBLOCK_OFFSET;
 use std::sync::Arc;
 
 const TEST_IMAGE: &str = "test-disks/ext4-basic.img";

@@ -8,48 +8,48 @@
 //! Image is 192 MB, so these tests are heavier — marked #[ignore] would
 //! be an option for CI, but they run in under a second locally.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::path::Path;
 
 const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-largedir.img");
 
-fn mount_or_skip() -> Option<*mut ext4rs_fs_t> {
+fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
     if !Path::new(IMAGE).exists() {
         eprintln!("skip: {IMAGE} not built (run test-disks/build-ext4-feature-images.sh largedir)");
         return None;
     }
     let p = CString::new(IMAGE).unwrap();
-    let fs = unsafe { ext4rs_mount(p.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
     if fs.is_null() {
         return None;
     }
     Some(fs)
 }
 
-fn count_entries(fs: *mut ext4rs_fs_t, path: &str) -> usize {
+fn count_entries(fs: *mut fs_ext4_fs_t, path: &str) -> usize {
     let c = CString::new(path).unwrap();
-    let iter = unsafe { ext4rs_dir_open(fs, c.as_ptr()) };
+    let iter = unsafe { fs_ext4_dir_open(fs, c.as_ptr()) };
     assert!(!iter.is_null(), "dir_open({path}) returned null");
     let mut count = 0usize;
     loop {
-        let e = unsafe { ext4rs_dir_next(iter) };
+        let e = unsafe { fs_ext4_dir_next(iter) };
         if e.is_null() {
             break;
         }
         count += 1;
     }
-    unsafe { ext4rs_dir_close(iter) };
+    unsafe { fs_ext4_dir_close(iter) };
     count
 }
 
-fn list_names(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
+fn list_names(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
     let c = CString::new(path).unwrap();
-    let iter = unsafe { ext4rs_dir_open(fs, c.as_ptr()) };
+    let iter = unsafe { fs_ext4_dir_open(fs, c.as_ptr()) };
     assert!(!iter.is_null());
     let mut names = Vec::with_capacity(70_002);
     loop {
-        let e = unsafe { ext4rs_dir_next(iter) };
+        let e = unsafe { fs_ext4_dir_next(iter) };
         if e.is_null() {
             break;
         }
@@ -60,7 +60,7 @@ fn list_names(fs: *mut ext4rs_fs_t, path: &str) -> Vec<String> {
             .collect();
         names.push(String::from_utf8_lossy(&bytes).into_owned());
     }
-    unsafe { ext4rs_dir_close(iter) };
+    unsafe { fs_ext4_dir_close(iter) };
     names
 }
 
@@ -72,7 +72,7 @@ fn small_file_reads_control_content() {
     let c = CString::new("/small.txt").unwrap();
     let mut buf = [0u8; 32];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             c.as_ptr(),
             buf.as_mut_ptr() as *mut std::os::raw::c_void,
@@ -82,7 +82,7 @@ fn small_file_reads_control_content() {
     };
     assert_eq!(n, 8);
     assert_eq!(&buf[..8], b"control\n");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -93,7 +93,7 @@ fn huge_dir_enumerates_all_70000_files_plus_dot_entries() {
     let count = count_entries(fs, "/huge");
     // 70_000 files + "." + ".."
     assert_eq!(count, 70_002, "expected 70002 entries, got {count}");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -106,7 +106,7 @@ fn huge_dir_no_duplicate_entries() {
     sorted.sort();
     sorted.dedup();
     assert_eq!(sorted.len(), names.len(), "duplicates detected in /huge");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -119,12 +119,12 @@ fn sampled_stat_succeeds_across_the_huge_range() {
         let name = format!("file_{idx:05}.txt");
         let path = format!("/huge/{name}");
         let c = CString::new(path.clone()).unwrap();
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs, c.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };
         assert_eq!(rc, 0, "stat({path}) failed — htree walk regression?");
         assert_eq!(attr.size, 0, "files were created empty");
     }
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -133,9 +133,9 @@ fn missing_entry_in_huge_dir_returns_enoent() {
         return;
     };
     let c = CString::new("/huge/file_99999999.txt").unwrap();
-    let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe { ext4rs_stat(fs, c.as_ptr(), &mut attr) };
+    let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };
     assert_eq!(rc, -1);
-    assert_eq!(ext4rs_last_errno(), 2, "missing must be ENOENT");
-    unsafe { ext4rs_umount(fs) };
+    assert_eq!(fs_ext4_last_errno(), 2, "missing must be ENOENT");
+    unsafe { fs_ext4_umount(fs) };
 }

@@ -8,15 +8,15 @@
 //! - ext4-no-csum.img: no metadata_csum feature. The verifier must stay
 //!   disabled so we don't reject perfectly valid blocks on legacy images.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::path::Path;
 
-fn last_err(fs: *mut ext4rs_fs_t) -> String {
+fn last_err(fs: *mut fs_ext4_fs_t) -> String {
     let _ = fs;
     unsafe {
-        let p = ext4rs_last_error();
+        let p = fs_ext4_last_error();
         if p.is_null() {
             return String::new();
         }
@@ -24,24 +24,24 @@ fn last_err(fs: *mut ext4rs_fs_t) -> String {
     }
 }
 
-fn mount_or_skip(image: &str) -> Option<*mut ext4rs_fs_t> {
+fn mount_or_skip(image: &str) -> Option<*mut fs_ext4_fs_t> {
     if !Path::new(image).exists() {
         eprintln!("skip: {image} not built");
         return None;
     }
     let p = CString::new(image).unwrap();
-    let fs = unsafe { ext4rs_mount(p.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
     if fs.is_null() {
         return None;
     }
     Some(fs)
 }
 
-fn read_full(fs: *mut ext4rs_fs_t, path: &str, cap: usize) -> Vec<u8> {
+fn read_full(fs: *mut fs_ext4_fs_t, path: &str, cap: usize) -> Vec<u8> {
     let c = CString::new(path).unwrap();
     let mut buf = vec![0u8; cap];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs,
             c.as_ptr(),
             buf.as_mut_ptr() as *mut c_void,
@@ -67,8 +67,8 @@ fn csum_seed_image_mounts() {
     let Some(fs) = mount_or_skip(SEED_IMAGE) else {
         return;
     };
-    assert_eq!(ext4rs_last_errno(), 0);
-    unsafe { ext4rs_umount(fs) };
+    assert_eq!(fs_ext4_last_errno(), 0);
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -78,7 +78,7 @@ fn csum_seed_image_reads_hello_txt() {
     };
     let data = read_full(fs, "/hello.txt", 64);
     assert_eq!(data, b"pi-style file\n");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -91,7 +91,7 @@ fn csum_seed_image_reads_etc_fstab_through_subdir() {
     // verification stay in sync.
     let data = read_full(fs, "/etc/fstab", 64);
     assert_eq!(data, b"fake fstab\n");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 // ---------------------------------------------------------------------------
@@ -105,8 +105,8 @@ fn no_csum_image_mounts() {
     let Some(fs) = mount_or_skip(NO_CSUM_IMAGE) else {
         return;
     };
-    assert_eq!(ext4rs_last_errno(), 0);
-    unsafe { ext4rs_umount(fs) };
+    assert_eq!(fs_ext4_last_errno(), 0);
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -116,7 +116,7 @@ fn no_csum_image_reads_file_without_verifier_interference() {
     };
     let data = read_full(fs, "/file.txt", 64);
     assert_eq!(data, b"no checksum here\n");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -125,9 +125,9 @@ fn no_csum_image_stat_works() {
         return;
     };
     let c = CString::new("/file.txt").unwrap();
-    let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe { ext4rs_stat(fs, c.as_ptr(), &mut attr) };
+    let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };
     assert_eq!(rc, 0, "stat failed: {}", last_err(fs));
     assert_eq!(attr.size, 17);
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }

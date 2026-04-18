@@ -1,8 +1,8 @@
 //! End-to-end mkdir + rmdir test against a writable copy of ext4-basic.img.
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::path as path_mod;
-use ext4rs::Filesystem;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::path as path_mod;
+use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
@@ -18,7 +18,7 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     if !std::path::Path::new(&src).exists() {
         return None;
     }
-    let dst = format!("/tmp/ext4rs_mkdir_{}_{n}_{}.img", std::process::id(), name);
+    let dst = format!("/tmp/fs_ext4_mkdir_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
 }
