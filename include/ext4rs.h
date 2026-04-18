@@ -294,6 +294,18 @@ uint32_t ext4rs_mkdir(ext4rs_fs_t *fs, const char *path,
  * journaled. */
 int ext4rs_rmdir(ext4rs_fs_t *fs, const char *path);
 
+/* Change the permission bits on `path`. Only the low 12 bits of `mode`
+ * (suid/sgid/sticky + rwx/rwx/rwx) are applied; file-type bits are
+ * preserved. Bumps i_ctime. Returns 0 on success, -1 on failure. */
+int ext4rs_chmod(ext4rs_fs_t *fs, const char *path, uint16_t mode);
+
+/* Change the owner of `path` to (`uid`, `gid`). Passing UINT32_MAX
+ * (0xFFFFFFFF) for either parameter leaves that value unchanged
+ * (matches Linux chown(2) semantics). Bumps i_ctime. Returns 0 on
+ * success, -1 on failure. */
+int ext4rs_chown(ext4rs_fs_t *fs, const char *path,
+                  uint32_t uid, uint32_t gid);
+
 #ifdef __cplusplus
 }
 #endif

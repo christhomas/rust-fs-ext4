@@ -25,7 +25,8 @@ dependency itself — the library is portable Rust.
 | multi-level extent tree mutation (depth ≥2, leaf-block split) | **not supported** |
 | sparse grow via truncate | **not supported** |
 | setxattr, removexattr | **not supported** |
-| chmod, chown, utimens | **not supported** |
+| chmod, chown | done (via `ext4rs_chmod` / `ext4rs_chown`) |
+| utimens | **not supported** |
 | journaled transactions | partial (jbd2 replay; write path unjournaled) |
 
 Roughly a read/write driver for the common case. Directories that have

@@ -250,6 +250,94 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Change the permission bits on `path`. Only the low 12 bits of `mode`
+    /// (`S_ISUID|S_ISGID|S_ISVTX` plus rwx/rwx/rwx) are applied; the file-type
+    /// bits (`S_IFMT`) are preserved from the existing inode.
+    ///
+    /// Updates `i_ctime = now` and recomputes the inode checksum on csum-
+    /// enabled mounts. Returns `Error::NotFound` if the path doesn't resolve,
+    /// `Error::ReadOnly` on a RO mount.
+    pub fn apply_chmod(&self, path: &str, mode: u16) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+
+        // Preserve file-type bits (high 4 bits of i_mode); only the low 12
+        // permission/suid/sgid/sticky bits are user-settable.
+        let file_type_bits = inode.mode & crate::inode::S_IFMT;
+        let new_mode = file_type_bits | (mode & 0x0FFF);
+        raw[0x00..0x02].copy_from_slice(&new_mode.to_le_bytes());
+
+        // POSIX: chmod bumps ctime (not mtime).
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self
+                .csum
+                .compute_inode_checksum(ino, inode.generation, &raw)
+            {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(ino, &raw)?;
+        self.dev.flush()?;
+        Ok(())
+    }
+
+    /// Change the owner of `path` to (`uid`, `gid`). Both values are full
+    /// 32-bit — the inode stores them as hi+lo u16 halves at different
+    /// offsets per the ext4 on-disk format. Passing `u32::MAX` for either
+    /// field leaves that value untouched (Linux lchown(2) convention).
+    ///
+    /// Updates `i_ctime = now` and recomputes the inode checksum on
+    /// csum-enabled mounts.
+    pub fn apply_chown(&self, path: &str, uid: u32, gid: u32) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+
+        if uid != u32::MAX {
+            let lo = (uid & 0xFFFF) as u16;
+            let hi = ((uid >> 16) & 0xFFFF) as u16;
+            raw[0x02..0x04].copy_from_slice(&lo.to_le_bytes());
+            raw[0x78..0x7A].copy_from_slice(&hi.to_le_bytes());
+        }
+        if gid != u32::MAX {
+            let lo = (gid & 0xFFFF) as u16;
+            let hi = ((gid >> 16) & 0xFFFF) as u16;
+            raw[0x18..0x1A].copy_from_slice(&lo.to_le_bytes());
+            raw[0x7A..0x7C].copy_from_slice(&hi.to_le_bytes());
+        }
+
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self
+                .csum
+                .compute_inode_checksum(ino, inode.generation, &raw)
+            {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(ino, &raw)?;
+        self.dev.flush()?;
+        Ok(())
+    }
+
     /// Unlink a regular file / symlink / special file at `path`.
     ///
     /// Semantics:
