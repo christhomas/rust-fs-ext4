@@ -306,6 +306,16 @@ int ext4rs_chmod(ext4rs_fs_t *fs, const char *path, uint16_t mode);
 int ext4rs_chown(ext4rs_fs_t *fs, const char *path,
                   uint32_t uid, uint32_t gid);
 
+/* Set the access + modification times on `path`. Each `*_sec` is a
+ * POSIX seconds-since-epoch value; passing UINT32_MAX leaves that pair
+ * unchanged (so `atime_sec == UINT32_MAX` touches only mtime, etc).
+ * `*_nsec` is sub-second nanoseconds, only written when the inode's
+ * i_extra_isize region can hold them. Bumps i_ctime. Returns 0 on
+ * success, -1 on failure. */
+int ext4rs_utimens(ext4rs_fs_t *fs, const char *path,
+                    uint32_t atime_sec, uint32_t atime_nsec,
+                    uint32_t mtime_sec, uint32_t mtime_nsec);
+
 #ifdef __cplusplus
 }
 #endif

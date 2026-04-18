@@ -338,6 +338,82 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Set the access + modification times on `path`. Mirrors POSIX
+    /// `utimensat(2)`: `atime_sec/nsec` and `mtime_sec/nsec` each replace
+    /// the inode's atime/mtime. `ctime` is bumped to now (POSIX requires
+    /// the change-time stamp on any attribute write). The `u32::MAX`
+    /// sentinel on either `_sec` leaves that pair unchanged (lets callers
+    /// touch just atime or just mtime).
+    ///
+    /// `nsec` values are the sub-second timestamp in nanoseconds and are
+    /// only written when the inode's `i_extra_isize` region is large
+    /// enough to hold them (requires ≥ 160-byte inodes — the ext4 tooling
+    /// default).
+    pub fn apply_utimens(
+        &self,
+        path: &str,
+        atime_sec: u32,
+        atime_nsec: u32,
+        mtime_sec: u32,
+        mtime_nsec: u32,
+    ) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let ino = crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, path)?;
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+
+        if atime_sec != u32::MAX {
+            raw[0x08..0x0C].copy_from_slice(&atime_sec.to_le_bytes());
+        }
+        if mtime_sec != u32::MAX {
+            raw[0x10..0x14].copy_from_slice(&mtime_sec.to_le_bytes());
+        }
+        // POSIX: any attribute write bumps ctime.
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+
+        // Extra-isize region carries the nsec fields on larger inodes.
+        // Offsets (relative to inode start):
+        //   0x84 i_ctime_extra  (needs i_extra_isize ≥  8)
+        //   0x88 i_mtime_extra  (needs i_extra_isize ≥ 12)
+        //   0x8C i_atime_extra  (needs i_extra_isize ≥ 16)
+        // Linux packs these as `(nsec << 2) | epoch_bits` — leave
+        // epoch_bits zero (matches the base 32-bit time counter's 2038
+        // range).
+        if raw.len() >= 0x82 {
+            let i_extra_isize = u16::from_le_bytes(raw[0x80..0x82].try_into().unwrap());
+            if i_extra_isize >= 8 && raw.len() >= 0x88 {
+                // Bump ctime_nsec to 0 alongside the ctime bump above.
+                raw[0x84..0x88].copy_from_slice(&0u32.to_le_bytes());
+            }
+            if mtime_sec != u32::MAX && i_extra_isize >= 12 && raw.len() >= 0x8C {
+                let packed = (mtime_nsec & 0x3FFF_FFFF) << 2;
+                raw[0x88..0x8C].copy_from_slice(&packed.to_le_bytes());
+            }
+            if atime_sec != u32::MAX && i_extra_isize >= 16 && raw.len() >= 0x90 {
+                let packed = (atime_nsec & 0x3FFF_FFFF) << 2;
+                raw[0x8C..0x90].copy_from_slice(&packed.to_le_bytes());
+            }
+        }
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self
+                .csum
+                .compute_inode_checksum(ino, inode.generation, &raw)
+            {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(ino, &raw)?;
+        self.dev.flush()?;
+        Ok(())
+    }
+
     /// Unlink a regular file / symlink / special file at `path`.
     ///
     /// Semantics:

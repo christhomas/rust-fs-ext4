@@ -1337,3 +1337,40 @@ pub unsafe extern "C" fn ext4rs_chown(
         }),
     )
 }
+
+/// Set the access + modification times on `path`. Each `*_sec` is the
+/// POSIX seconds-since-epoch; pass `u32::MAX` (0xFFFF_FFFF) to leave a
+/// given pair unchanged. `*_nsec` are the sub-second nanoseconds (written
+/// only when i_extra_isize covers them). Bumps i_ctime.
+///
+/// Returns 0 on success, -1 on failure with details in
+/// `ext4rs_last_error`.
+#[no_mangle]
+pub unsafe extern "C" fn ext4rs_utimens(
+    fs: *mut ext4rs_fs_t,
+    path: *const c_char,
+    atime_sec: u32,
+    atime_nsec: u32,
+    mtime_sec: u32,
+    mtime_nsec: u32,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_utimens(path_str, atime_sec, atime_nsec, mtime_sec, mtime_nsec) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("utimens {path_str}"));
+                    -1
+                }
+            }
+        }),
+    )
+}
