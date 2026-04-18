@@ -8,7 +8,7 @@
 //!     POSIX violation — e.g. `rm /test.txt/` must not succeed even though
 //!     /test.txt exists, because the path explicitly asked for a directory).
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::path::Path;
 
@@ -16,7 +16,7 @@ const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.
 
 fn last_err() -> String {
     unsafe {
-        let p = ext4rs_last_error();
+        let p = fs_ext4_last_error();
         if p.is_null() {
             return String::new();
         }
@@ -24,22 +24,22 @@ fn last_err() -> String {
     }
 }
 
-fn mount_or_skip() -> Option<*mut ext4rs_fs_t> {
+fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
     if !Path::new(IMAGE).exists() {
         return None;
     }
     let p = CString::new(IMAGE).unwrap();
-    let fs = unsafe { ext4rs_mount(p.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
     if fs.is_null() {
         return None;
     }
     Some(fs)
 }
 
-fn stat_ino(fs: *mut ext4rs_fs_t, path: &str) -> Option<u32> {
+fn stat_ino(fs: *mut fs_ext4_fs_t, path: &str) -> Option<u32> {
     let c = CString::new(path).unwrap();
-    let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-    let rc = unsafe { ext4rs_stat(fs, c.as_ptr(), &mut attr) };
+    let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+    let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };
     if rc == 0 {
         Some(attr.inode)
     } else {
@@ -58,7 +58,7 @@ fn empty_slash_and_double_slash_all_resolve_to_root() {
     assert_eq!(by_slash, 2, "/ should resolve to root inode 2");
     assert_eq!(by_empty, 2, "empty string should resolve to root");
     assert_eq!(by_double, 2, "// should resolve to root");
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -71,8 +71,8 @@ fn trailing_slash_on_regular_file_yields_enotdir() {
     };
     let ino = stat_ino(fs, "/test.txt/");
     assert!(ino.is_none(), "/test.txt/ must not resolve as a directory");
-    assert_eq!(ext4rs_last_errno(), 20, "ENOTDIR expected"); // ENOTDIR
-    unsafe { ext4rs_umount(fs) };
+    assert_eq!(fs_ext4_last_errno(), 20, "ENOTDIR expected"); // ENOTDIR
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -85,7 +85,7 @@ fn doubled_slashes_in_path_are_tolerated() {
     assert_eq!(plain, doubled);
     let tripled = stat_ino(fs, "///test.txt").expect("///test.txt");
     assert_eq!(plain, tripled);
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -96,7 +96,7 @@ fn path_through_subdir_with_trailing_slash() {
     let plain = stat_ino(fs, "/subdir").expect("/subdir");
     let trailing = stat_ino(fs, "/subdir/").expect("/subdir/");
     assert_eq!(plain, trailing);
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -106,9 +106,9 @@ fn nonexistent_component_yields_enoent() {
     };
     let ino = stat_ino(fs, "/does-not-exist-at-all");
     assert!(ino.is_none());
-    assert_eq!(ext4rs_last_errno(), 2); // ENOENT
+    assert_eq!(fs_ext4_last_errno(), 2); // ENOENT
     assert!(!last_err().is_empty());
-    unsafe { ext4rs_umount(fs) };
+    unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
@@ -119,6 +119,6 @@ fn file_used_as_directory_mid_path_yields_enotdir() {
     // /test.txt is a file; treating it as a directory must fail with ENOTDIR.
     let ino = stat_ino(fs, "/test.txt/anything");
     assert!(ino.is_none());
-    assert_eq!(ext4rs_last_errno(), 20); // ENOTDIR
-    unsafe { ext4rs_umount(fs) };
+    assert_eq!(fs_ext4_last_errno(), 20); // ENOTDIR
+    unsafe { fs_ext4_umount(fs) };
 }

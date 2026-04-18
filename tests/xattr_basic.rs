@@ -5,13 +5,13 @@
 //!   /tagged_dir    user.purpose=documents
 //!   /plain.txt     (no xattrs)
 
-use ext4rs::bgd;
-use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::error::Result;
-use ext4rs::fs::Filesystem;
-use ext4rs::inode::Inode;
-use ext4rs::path;
-use ext4rs::xattr;
+use fs_ext4::bgd;
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::error::Result;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::Inode;
+use fs_ext4::path;
+use fs_ext4::xattr;
 use std::sync::Arc;
 
 const TEST_IMAGE: &str = "test-disks/ext4-xattr.img";

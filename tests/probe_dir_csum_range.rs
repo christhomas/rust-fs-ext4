@@ -8,11 +8,11 @@
 //! is `block[..len-4]` (excludes only the 4-byte det_checksum field,
 //! NOT the full 12-byte tail). This test settles it empirically.
 
-use ext4rs::bgd;
-use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::checksum::Checksummer;
-use ext4rs::fs::Filesystem;
-use ext4rs::inode::Inode;
+use fs_ext4::bgd;
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::checksum::Checksummer;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::Inode;
 use std::sync::Arc;
 
 const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
@@ -48,7 +48,7 @@ fn determine_which_hash_range_matches_real_block() {
 
     // Root dir's first logical block — map via extent tree.
     let bs = fs.sb.block_size();
-    let phys = ext4rs::extent::map_logical(&root.block, dev_dyn.as_ref(), bs, 0)
+    let phys = fs_ext4::extent::map_logical(&root.block, dev_dyn.as_ref(), bs, 0)
         .expect("map")
         .expect("root dir should have block 0");
     let mut block = vec![0u8; bs as usize];

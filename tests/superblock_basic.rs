@@ -1,8 +1,8 @@
 //! End-to-end: parse the existing test-disks/ext4-basic.img superblock.
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::error::Error;
-use ext4rs::superblock::Superblock;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::error::Error;
+use fs_ext4::superblock::Superblock;
 
 const TEST_IMAGE: &str = "test-disks/ext4-basic.img";
 
@@ -47,7 +47,7 @@ fn superblock_parses_basic_image() {
 fn rejects_non_ext4_data() {
     use std::io::Write;
     let mut tmp = std::env::temp_dir();
-    tmp.push("ext4rs_bad_magic.img");
+    tmp.push("fs_ext4_bad_magic.img");
     {
         let mut f = std::fs::File::create(&tmp).unwrap();
         // Write 2048 bytes of zeroes — no magic at offset 1024+0x38

@@ -8,14 +8,14 @@
 //! These tests skip cleanly when the image is absent (needs docker to build),
 //! following the pattern established by other integration suites here.
 
-use ext4rs::bgd;
-use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::dir::{self, DirEntryType};
-use ext4rs::error::Result;
-use ext4rs::file_io;
-use ext4rs::fs::Filesystem;
-use ext4rs::inode::Inode;
-use ext4rs::path;
+use fs_ext4::bgd;
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::dir::{self, DirEntryType};
+use fs_ext4::error::Result;
+use fs_ext4::file_io;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::Inode;
+use fs_ext4::path;
 use std::path::Path;
 use std::sync::Arc;
 

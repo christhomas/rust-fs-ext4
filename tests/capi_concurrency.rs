@@ -10,7 +10,7 @@
 //! for I/O, so these tests also implicitly check that the mount handle is
 //! `Send + Sync`.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::os::raw::c_void;
 use std::sync::Arc;
@@ -18,7 +18,7 @@ use std::thread;
 
 const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
 
-/// `*mut ext4rs_fs_t` isn't Send by default. Wrap in a usize for
+/// `*mut fs_ext4_fs_t` isn't Send by default. Wrap in a usize for
 /// cross-thread hand-off — the underlying filesystem IS thread-safe
 /// (Mutex-guarded file + Arc block device), we just need to silence the
 /// borrow checker.
@@ -27,14 +27,14 @@ struct FsPtr(usize);
 unsafe impl Send for FsPtr {}
 unsafe impl Sync for FsPtr {}
 impl FsPtr {
-    fn get(self) -> *mut ext4rs_fs_t {
-        self.0 as *mut ext4rs_fs_t
+    fn get(self) -> *mut fs_ext4_fs_t {
+        self.0 as *mut fs_ext4_fs_t
     }
 }
 
 fn mount() -> FsPtr {
     let p = CString::new(IMAGE).unwrap();
-    let fs = unsafe { ext4rs_mount(p.as_ptr()) };
+    let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
     assert!(!fs.is_null(), "mount");
     FsPtr(fs as usize)
 }
@@ -46,11 +46,11 @@ fn errno_is_thread_isolated() {
 
     let t_a = thread::spawn(move || {
         let bad = CString::new("/nope-nope-nope").unwrap();
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs.get(), bad.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs.get(), bad.as_ptr(), &mut attr) };
         assert_eq!(rc, -1);
         assert_eq!(
-            ext4rs_last_errno(),
+            fs_ext4_last_errno(),
             2,
             "A: expected ENOENT after failed stat"
         );
@@ -59,13 +59,13 @@ fn errno_is_thread_isolated() {
     let t_b = thread::spawn(move || {
         // B's errno should remain 0 since B did nothing that could fail.
         // (Thread_local means A's ENOENT doesn't leak here.)
-        assert_eq!(ext4rs_last_errno(), 0, "B should see fresh errno=0");
+        assert_eq!(fs_ext4_last_errno(), 0, "B should see fresh errno=0");
     });
 
     t_a.join().unwrap();
     t_b.join().unwrap();
 
-    unsafe { ext4rs_umount(fs.get()) };
+    unsafe { fs_ext4_umount(fs.get()) };
 }
 
 #[test]
@@ -80,8 +80,8 @@ fn concurrent_stat_on_same_mount_never_panics() {
                 for _ in 0..50 {
                     let path = if i % 2 == 0 { "/test.txt" } else { "/subdir" };
                     let c = CString::new(path).unwrap();
-                    let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-                    let rc = unsafe { ext4rs_stat(fs.get(), c.as_ptr(), &mut attr) };
+                    let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+                    let rc = unsafe { fs_ext4_stat(fs.get(), c.as_ptr(), &mut attr) };
                     assert_eq!(rc, 0);
                 }
             })
@@ -92,7 +92,7 @@ fn concurrent_stat_on_same_mount_never_panics() {
         h.join().unwrap();
     }
 
-    unsafe { ext4rs_umount(fs_arc.get()) };
+    unsafe { fs_ext4_umount(fs_arc.get()) };
 }
 
 #[test]
@@ -104,7 +104,7 @@ fn concurrent_read_file_on_same_mount_returns_consistent_bytes() {
     let c = CString::new("/test.txt").unwrap();
     let mut baseline = [0u8; 256];
     let n = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs_arc.get(),
             c.as_ptr(),
             baseline.as_mut_ptr() as *mut c_void,
@@ -125,7 +125,7 @@ fn concurrent_read_file_on_same_mount_returns_consistent_bytes() {
                     let c = CString::new("/test.txt").unwrap();
                     let mut buf = [0u8; 256];
                     let n = unsafe {
-                        ext4rs_read_file(
+                        fs_ext4_read_file(
                             fs.get(),
                             c.as_ptr(),
                             buf.as_mut_ptr() as *mut c_void,
@@ -144,7 +144,7 @@ fn concurrent_read_file_on_same_mount_returns_consistent_bytes() {
         h.join().unwrap();
     }
 
-    unsafe { ext4rs_umount(fs_arc.get()) };
+    unsafe { fs_ext4_umount(fs_arc.get()) };
 }
 
 #[test]
@@ -158,17 +158,17 @@ fn concurrent_dir_iterations_do_not_interfere() {
             thread::spawn(move || {
                 for _ in 0..20 {
                     let c = CString::new("/").unwrap();
-                    let iter = unsafe { ext4rs_dir_open(fs.get(), c.as_ptr()) };
+                    let iter = unsafe { fs_ext4_dir_open(fs.get(), c.as_ptr()) };
                     assert!(!iter.is_null());
                     let mut count = 0;
                     loop {
-                        let e = unsafe { ext4rs_dir_next(iter) };
+                        let e = unsafe { fs_ext4_dir_next(iter) };
                         if e.is_null() {
                             break;
                         }
                         count += 1;
                     }
-                    unsafe { ext4rs_dir_close(iter) };
+                    unsafe { fs_ext4_dir_close(iter) };
                     // Root of ext4-basic has at least . + .. + a few entries.
                     assert!(count >= 4);
                 }
@@ -180,5 +180,5 @@ fn concurrent_dir_iterations_do_not_interfere() {
         h.join().unwrap();
     }
 
-    unsafe { ext4rs_umount(fs_arc.get()) };
+    unsafe { fs_ext4_umount(fs_arc.get()) };
 }

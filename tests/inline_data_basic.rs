@@ -1,12 +1,12 @@
 //! Inline data integration test against test-disks/ext4-inline.img.
 
-use ext4rs::bgd;
-use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::error::Result;
-use ext4rs::file_io;
-use ext4rs::fs::Filesystem;
-use ext4rs::inode::{Inode, InodeFlags};
-use ext4rs::path;
+use fs_ext4::bgd;
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::error::Result;
+use fs_ext4::file_io;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::{Inode, InodeFlags};
+use fs_ext4::path;
 use std::sync::Arc;
 
 const TEST_IMAGE: &str = "test-disks/ext4-inline.img";

@@ -5,7 +5,7 @@
 //! mutating ops on empty/invalid paths must NOT corrupt the filesystem —
 //! they should refuse cleanly.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -19,7 +19,7 @@ fn scratch() -> PathBuf {
     static C: AtomicU32 = AtomicU32::new(0);
     let n = C.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_nonutf8_{}_{n}.img",
+        "/tmp/fs_ext4_capi_nonutf8_{}_{n}.img",
         std::process::id()
     ));
     let mut out = fs::File::create(&dst).unwrap();
@@ -29,7 +29,7 @@ fn scratch() -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error())
+        CStr::from_ptr(fs_ext4_last_error())
             .to_string_lossy()
             .into_owned()
     }
@@ -45,23 +45,23 @@ fn raw_non_utf8_cstr() -> Vec<c_char> {
 fn stat_on_non_utf8_path_does_not_crash() {
     let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
-    let fs_h = unsafe { ext4rs_mount(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     let bad = raw_non_utf8_cstr();
-    let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
+    let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
     // This should either succeed (non-UTF-8 interpreted as empty → root) or
     // fail, but NEVER panic or segfault. Just confirming we get a clean result.
-    let rc = unsafe { ext4rs_stat(fs_h, bad.as_ptr(), &mut attr) };
+    let rc = unsafe { fs_ext4_stat(fs_h, bad.as_ptr(), &mut attr) };
     // Either outcome is acceptable; what matters is that we returned and the
     // errno is consistent.
     if rc == 0 {
         // Non-UTF-8 interpreted as empty path → root (inode 2). Tolerable.
         assert_eq!(attr.inode, 2);
     } else {
-        assert_ne!(ext4rs_last_errno(), 0);
+        assert_ne!(fs_ext4_last_errno(), 0);
     }
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }
 
@@ -71,22 +71,22 @@ fn create_on_non_utf8_path_does_not_corrupt() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
 
     let before_root_inode = {
-        let fs_h = unsafe { ext4rs_mount(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount(img_c.as_ptr()) };
         assert!(!fs_h.is_null());
         let root = CString::new("/").unwrap();
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs_h, root.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs_h, root.as_ptr(), &mut attr) };
         assert_eq!(rc, 0);
         let sz = attr.size;
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
         sz
     };
 
     {
-        let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
         assert!(!fs_h.is_null());
         let bad = raw_non_utf8_cstr();
-        let ino = unsafe { ext4rs_create(fs_h, bad.as_ptr(), 0o644) };
+        let ino = unsafe { fs_ext4_create(fs_h, bad.as_ptr(), 0o644) };
         // Must not crash. Most likely fails (empty path can't be created).
         if ino != 0 {
             // If somehow succeeded, at least verify we didn't break the fs.
@@ -95,21 +95,21 @@ fn create_on_non_utf8_path_does_not_corrupt() {
                 last_err()
             );
         } else {
-            assert_ne!(ext4rs_last_errno(), 0);
+            assert_ne!(fs_ext4_last_errno(), 0);
         }
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     // Remount ro and confirm root is intact.
     {
-        let fs_h = unsafe { ext4rs_mount(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount(img_c.as_ptr()) };
         assert!(!fs_h.is_null(), "post-test remount: {}", last_err());
         let root = CString::new("/").unwrap();
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs_h, root.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs_h, root.as_ptr(), &mut attr) };
         assert_eq!(rc, 0);
         assert_eq!(attr.size, before_root_inode, "root size must be unchanged");
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     let _ = fs::remove_file(&img);
@@ -119,14 +119,14 @@ fn create_on_non_utf8_path_does_not_corrupt() {
 fn unlink_on_non_utf8_path_fails_cleanly() {
     let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
-    let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_h.is_null());
 
     let bad = raw_non_utf8_cstr();
-    let rc = unsafe { ext4rs_unlink(fs_h, bad.as_ptr()) };
+    let rc = unsafe { fs_ext4_unlink(fs_h, bad.as_ptr()) };
     assert_eq!(rc, -1, "unlink on non-UTF-8 path must fail");
-    assert_ne!(ext4rs_last_errno(), 0);
+    assert_ne!(fs_ext4_last_errno(), 0);
 
-    unsafe { ext4rs_umount(fs_h) };
+    unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }

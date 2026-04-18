@@ -1,4 +1,4 @@
-//! Integration tests for sparse-grow via `ext4rs_truncate`.
+//! Integration tests for sparse-grow via `fs_ext4_truncate`.
 //!
 //! Grow path: `new_size > inode.size` with no block allocation (ext4's
 //! extent tree treats unmapped logical blocks as holes that read back as
@@ -9,7 +9,7 @@
 //! - Grow-to-current-size is idempotent success.
 //! - Shrink path through the same capi still works (regression check).
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::fs;
 use std::io::Write;
@@ -23,7 +23,7 @@ fn scratch(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_trunc_grow_{tag}_{}_{n}.img",
+        "/tmp/fs_ext4_capi_trunc_grow_{tag}_{}_{n}.img",
         std::process::id()
     ));
     let bytes = fs::read(SRC).expect("read src");
@@ -33,10 +33,10 @@ fn scratch(tag: &str) -> PathBuf {
     dst
 }
 
-fn stat_attr(fs_handle: *mut ext4rs_fs_t, path: &str) -> ext4rs_attr_t {
+fn stat_attr(fs_handle: *mut fs_ext4_fs_t, path: &str) -> fs_ext4_attr_t {
     let p = CString::new(path).unwrap();
-    let mut attr = MaybeUninit::<ext4rs_attr_t>::uninit();
-    let rc = unsafe { ext4rs_stat(fs_handle, p.as_ptr(), attr.as_mut_ptr()) };
+    let mut attr = MaybeUninit::<fs_ext4_attr_t>::uninit();
+    let rc = unsafe { fs_ext4_stat(fs_handle, p.as_ptr(), attr.as_mut_ptr()) };
     assert_eq!(rc, 0, "stat {path} failed");
     unsafe { attr.assume_init() }
 }
@@ -47,17 +47,17 @@ fn truncate_grow_increases_size_without_allocating_blocks() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
 
-    let fs_handle = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_handle.is_null());
 
     let before = stat_attr(fs_handle, "/test.txt");
     let new_size = before.size + 65536; // 64 KiB past current
 
-    let rc = unsafe { ext4rs_truncate(fs_handle, path_c.as_ptr(), new_size) };
+    let rc = unsafe { fs_ext4_truncate(fs_handle, path_c.as_ptr(), new_size) };
     assert_eq!(rc, 0, "grow should succeed, got {}: {}", rc, unsafe {
-        std::ffi::CStr::from_ptr(ext4rs_last_error()).to_string_lossy()
+        std::ffi::CStr::from_ptr(fs_ext4_last_error()).to_string_lossy()
     });
-    assert_eq!(ext4rs_last_errno(), 0);
+    assert_eq!(fs_ext4_last_errno(), 0);
 
     let after = stat_attr(fs_handle, "/test.txt");
     assert_eq!(after.size, new_size, "size grew to requested value");
@@ -68,7 +68,7 @@ fn truncate_grow_increases_size_without_allocating_blocks() {
         "delta size == requested delta"
     );
 
-    unsafe { ext4rs_umount(fs_handle) };
+    unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
 }
 
@@ -78,18 +78,18 @@ fn truncate_grow_tail_reads_as_zero() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
 
-    let fs_handle = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_handle.is_null());
     let before = stat_attr(fs_handle, "/test.txt");
     let new_size = before.size + 4096;
 
-    let rc = unsafe { ext4rs_truncate(fs_handle, path_c.as_ptr(), new_size) };
+    let rc = unsafe { fs_ext4_truncate(fs_handle, path_c.as_ptr(), new_size) };
     assert_eq!(rc, 0);
 
     // Read the whole file post-grow. The tail should be all zeros.
     let mut buf = vec![0xABu8; new_size as usize];
     let got = unsafe {
-        ext4rs_read_file(
+        fs_ext4_read_file(
             fs_handle,
             path_c.as_ptr(),
             buf.as_mut_ptr() as *mut _,
@@ -108,7 +108,7 @@ fn truncate_grow_tail_reads_as_zero() {
             b
         );
     }
-    unsafe { ext4rs_umount(fs_handle) };
+    unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
 }
 
@@ -118,19 +118,19 @@ fn truncate_grow_persists_across_remount_with_csum() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
 
-    let fs_handle = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_handle.is_null());
     let before = stat_attr(fs_handle, "/test.txt");
     let new_size = before.size + 12345;
-    let rc = unsafe { ext4rs_truncate(fs_handle, path_c.as_ptr(), new_size) };
+    let rc = unsafe { fs_ext4_truncate(fs_handle, path_c.as_ptr(), new_size) };
     assert_eq!(rc, 0);
-    unsafe { ext4rs_umount(fs_handle) };
+    unsafe { fs_ext4_umount(fs_handle) };
 
-    let fs2 = unsafe { ext4rs_mount(img_c.as_ptr()) };
+    let fs2 = unsafe { fs_ext4_mount(img_c.as_ptr()) };
     assert!(!fs2.is_null(), "remount failed — inode csum not patched?");
     let after = stat_attr(fs2, "/test.txt");
     assert_eq!(after.size, new_size);
-    unsafe { ext4rs_umount(fs2) };
+    unsafe { fs_ext4_umount(fs2) };
     let _ = fs::remove_file(&img);
 }
 
@@ -140,18 +140,18 @@ fn truncate_at_current_size_is_success() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
 
-    let fs_handle = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_handle.is_null());
     let before = stat_attr(fs_handle, "/test.txt");
 
-    let rc = unsafe { ext4rs_truncate(fs_handle, path_c.as_ptr(), before.size) };
+    let rc = unsafe { fs_ext4_truncate(fs_handle, path_c.as_ptr(), before.size) };
     assert_eq!(rc, 0);
-    assert_eq!(ext4rs_last_errno(), 0);
+    assert_eq!(fs_ext4_last_errno(), 0);
 
     let after = stat_attr(fs_handle, "/test.txt");
     assert_eq!(after.size, before.size, "size unchanged");
 
-    unsafe { ext4rs_umount(fs_handle) };
+    unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
 }
 
@@ -163,16 +163,16 @@ fn truncate_shrink_path_still_works() {
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/test.txt").unwrap();
 
-    let fs_handle = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+    let fs_handle = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs_handle.is_null());
     let before = stat_attr(fs_handle, "/test.txt");
     assert!(before.size > 4, "test.txt should be larger than 4 bytes");
 
-    let rc = unsafe { ext4rs_truncate(fs_handle, path_c.as_ptr(), 4) };
+    let rc = unsafe { fs_ext4_truncate(fs_handle, path_c.as_ptr(), 4) };
     assert_eq!(rc, 0);
     let after = stat_attr(fs_handle, "/test.txt");
     assert_eq!(after.size, 4);
 
-    unsafe { ext4rs_umount(fs_handle) };
+    unsafe { fs_ext4_umount(fs_handle) };
     let _ = fs::remove_file(&img);
 }

@@ -8,10 +8,10 @@
 //! block — the gap breaks the allocator's natural contiguity, so the next
 //! extent lands at a fresh, non-contiguous physical block.
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::extent::ExtentHeader;
-use ext4rs::path as path_mod;
-use ext4rs::Filesystem;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::extent::ExtentHeader;
+use fs_ext4::path as path_mod;
+use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
@@ -28,7 +28,7 @@ fn copy_to_tmp(name: &str) -> Option<String> {
         return None;
     }
     let dst = format!(
-        "/tmp/ext4rs_multilvl_{}_{n}_{}.img",
+        "/tmp/fs_ext4_multilvl_{}_{n}_{}.img",
         std::process::id(),
         name
     );
@@ -64,7 +64,7 @@ fn create_until_promotion(fs: &Filesystem, target: &str, max_entries: usize) {
         let new_size = fs.read_inode_verified(dir_ino).expect("re-read").0.size;
         if new_size > prev_size {
             prev_size = new_size;
-            let gap = format!("/ext4rs_gap_{gap_counter:04}.bin");
+            let gap = format!("/fs_ext4_gap_{gap_counter:04}.bin");
             gap_counter += 1;
             fs.apply_create(&gap, 0o644).expect("create gap");
             fs.apply_replace_file_content(&gap, &vec![0xABu8; bs as usize])
@@ -123,7 +123,7 @@ fn extending_dir_past_four_noncontiguous_extents_triggers_promotion() {
     // block, since verify_extent_tail is called during the descend).
     let n_blocks = dir_inode.size.div_ceil(fs.sb.block_size() as u64);
     for logical in 0..n_blocks {
-        let phys = ext4rs::extent::map_logical(
+        let phys = fs_ext4::extent::map_logical(
             &dir_inode.block,
             fs.dev.as_ref(),
             fs.sb.block_size(),
@@ -206,7 +206,7 @@ fn directory_growth_continues_past_promotion() {
     let (dir_inode, _) = fs.read_inode_verified(dir_ino).expect("read");
     let n_blocks = dir_inode.size.div_ceil(fs.sb.block_size() as u64);
     for logical in 0..n_blocks {
-        let phys = ext4rs::extent::map_logical(
+        let phys = fs_ext4::extent::map_logical(
             &dir_inode.block,
             fs.dev.as_ref(),
             fs.sb.block_size(),

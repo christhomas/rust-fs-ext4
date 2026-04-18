@@ -1,6 +1,6 @@
 # ext4rs
 
-Pure-Rust ext4 filesystem driver. Exposes a stable C ABI (`ext4rs_*`)
+Pure-Rust ext4 filesystem driver. Exposes a stable C ABI (`fs_ext4_*`)
 designed to be linked from Swift, C, C++, Go (via CGo), or any other
 language with FFI.
 
@@ -24,9 +24,9 @@ dependency itself — the library is portable Rust.
 | multi-level extent tree mutation (depth 0→1 promotion + depth-1 inserts) | done |
 | multi-level extent tree mutation (depth ≥2, leaf-block split) | **not supported** |
 | sparse grow via truncate | **not supported** |
-| setxattr, removexattr (in-inode) | done (via `ext4rs_setxattr` / `ext4rs_removexattr`) |
+| setxattr, removexattr (in-inode) | done (via `fs_ext4_setxattr` / `fs_ext4_removexattr`) |
 | setxattr/removexattr on external xattr block | **not supported** |
-| chmod, chown, utimens | done (via `ext4rs_chmod` / `ext4rs_chown` / `ext4rs_utimens`) |
+| chmod, chown, utimens | done (via `fs_ext4_chmod` / `fs_ext4_chown` / `fs_ext4_utimens`) |
 | journaled transactions | partial (jbd2 replay; write path unjournaled) |
 
 Roughly a read/write driver for the common case. Directories that have
@@ -40,7 +40,7 @@ file extension, are the known gaps. POSIX errnos are mapped through
 
 ```sh
 cargo build --release
-# produces target/release/libext4rs.a and the rlib
+# produces target/release/libfs_ext4.a and the rlib
 ```
 
 Cross-compile to a specific target the usual way:
@@ -59,23 +59,23 @@ specific build scripts.
 
 ## Using from C
 
-Link `libext4rs.a` and include `ext4rs.h`:
+Link `libfs_ext4.a` and include `fs_ext4.h`:
 
 ```c
-#include "ext4rs.h"
+#include "fs_ext4.h"
 
-ext4rs_fs_t *fs = ext4rs_mount("/path/to/disk.img");
+fs_ext4_fs_t *fs = fs_ext4_mount("/path/to/disk.img");
 if (!fs) {
-    fprintf(stderr, "%s\n", ext4rs_last_error());
+    fprintf(stderr, "%s\n", fs_ext4_last_error());
     return 1;
 }
 
-ext4rs_attr_t attr;
-if (ext4rs_stat(fs, "/hello.txt", &attr) == 0) {
+fs_ext4_attr_t attr;
+if (fs_ext4_stat(fs, "/hello.txt", &attr) == 0) {
     printf("size=%llu mode=%o\n", attr.size, attr.mode);
 }
 
-ext4rs_umount(fs);
+fs_ext4_umount(fs);
 ```
 
 See `examples/capi_demo.rs` for the Rust-side equivalent.
@@ -88,7 +88,7 @@ ext4rs = "0.1"
 ```
 
 ```rust
-use ext4rs::Filesystem;
+use fs_ext4::Filesystem;
 
 let fs = Filesystem::mount("/path/to/disk.img")?;
 let attrs = fs.stat("/hello.txt")?;

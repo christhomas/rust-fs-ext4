@@ -9,14 +9,14 @@
 //! These tests are skipped when the image is not present (the Docker builder
 //! is macOS-unavailable without docker), matching @5's pattern.
 
-use ext4rs::acl::{self, AclKind, AclTag, ACL_EXECUTE, ACL_READ, ACL_WRITE};
-use ext4rs::bgd;
-use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::error::Result;
-use ext4rs::fs::Filesystem;
-use ext4rs::inode::Inode;
-use ext4rs::path;
-use ext4rs::xattr;
+use fs_ext4::acl::{self, AclKind, AclTag, ACL_EXECUTE, ACL_READ, ACL_WRITE};
+use fs_ext4::bgd;
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::error::Result;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::Inode;
+use fs_ext4::path;
+use fs_ext4::xattr;
 use std::path::Path;
 use std::sync::Arc;
 

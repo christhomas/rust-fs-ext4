@@ -9,12 +9,12 @@
 //! tests exercise `htree::lookup_leaf` descending through multiple internal
 //! levels — the code path LARGEDIR enables.
 
-use ext4rs::bgd;
-use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::error::Result;
-use ext4rs::fs::Filesystem;
-use ext4rs::inode::Inode;
-use ext4rs::path;
+use fs_ext4::bgd;
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::error::Result;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::Inode;
+use fs_ext4::path;
 use std::path::Path;
 use std::sync::Arc;
 
@@ -97,6 +97,6 @@ fn missing_entry_returns_notfound() {
     let mut reader = inode_reader(&fs);
     // Name that clearly isn't in the 1..=70000 range.
     let err = path::lookup(dev.as_ref(), &fs.sb, &mut reader, "/huge/file_99999.txt").unwrap_err();
-    use ext4rs::error::Error;
+    use fs_ext4::error::Error;
     assert!(matches!(err, Error::NotFound));
 }

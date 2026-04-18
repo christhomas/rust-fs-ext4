@@ -7,7 +7,7 @@
 //! then re-mounts (which runs all the CSUM verifiers in Filesystem::mount
 //! and read_inode_verified). Any mismatch → mount fails or reads fail.
 
-use ext4rs::capi::*;
+use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::fs;
 use std::io::Write;
@@ -21,7 +21,7 @@ fn scratch(label: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(format!(
-        "/tmp/ext4rs_capi_wf_csum_{label}_{}_{n}.img",
+        "/tmp/fs_ext4_capi_wf_csum_{label}_{}_{n}.img",
         std::process::id()
     ));
     let mut out = fs::File::create(&dst).unwrap();
@@ -31,7 +31,7 @@ fn scratch(label: &str) -> PathBuf {
 
 fn last_err() -> String {
     unsafe {
-        CStr::from_ptr(ext4rs_last_error())
+        CStr::from_ptr(fs_ext4_last_error())
             .to_string_lossy()
             .into_owned()
     }
@@ -45,11 +45,11 @@ fn write_file_result_survives_csum_verification_on_remount() {
 
     // Write via rw mount.
     {
-        let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
         assert!(!fs_h.is_null());
         let payload = b"csum-check replacement payload\n";
         let rc = unsafe {
-            ext4rs_write_file(
+            fs_ext4_write_file(
                 fs_h,
                 path_c.as_ptr(),
                 payload.as_ptr() as *const c_void,
@@ -57,14 +57,14 @@ fn write_file_result_survives_csum_verification_on_remount() {
             )
         };
         assert!(rc > 0, "write_file: {}", last_err());
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     // Remount read-only — this runs Filesystem::mount's csum-seed
     // derivation + verify_superblock + verify_bgd chain, and every stat
     // goes through read_inode_verified. Any CRC mismatch aborts.
     {
-        let fs_h = unsafe { ext4rs_mount(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount(img_c.as_ptr()) };
         assert!(
             !fs_h.is_null(),
             "remount after write_file failed: {}",
@@ -72,30 +72,30 @@ fn write_file_result_survives_csum_verification_on_remount() {
         );
 
         // Stat the file we wrote (read_inode_verified).
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs_h, path_c.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs_h, path_c.as_ptr(), &mut attr) };
         assert_eq!(rc, 0, "stat /test.txt after write: {}", last_err());
         assert_eq!(attr.size, 31);
 
         // Enumerate root — verifies the root dir block's CRC tail.
         let root = CString::new("/").unwrap();
-        let iter = unsafe { ext4rs_dir_open(fs_h, root.as_ptr()) };
+        let iter = unsafe { fs_ext4_dir_open(fs_h, root.as_ptr()) };
         assert!(!iter.is_null(), "dir_open /: {}", last_err());
         let mut count = 0;
         loop {
-            let e = unsafe { ext4rs_dir_next(iter) };
+            let e = unsafe { fs_ext4_dir_next(iter) };
             if e.is_null() {
                 break;
             }
             count += 1;
         }
-        unsafe { ext4rs_dir_close(iter) };
+        unsafe { fs_ext4_dir_close(iter) };
         assert!(count >= 4, "root must still enumerate all entries");
 
         // Read the file — exercises extent-tail CRC verification.
         let mut buf = [0u8; 64];
         let n = unsafe {
-            ext4rs_read_file(
+            fs_ext4_read_file(
                 fs_h,
                 path_c.as_ptr(),
                 buf.as_mut_ptr() as *mut c_void,
@@ -106,7 +106,7 @@ fn write_file_result_survives_csum_verification_on_remount() {
         assert_eq!(n, 31, "read_file: {}", last_err());
         assert_eq!(&buf[..31], b"csum-check replacement payload\n");
 
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     let _ = fs::remove_file(&img);
@@ -119,23 +119,23 @@ fn truncate_result_survives_csum_verification_on_remount() {
     let path_c = CString::new("/test.txt").unwrap();
 
     {
-        let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
         assert!(!fs_h.is_null());
-        let rc = unsafe { ext4rs_truncate(fs_h, path_c.as_ptr(), 4) };
+        let rc = unsafe { fs_ext4_truncate(fs_h, path_c.as_ptr(), 4) };
         assert_eq!(rc, 0, "truncate: {}", last_err());
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     {
-        let fs_h = unsafe { ext4rs_mount(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount(img_c.as_ptr()) };
         assert!(!fs_h.is_null(), "remount after truncate: {}", last_err());
 
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs_h, path_c.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs_h, path_c.as_ptr(), &mut attr) };
         assert_eq!(rc, 0, "stat after truncate remount: {}", last_err());
         assert_eq!(attr.size, 4);
 
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     let _ = fs::remove_file(&img);
@@ -148,30 +148,30 @@ fn unlink_result_survives_csum_verification_on_remount() {
     let path_c = CString::new("/test.txt").unwrap();
 
     {
-        let fs_h = unsafe { ext4rs_mount_rw(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
         assert!(!fs_h.is_null());
-        let rc = unsafe { ext4rs_unlink(fs_h, path_c.as_ptr()) };
+        let rc = unsafe { fs_ext4_unlink(fs_h, path_c.as_ptr()) };
         assert_eq!(rc, 0, "unlink: {}", last_err());
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     {
-        let fs_h = unsafe { ext4rs_mount(img_c.as_ptr()) };
+        let fs_h = unsafe { fs_ext4_mount(img_c.as_ptr()) };
         assert!(!fs_h.is_null(), "remount after unlink: {}", last_err());
 
         // File should be gone.
-        let mut attr: ext4rs_attr_t = unsafe { std::mem::zeroed() };
-        let rc = unsafe { ext4rs_stat(fs_h, path_c.as_ptr(), &mut attr) };
+        let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
+        let rc = unsafe { fs_ext4_stat(fs_h, path_c.as_ptr(), &mut attr) };
         assert_eq!(rc, -1, "stat of unlinked file should fail");
-        assert_eq!(ext4rs_last_errno(), 2, "ENOENT expected");
+        assert_eq!(fs_ext4_last_errno(), 2, "ENOENT expected");
 
         // Root should still enumerate (without the unlinked entry).
         let root = CString::new("/").unwrap();
-        let iter = unsafe { ext4rs_dir_open(fs_h, root.as_ptr()) };
+        let iter = unsafe { fs_ext4_dir_open(fs_h, root.as_ptr()) };
         assert!(!iter.is_null(), "dir_open /: {}", last_err());
         let mut names = Vec::new();
         loop {
-            let e = unsafe { ext4rs_dir_next(iter) };
+            let e = unsafe { fs_ext4_dir_next(iter) };
             if e.is_null() {
                 break;
             }
@@ -182,13 +182,13 @@ fn unlink_result_survives_csum_verification_on_remount() {
                 .collect();
             names.push(String::from_utf8_lossy(&bytes).into_owned());
         }
-        unsafe { ext4rs_dir_close(iter) };
+        unsafe { fs_ext4_dir_close(iter) };
         assert!(
             !names.contains(&"test.txt".to_string()),
             "test.txt should be absent"
         );
 
-        unsafe { ext4rs_umount(fs_h) };
+        unsafe { fs_ext4_umount(fs_h) };
     }
 
     let _ = fs::remove_file(&img);

@@ -7,9 +7,9 @@
 //! if `sb.journal_inode == 0`, we assert that `jbd2::read_superblock` returns
 //! Ok(None) instead of failing.
 
-use ext4rs::block_io::FileDevice;
-use ext4rs::jbd2::{self, JBD2_SUPERBLOCK_V1, JBD2_SUPERBLOCK_V2};
-use ext4rs::Filesystem;
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::jbd2::{self, JBD2_SUPERBLOCK_V1, JBD2_SUPERBLOCK_V2};
+use fs_ext4::Filesystem;
 use std::sync::Arc;
 
 fn image_path(name: &str) -> String {

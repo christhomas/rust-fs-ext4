@@ -12,12 +12,12 @@
 //! a minimally valid transaction that happens to not conflict with the
 //! filesystem's actual data, then replaying.
 
-use ext4rs::block_io::{BlockDevice, FileDevice};
-use ext4rs::jbd2::{self, JBD2_MAGIC_NUMBER};
-use ext4rs::journal;
-use ext4rs::journal_apply;
-use ext4rs::transaction::Transaction;
-use ext4rs::Filesystem;
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::jbd2::{self, JBD2_MAGIC_NUMBER};
+use fs_ext4::journal;
+use fs_ext4::journal_apply;
+use fs_ext4::transaction::Transaction;
+use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
@@ -35,7 +35,7 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     }
     // Unique-per-call: cargo runs test fns in parallel threads; a shared name
     // would race on create/delete.
-    let dst = format!("/tmp/ext4rs_replay_{}_{n}_{}.img", std::process::id(), name);
+    let dst = format!("/tmp/fs_ext4_replay_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
 }
@@ -85,7 +85,7 @@ fn synthetic_dirty_journal_round_trip() {
     // Locate journal inode's physical blocks for logical 0..4 so we can
     // splice our synthetic transaction in.
     let raw = fs.read_inode_raw(fs.sb.journal_inode).expect("read jinode");
-    let jinode = ext4rs::inode::Inode::parse(&raw).expect("parse jinode");
+    let jinode = fs_ext4::inode::Inode::parse(&raw).expect("parse jinode");
 
     // Read the existing JBD2 superblock so we keep its features consistent.
     let jsb = jbd2::read_superblock(&fs)
@@ -103,7 +103,7 @@ fn synthetic_dirty_journal_round_trip() {
         jsb.sequence,
         block_size as u32,
         jsb.uses_64bit(),
-        jsb.feature_incompat & ext4rs::jbd2::JbdIncompat::CSUM_V3.bits() != 0,
+        jsb.feature_incompat & fs_ext4::jbd2::JbdIncompat::CSUM_V3.bits() != 0,
     );
     let mut payload = vec![0u8; block_size as usize];
     for (i, b) in payload.iter_mut().enumerate() {
