@@ -559,11 +559,7 @@ impl Filesystem {
         self.free_inode_slot(target_ino)?;
 
         // Update SB counters: free_inodes_count++, free_blocks_count += (freed_sectors / sectors_per_block).
-        let freed_blocks = if sectors_per_block > 0 {
-            freed_sectors / sectors_per_block
-        } else {
-            0
-        };
+        let freed_blocks = freed_sectors.checked_div(sectors_per_block).unwrap_or(0);
         self.patch_sb_counters(freed_blocks as i64, 1)?;
         // Also credit the freed data blocks to the group's bg_free_blocks_count.
         if freed_blocks > 0 && target_inode.has_extents() {

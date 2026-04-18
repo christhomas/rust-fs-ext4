@@ -42,16 +42,21 @@ cargo build --release
 # produces target/release/libext4rs.a and the rlib
 ```
 
-Universal macOS static lib:
+Cross-compile to a specific target the usual way:
 
 ```sh
-./build.sh          # builds both archs + lipos them into dist/libext4rs.a
+cargo build --release --target aarch64-unknown-linux-gnu
+cargo build --release --target x86_64-pc-windows-gnu
+# … etc.
 ```
 
-The CI workflow on tagged releases packages a `.xcframework` for
-Swift/Xcode consumers.
+Platform-specific packaging (e.g. macOS `lipo` to build a universal
+static archive, producing an Xcode `.xcframework`, or cross-compile
+matrices for a particular SDK) belongs in the consuming project.
+`ext4rs` itself stays portable cargo — it does not carry platform-
+specific build scripts.
 
-## Using from C / Swift
+## Using from C
 
 Link `libext4rs.a` and include `ext4rs.h`:
 

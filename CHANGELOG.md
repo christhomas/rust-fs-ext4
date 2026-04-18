@@ -29,10 +29,8 @@ repo into a standalone crate.
 
 ### Build / CI
 
-- `cargo fmt` + `cargo clippy --all-targets -- -D warnings` gate on
-  CI (`ubuntu-latest`). `macos-14` temporarily dropped from the test
-  matrix pending a qemu-based test-disk generator (the docker-based
-  generator doesn't run on macOS CI).
+- `cargo fmt` + `cargo clippy --all-targets -- -D warnings` + `cargo
+  test --release` on `ubuntu-latest`.
 - `CallbackDevice` fields use `ReadCb` / `WriteCb` / `FlushCb` type
   aliases instead of inline `Box<dyn Fn(...) + Send + Sync>`.
 
