@@ -279,6 +279,90 @@ pub fn plan_remove_in_inode_region(region: &mut [u8], name: &str) -> Result<Remo
     Ok(RemoveOutcome::Removed)
 }
 
+/// Result of [`plan_set_in_inode_region`]: the entry was either
+/// inserted (no previous entry with this name) or replaced (new value
+/// overwrote an existing entry's value).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum SetOutcome {
+    Inserted,
+    Replaced,
+}
+
+/// Set (create-or-replace) an xattr entry in the in-inode region.
+/// `region` spans from the 4-byte magic to the end of the inode image.
+/// On success the bytes have been rewritten to include the new entry.
+///
+/// Errors:
+/// - `Error::InvalidArgument` when `name` lacks a known namespace prefix
+///   or the suffix is empty (except for ACL namespaces 2 + 3).
+/// - `Error::NameTooLong` when the suffix is longer than 255 bytes.
+/// - `Error::NoSpaceLeftOnDevice` when the rewritten region wouldn't fit
+///   (entries + values + 4-byte terminator > region capacity).
+pub fn plan_set_in_inode_region(
+    region: &mut [u8],
+    name: &str,
+    value: &[u8],
+) -> Result<SetOutcome> {
+    let Some((name_index, suffix)) = split_qualified_name(name) else {
+        return Err(Error::InvalidArgument(
+            "xattr name missing known namespace prefix",
+        ));
+    };
+    if suffix.is_empty() && !matches!(name_index, 2 | 3) {
+        return Err(Error::InvalidArgument("xattr name suffix is empty"));
+    }
+    if suffix.len() > 255 {
+        return Err(Error::NameTooLong);
+    }
+    if region.len() < 8 {
+        return Err(Error::NoSpaceLeftOnDevice);
+    }
+
+    let magic_present = {
+        let m = u32::from_le_bytes(region[..4].try_into().unwrap());
+        m == EXT4_XATTR_MAGIC
+    };
+    let mut entries = if magic_present {
+        decode_in_inode_entries(&region[4..])?
+    } else {
+        Vec::new()
+    };
+
+    let mut outcome = SetOutcome::Inserted;
+    let suffix_bytes = suffix.as_bytes();
+    for e in entries.iter_mut() {
+        if e.name_index == name_index && e.name_bytes == suffix_bytes {
+            e.value = value.to_vec();
+            outcome = SetOutcome::Replaced;
+            break;
+        }
+    }
+    if matches!(outcome, SetOutcome::Inserted) {
+        entries.push(DecodedEntry {
+            name_index,
+            name_bytes: suffix_bytes.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+
+    let area_len = region.len() - 4;
+    let needed_entries: usize = entries
+        .iter()
+        .map(|e| (16 + e.name_bytes.len() + 3) & !3)
+        .sum();
+    let needed_values: usize = entries
+        .iter()
+        .filter(|e| !e.value.is_empty())
+        .map(|e| (e.value.len() + 3) & !3)
+        .sum();
+    if needed_entries + 4 + needed_values > area_len {
+        return Err(Error::NoSpaceLeftOnDevice);
+    }
+
+    encode_in_inode_entries(region, &entries);
+    Ok(outcome)
+}
+
 /// One fully-owned xattr entry decoded from an in-inode region.
 #[derive(Debug, Clone)]
 struct DecodedEntry {
@@ -478,5 +562,57 @@ mod tests {
         // all zeros → no magic
         let outcome = plan_remove_in_inode_region(&mut region, "user.x").unwrap();
         assert_eq!(outcome, RemoveOutcome::NotFound);
+    }
+
+    #[test]
+    fn set_in_inode_inserts_new_into_empty_region() {
+        let mut region = vec![0u8; 64];
+        let outcome = plan_set_in_inode_region(&mut region, "user.color", b"red").unwrap();
+        assert_eq!(outcome, SetOutcome::Inserted);
+        let decoded = decode_in_inode_entries(&region[4..]).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].name_bytes, b"color");
+        assert_eq!(decoded[0].value, b"red");
+    }
+
+    #[test]
+    fn set_in_inode_replaces_existing_value() {
+        let mut region = vec![0u8; 96];
+        plan_set_in_inode_region(&mut region, "user.color", b"red").unwrap();
+        let outcome = plan_set_in_inode_region(&mut region, "user.color", b"emerald").unwrap();
+        assert_eq!(outcome, SetOutcome::Replaced);
+        let decoded = decode_in_inode_entries(&region[4..]).unwrap();
+        assert_eq!(decoded.len(), 1);
+        assert_eq!(decoded[0].value, b"emerald");
+    }
+
+    #[test]
+    fn set_in_inode_preserves_other_entries() {
+        let mut region = vec![0u8; 128];
+        plan_set_in_inode_region(&mut region, "user.color", b"red").unwrap();
+        plan_set_in_inode_region(&mut region, "user.mood", b"happy").unwrap();
+        plan_set_in_inode_region(&mut region, "user.color", b"blue").unwrap();
+        let decoded = decode_in_inode_entries(&region[4..]).unwrap();
+        let by_name: std::collections::BTreeMap<_, _> = decoded
+            .into_iter()
+            .map(|e| (e.name_bytes.clone(), e.value))
+            .collect();
+        assert_eq!(by_name.get(&b"color".to_vec()).unwrap(), b"blue");
+        assert_eq!(by_name.get(&b"mood".to_vec()).unwrap(), b"happy");
+    }
+
+    #[test]
+    fn set_in_inode_enospc_on_overflow() {
+        let mut region = vec![0u8; 32];
+        let err =
+            plan_set_in_inode_region(&mut region, "user.x", b"this_is_20_bytes_xx!").unwrap_err();
+        assert!(matches!(err, Error::NoSpaceLeftOnDevice));
+    }
+
+    #[test]
+    fn set_in_inode_unknown_prefix_is_einval() {
+        let mut region = vec![0u8; 64];
+        let err = plan_set_in_inode_region(&mut region, "weird.key", b"v").unwrap_err();
+        assert!(matches!(err, Error::InvalidArgument(_)));
     }
 }
