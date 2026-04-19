@@ -80,6 +80,11 @@ pub const EXT_INIT_MAX_LEN: u16 = 32768;
 /// Bytes per on-disk extent node (header or entry).
 pub const EXT4_EXT_NODE_SIZE: usize = 12;
 
+/// Maximum extent tree depth we will descend. ext4 spec puts the hard
+/// limit at 5; anything above that is a pathological / malformed image
+/// and we bail out rather than chase pointers forever.
+pub const EXT4_EXT_MAX_DEPTH: u16 = 5;
+
 /// Header at the start of every extent tree node.
 #[derive(Debug, Clone, Copy)]
 pub struct ExtentHeader {
@@ -226,11 +231,20 @@ pub fn lookup_verified(
 ) -> Result<Option<Extent>> {
     // Parse root header from inode.block (the 60-byte i_block area).
     let mut header = ExtentHeader::parse(root)?;
+    if header.depth > EXT4_EXT_MAX_DEPTH {
+        return Err(Error::CorruptExtentTree(
+            "extent tree depth exceeds spec maximum",
+        ));
+    }
     // Holds data for non-root nodes once we descend into internal indices.
     // `cursor` borrows from `root` initially, then from `node` after the first
     // descent — we keep `node` alive for the duration of the lookup.
     let mut node: Vec<u8>;
     let mut cursor: &[u8] = root;
+    // Guard against malformed images where an internal node's child
+    // references cycle back (self or each other). We never need to
+    // recurse more than the root's claimed depth.
+    let mut descents_remaining = header.depth as usize;
 
     loop {
         if header.is_leaf() {
@@ -293,6 +307,12 @@ pub fn lookup_verified(
         node = buf;
         cursor = &node[..];
         header = ExtentHeader::parse(cursor)?;
+        if descents_remaining == 0 {
+            return Err(Error::CorruptExtentTree(
+                "extent tree descended past claimed depth",
+            ));
+        }
+        descents_remaining -= 1;
     }
 }
 
@@ -300,8 +320,13 @@ pub fn lookup_verified(
 /// building a file-block list or for testing.
 pub fn collect_all(root: &[u8], dev: &dyn BlockDevice, block_size: u32) -> Result<Vec<Extent>> {
     let header = ExtentHeader::parse(root)?;
+    if header.depth > EXT4_EXT_MAX_DEPTH {
+        return Err(Error::CorruptExtentTree(
+            "extent tree depth exceeds spec maximum",
+        ));
+    }
     let mut out = Vec::new();
-    walk(root, &header, dev, block_size, &mut out)?;
+    walk(root, &header, dev, block_size, &mut out, header.depth)?;
     Ok(out)
 }
 
@@ -311,6 +336,7 @@ fn walk(
     dev: &dyn BlockDevice,
     block_size: u32,
     out: &mut Vec<Extent>,
+    descents_remaining: u16,
 ) -> Result<()> {
     if header.is_leaf() {
         for i in 0..header.entries {
@@ -321,6 +347,12 @@ fn walk(
             out.push(Extent::parse(&node[off..off + EXT4_EXT_NODE_SIZE])?);
         }
         return Ok(());
+    }
+
+    if descents_remaining == 0 {
+        return Err(Error::CorruptExtentTree(
+            "extent tree descended past claimed depth",
+        ));
     }
 
     for i in 0..header.entries {
@@ -338,7 +370,14 @@ fn walk(
                 ))?;
         dev.read_at(child_offset, &mut buf)?;
         let child_header = ExtentHeader::parse(&buf)?;
-        walk(&buf, &child_header, dev, block_size, out)?;
+        walk(
+            &buf,
+            &child_header,
+            dev,
+            block_size,
+            out,
+            descents_remaining - 1,
+        )?;
     }
     Ok(())
 }
@@ -468,6 +507,33 @@ mod tests {
         buf[4..6].copy_from_slice(&4u16.to_le_bytes());
         let err = ExtentHeader::parse(&buf).unwrap_err();
         assert!(matches!(err, Error::CorruptExtentTree(_)));
+    }
+
+    #[test]
+    fn rejects_impossible_depth() {
+        // depth=99 is well past the spec-allowed max of 5.
+        let mut buf = make_root(0);
+        buf[6..8].copy_from_slice(&99u16.to_le_bytes());
+
+        struct Dummy;
+        impl BlockDevice for Dummy {
+            fn read_at(&self, _o: u64, _b: &mut [u8]) -> Result<()> {
+                unreachable!()
+            }
+            fn size_bytes(&self) -> u64 {
+                0
+            }
+        }
+
+        // lookup/collect_all must refuse rather than try to descend 99 levels.
+        assert!(matches!(
+            lookup(&buf, &Dummy, 4096, 0),
+            Err(Error::CorruptExtentTree(_))
+        ));
+        assert!(matches!(
+            collect_all(&buf, &Dummy, 4096),
+            Err(Error::CorruptExtentTree(_))
+        ));
     }
 
     /// Real ext4-basic.img test: the root directory's inode has exactly one
