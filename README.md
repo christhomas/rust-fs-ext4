@@ -23,11 +23,13 @@ dependency itself — the library is portable Rust.
 | hardlink, truncate (shrink), write file (replace body) | done |
 | multi-level extent tree mutation (depth 0→1 promotion + depth-1 inserts) | done |
 | multi-level extent tree mutation (depth ≥2, leaf-block split) | **not supported** |
-| sparse grow via truncate | **not supported** |
+| sparse grow via truncate (i_size bump, reads return zeros) | done |
 | setxattr, removexattr (in-inode) | done (via `fs_ext4_setxattr` / `fs_ext4_removexattr`) |
 | setxattr/removexattr on external xattr block | **not supported** |
 | chmod, chown, utimens | done (via `fs_ext4_chmod` / `fs_ext4_chown` / `fs_ext4_utimens`) |
 | journaled transactions | partial (jbd2 replay; write path unjournaled) |
+| read-only fsck audit (link counts, dangling entries) | done (via `Filesystem::audit`) |
+| opt-in LRU block cache (for remote callback devices) | done (via `CachingDevice`) |
 
 Roughly a read/write driver for the common case. Directories that have
 been promoted to depth 1 can keep growing up to their leaf block's

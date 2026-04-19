@@ -2,6 +2,49 @@
 
 ## [Unreleased]
 
+### Safety / robustness
+
+- Mount path no longer panics on malformed images. Superblock parse
+  rejects `blocks_per_group == 0`, `inodes_per_group == 0`,
+  `inode_size == 0`, `inode_size > block_size`, and `log_block_size`
+  above the spec-sane maximum. Block/inode arithmetic in
+  `fs::read_block`, `fs::read_inode_raw`, `bgd::locate_inode`, and
+  `extent::lookup` now uses `checked_mul`/`checked_add`; overflows
+  surface as structured `Error::Corrupt` instead of silent wraps or
+  div-by-zero panics.
+- New `tests/fuzz_smoke.rs` harness: truncated / zero-filled /
+  all-ones images, an xorshift PRNG seed fan, single-byte flips at
+  sampled superblock+BGDT+inode-table+dir-block offsets, direct
+  random-bytes feeding into `dir::parse_block` and the extent
+  parsers, and an exhaustive-single-bit-flip sweep of the
+  superblock sector. Every combination must either succeed or
+  return a structured `Err` — never panic.
+
+### Features
+
+- `Filesystem::audit(max_dirs, max_entries_per_dir)` — read-only
+  fsck-style link-count audit (see `src/fsck.rs`). Returns an
+  `AuditReport` listing `LinkCountTooLow` / `LinkCountTooHigh` /
+  `DanglingEntry` / `WrongDotDot` / `BogusEntry` anomalies. Pure
+  diagnostic: never writes. Bounded work so pathological images
+  can't hang the caller.
+- `CachingDevice` — LRU read cache decorator for any
+  `Arc<dyn BlockDevice>`. Caches only block-aligned, block-sized
+  reads (hot paths: `fs::read_block`, extent index blocks, bitmap
+  blocks); passes arbitrary-offset reads through. Writes
+  invalidate overlapping entries. Opt-in — existing callers see no
+  behaviour change. Primary target is the FSKit `CallbackDevice`
+  path where repeated reads of the same inode-table / bgd blocks
+  dominate directory walks.
+
+### Performance
+
+- `alloc::find_first_free` — scan the free-block bitmap a `u64` at
+  a time once aligned to an 8-byte word. Skips full words in a
+  single branch; uses `trailing_ones` to locate the first zero
+  within a non-full word. 8–16× faster than the previous per-bit
+  loop on sparse bitmaps.
+
 ### Build / CI
 
 - Test-disk fixtures now regenerate from scratch on any host with
