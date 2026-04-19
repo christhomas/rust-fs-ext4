@@ -144,7 +144,7 @@ pub fn audit(
         };
 
         let mut truncated = false;
-        for (n_scanned, entry) in (0u32..).zip(entries.into_iter()) {
+        for (n_scanned, entry) in (0u32..).zip(entries) {
             if n_scanned >= max_entries_per_dir {
                 truncated = true;
                 break;
