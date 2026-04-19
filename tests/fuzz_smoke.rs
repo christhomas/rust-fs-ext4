@@ -135,6 +135,69 @@ fn single_byte_flips_in_basic_image_dont_panic() {
     }
 }
 
+/// Walk key on-disk structures of a byte-flipped ext4-basic image:
+/// mount + root-inode read + root-extent-walk + reading the first
+/// directory block. Every step must either return a structured Err
+/// or succeed — NEVER panic. Any `.unwrap()` tripped by malformed
+/// on-disk structures (dir entries, extent tree nodes, inode
+/// fields, …) will light this up.
+#[test]
+fn dir_structure_walks_never_panic_on_byte_flipped_basic() {
+    use fs_ext4::dir;
+    use fs_ext4::extent;
+    use fs_ext4::inode::Inode;
+
+    let bytes = match std::fs::read("test-disks/ext4-basic.img") {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: test-disks/ext4-basic.img absent");
+            return;
+        }
+    };
+    let sb_size = bytes.len();
+    let sample_offsets: Vec<u64> = vec![
+        0x400, 0x408, 0x450, 0x500, // superblock
+        0x800, 0x820, 0x840, // bgdt
+        0x2000, 0x2100, 0x2200, // inode table area
+        0x4000, 0x4100, 0x5000, // root dir data block(s)
+        0x8000, 0x10000,
+    ];
+
+    for &off in &sample_offsets {
+        if off as usize >= sb_size {
+            continue;
+        }
+        let mut mutated = bytes.clone();
+        mutated[off as usize] ^= 0xFF;
+        let dev = MemDevice::new(mutated);
+        let Ok(fs) = Filesystem::mount(dev) else {
+            continue;
+        };
+
+        // Root inode (ino 2).
+        let Ok((inode, _raw)) = fs.read_inode_verified(2) else {
+            continue;
+        };
+        // Extent walk over the root inode's extent tree.
+        let _ = extent::collect_all(&inode.block, fs.dev.as_ref(), fs.sb.block_size());
+        // Raw read of logical block 0 and parse as a directory block.
+        if let Ok(Some(phys)) =
+            extent::map_logical(&inode.block, fs.dev.as_ref(), fs.sb.block_size(), 0)
+        {
+            let mut block = vec![0u8; fs.sb.block_size() as usize];
+            if fs
+                .dev
+                .read_at(phys * fs.sb.block_size() as u64, &mut block)
+                .is_ok()
+            {
+                let _ = dir::parse_block(&block, true);
+            }
+        }
+        // Inode 2 again but via the raw path.
+        let _ = fs.read_inode_raw(2).and_then(|r| Inode::parse(&r));
+    }
+}
+
 /// Build a minimal "superblock" buffer with valid magic but wildly
 /// inconsistent inode parameters. Mount should surface a structured
 /// error, never panic (pre-fix this tripped a div-by-zero).
@@ -152,4 +215,79 @@ fn superblock_with_zero_inode_size_rejected() {
         panic!("zero-inode-size must be rejected");
     }
     // Any structured Err is fine as long as we didn't panic.
+}
+
+/// Feed random bytes directly into `dir::parse_block`. The parser must
+/// never panic — it should always either produce entries or return
+/// `Err(CorruptDirEntry)`.
+#[test]
+fn dir_parse_block_never_panics_on_random_bytes() {
+    use fs_ext4::dir;
+    let mut state: u64 = 0xC0FF_EE00_DEAD_BEEF;
+    for _ in 0..64 {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let len = 32 + (state as usize & 0x3FF);
+        let mut buf = vec![0u8; len];
+        for b in buf.iter_mut() {
+            state ^= state >> 12;
+            state ^= state << 25;
+            state ^= state >> 27;
+            *b = (state.wrapping_mul(0x2545_F491_4F6C_DD1D) >> 56) as u8;
+        }
+        let _ = dir::parse_block(&buf, true);
+        let _ = dir::parse_block(&buf, false);
+        let _ = dir::has_csum_tail(&buf);
+    }
+}
+
+/// Exercise the extent-header parser and leaf-extent parser on random bytes.
+#[test]
+fn extent_parsers_never_panic_on_random_bytes() {
+    use fs_ext4::extent::{Extent, ExtentHeader, ExtentIdx};
+    let mut state: u64 = 0xA5A5_A5A5_5A5A_5A5A;
+    for _ in 0..128 {
+        state ^= state >> 12;
+        state ^= state << 25;
+        state ^= state >> 27;
+        let len = 12 + (state as usize & 0x7F);
+        let mut buf = vec![0u8; len];
+        for b in buf.iter_mut() {
+            state ^= state >> 13;
+            state ^= state << 7;
+            *b = state as u8;
+        }
+        let _ = ExtentHeader::parse(&buf);
+        let _ = Extent::parse(&buf);
+        let _ = ExtentIdx::parse(&buf);
+    }
+}
+
+/// Flip every single bit in the first 512 bytes of a real ext4 image
+/// and confirm mounting never panics. This is the densest single-bit
+/// flip surface available for the superblock region.
+#[test]
+fn exhaustive_single_bit_flip_first_sector_never_panics() {
+    let bytes = match std::fs::read("test-disks/ext4-basic.img") {
+        Ok(b) => b,
+        Err(_) => {
+            eprintln!("skip: test-disks/ext4-basic.img absent");
+            return;
+        }
+    };
+    for byte_off in 0x400..0x600usize {
+        if byte_off >= bytes.len() {
+            break;
+        }
+        for bit in 0..8u8 {
+            let mut mutated = bytes.clone();
+            mutated[byte_off] ^= 1 << bit;
+            let dev = MemDevice::new(mutated);
+            // Mount is allowed to succeed or fail; never panic.
+            if let Ok(fs) = Filesystem::mount(dev) {
+                let _ = fs.read_inode_verified(2);
+            }
+        }
+    }
 }
