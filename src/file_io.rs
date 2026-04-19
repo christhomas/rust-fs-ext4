@@ -61,6 +61,12 @@ pub fn read(
     let mut cur_offset = offset;
     let end_offset = offset + max_read;
 
+    // Memoize the most recent extent lookup. Sequential reads that stay
+    // within one extent no longer re-walk the tree per block — for a
+    // 4 KiB-block file with one big contiguous extent, that's one
+    // tree walk total instead of one per block.
+    let mut cached_extent: Option<extent::Extent> = None;
+
     // Walk byte-by-block until we've satisfied the request.
     while cur_offset < end_offset {
         let logical_block = cur_offset / block_size;
@@ -71,12 +77,21 @@ pub fn read(
 
         let dst = &mut out[written as usize..written as usize + copy_len];
 
-        match extent::lookup(
-            &inode.block,
-            fs.dev.as_ref(),
-            fs.sb.block_size(),
-            logical_block,
-        )? {
+        let ext_opt = match cached_extent {
+            Some(e) if e.contains(logical_block) => Some(e),
+            _ => {
+                let fresh = extent::lookup(
+                    &inode.block,
+                    fs.dev.as_ref(),
+                    fs.sb.block_size(),
+                    logical_block,
+                )?;
+                cached_extent = fresh;
+                fresh
+            }
+        };
+
+        match ext_opt {
             None => {
                 // Sparse hole — fill with zeros.
                 dst.fill(0);
@@ -203,6 +218,7 @@ pub fn read_verified(
     let mut written: u64 = 0;
     let mut cur_offset = offset;
     let end_offset = offset + max_read;
+    let mut cached_extent: Option<extent::Extent> = None;
 
     while cur_offset < end_offset {
         let logical_block = cur_offset / block_size;
@@ -212,13 +228,22 @@ pub fn read_verified(
         let copy_len = bytes_available_in_block.min(bytes_remaining);
         let dst = &mut out[written as usize..written as usize + copy_len];
 
-        match extent::lookup_verified(
-            &inode.block,
-            fs.dev.as_ref(),
-            bs32,
-            logical_block,
-            Some(&ctx),
-        )? {
+        let ext_opt = match cached_extent {
+            Some(e) if e.contains(logical_block) => Some(e),
+            _ => {
+                let fresh = extent::lookup_verified(
+                    &inode.block,
+                    fs.dev.as_ref(),
+                    bs32,
+                    logical_block,
+                    Some(&ctx),
+                )?;
+                cached_extent = fresh;
+                fresh
+            }
+        };
+
+        match ext_opt {
             None => dst.fill(0),
             Some(ext) if ext.uninitialized => dst.fill(0),
             Some(ext) => {
