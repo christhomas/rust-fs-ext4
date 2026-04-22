@@ -1,5 +1,21 @@
 # Changelog
 
+## [0.1.3] — 2026-04-22
+
+### Fixes
+
+- `tests/capi_basic.rs::volume_info_flags_dirty_image` is now
+  formatted per rustfmt. Shipping 0.1.2 with that line unformatted
+  broke `cargo fmt --check` in CI, which in turn blocked clippy and
+  test. No ABI / behaviour change.
+
+### Tooling
+
+- Pre-commit hook (`.githooks/pre-commit`) runs the fast CI subset —
+  `cargo fmt --check` + `cargo clippy --all-targets -- -D warnings`
+  — so the same class of miss can't slip through again. Enable with
+  `./scripts/install-hooks.sh`.
+
 ## [0.1.2] — 2026-04-20
 
 ### ABI additions

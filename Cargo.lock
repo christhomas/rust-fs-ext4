@@ -19,7 +19,7 @@ dependencies = [
 
 [[package]]
 name = "fs-ext4"
-version = "0.1.2"
+version = "0.1.3"
 dependencies = [
  "bitflags",
  "crc32c",
