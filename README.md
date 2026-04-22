@@ -155,6 +155,18 @@ the same script works on macOS, Linux, and in CI (no docker
 required). First run downloads the Alpine virt ISO + kernel (~75 MB,
 cached under `test-disks/.vm-cache/`).
 
+## Git hooks
+
+One-time setup per clone, so every commit runs the same `cargo fmt
+--check` + `cargo clippy` checks CI does and CI doesn't have to catch
+what your machine could have:
+
+```sh
+./scripts/install-hooks.sh
+```
+
+Bypass a single commit with `git commit --no-verify`.
+
 ## License
 
 MIT — see [LICENSE](LICENSE). Derives research from
