@@ -40,6 +40,8 @@ fn mount_ro(bytes: &Vec<u8>) -> *mut fs_ext4_fs_t {
         context: bytes as *const Vec<u8> as *mut c_void,
         size_bytes: bytes.len() as u64,
         block_size: 512,
+        write: None,
+        flush: None,
     };
     let fs_h = unsafe { fs_ext4_mount_with_callbacks(&cfg) };
     assert!(!fs_h.is_null());

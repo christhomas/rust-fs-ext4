@@ -88,13 +88,41 @@ typedef int (*fs_ext4_read_fn)(void *context, void *buf,
                                    uint64_t offset, uint64_t length);
 
 /*
+ * Callback for writing blocks to the device.
+ * Must write exactly `length` bytes from `buf` starting at `offset`.
+ * Returns 0 on success, non-zero on error.
+ *
+ * Optional — set to NULL when mounting read-only via
+ * fs_ext4_mount_with_callbacks. Required (must be non-NULL) when mounting
+ * read-write via fs_ext4_mount_rw_with_callbacks.
+ */
+typedef int (*fs_ext4_write_fn)(void *context, const void *buf,
+                                    uint64_t offset, uint64_t length);
+
+/*
+ * Optional flush/fsync callback. Invoked when the driver wants pending
+ * writes pushed to stable storage. May be NULL — the driver then treats
+ * flush as a no-op (this is what FSKit's FSBlockDeviceResource already
+ * does, as it batches synchronisation at a higher layer).
+ */
+typedef int (*fs_ext4_flush_fn)(void *context);
+
+/*
  * Block device parameters for callback-based mounting.
+ *
+ * NOTE: `write` and `flush` were appended at the tail of the struct in
+ * v0.1.3 to keep backward-compatible binary layout with v0.1.2 consumers.
+ * Existing read-only callers that memset/zero-init their config are
+ * unaffected — fs_ext4_mount_with_callbacks ignores both new fields and
+ * always mounts read-only, regardless of what's in `write` / `flush`.
  */
 typedef struct {
     fs_ext4_read_fn read;
     void   *context;     /* Passed to callbacks (e.g. FSBlockDeviceResource pointer) */
     uint64_t size_bytes; /* Total device/partition size */
     uint32_t block_size; /* Physical block size (e.g. 512) */
+    fs_ext4_write_fn write; /* NEW in v0.1.3; NULL if read-only */
+    fs_ext4_flush_fn flush; /* NEW in v0.1.3; NULL = flush is a no-op */
 } fs_ext4_blockdev_cfg_t;
 
 /* ---- Lifecycle ---- */
@@ -109,9 +137,29 @@ fs_ext4_fs_t *fs_ext4_mount(const char *device_path);
  * Mount an ext4 filesystem using callback-based I/O.
  * Use this from sandboxed environments (e.g. FSKit extensions)
  * where direct device access is not available.
- * Returns NULL on failure. Read-only.
+ * Returns NULL on failure. Read-only — `cfg->write` / `cfg->flush` are
+ * ignored even if non-NULL. Use fs_ext4_mount_rw_with_callbacks for
+ * read-write mounts.
  */
 fs_ext4_fs_t *fs_ext4_mount_with_callbacks(
+    const fs_ext4_blockdev_cfg_t *cfg);
+
+/*
+ * Mount an ext4 filesystem read-write using callback-based I/O.
+ * Companion to fs_ext4_mount_rw — same behaviour (replays a dirty journal
+ * before returning), but the device is reached through caller-supplied
+ * read/write callbacks instead of a path. Suitable for FSKit extensions
+ * that own an FSBlockDeviceResource and cannot open /dev/diskN directly.
+ *
+ * Both `cfg->read` AND `cfg->write` must be non-NULL — otherwise this
+ * returns NULL with errno set to EINVAL. `cfg->flush` is optional; pass
+ * NULL to make synchronize() a no-op (the caller's host I/O layer is
+ * expected to handle stable-storage barriers in that case).
+ *
+ * Returns NULL on failure; use fs_ext4_last_error() / fs_ext4_last_errno()
+ * to inspect the cause.
+ */
+fs_ext4_fs_t *fs_ext4_mount_rw_with_callbacks(
     const fs_ext4_blockdev_cfg_t *cfg);
 
 /*

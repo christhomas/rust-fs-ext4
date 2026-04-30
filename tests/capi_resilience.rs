@@ -243,6 +243,8 @@ fn mount_callback(bytes: &Vec<u8>) -> *mut fs_ext4_fs_t {
         context: bytes as *const Vec<u8> as *mut c_void,
         size_bytes: bytes.len() as u64,
         block_size: 512,
+        write: None,
+        flush: None,
     };
     unsafe { fs_ext4_mount_with_callbacks(&cfg) }
 }
@@ -291,6 +293,8 @@ fn callback_mount_with_failing_read_fn_rejected_cleanly() {
         context: std::ptr::null_mut(),
         size_bytes: 16 * 1024 * 1024,
         block_size: 512,
+        write: None,
+        flush: None,
     };
     let fs_ptr = unsafe { fs_ext4_mount_with_callbacks(&cfg) };
     assert!(fs_ptr.is_null(), "mount must fail when callback errors");
@@ -305,6 +309,8 @@ fn callback_mount_null_read_fn_returns_einval() {
         context: std::ptr::null_mut(),
         size_bytes: 0,
         block_size: 512,
+        write: None,
+        flush: None,
     };
     let fs = unsafe { fs_ext4_mount_with_callbacks(&cfg) };
     assert!(fs.is_null());

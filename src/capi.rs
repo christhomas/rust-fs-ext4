@@ -20,6 +20,7 @@
 //!
 //! Phase 4 (write path, in progress):
 //! - fs_ext4_mount_rw(device_path) -> *mut fs_ext4_fs_t
+//! - fs_ext4_mount_rw_with_callbacks(cfg) -> *mut fs_ext4_fs_t  (RW via FSKit-style read+write callbacks)
 //! - fs_ext4_truncate(fs, path, new_size) -> int (shrink + sparse grow)
 //! - fs_ext4_symlink(fs, target, linkpath) -> u32 inode (fast + slow path)
 //! - fs_ext4_chmod(fs, path, mode) -> int
@@ -203,13 +204,34 @@ pub type fs_ext4_read_fn = Option<
     unsafe extern "C" fn(context: *mut c_void, buf: *mut c_void, offset: u64, length: u64) -> c_int,
 >;
 
+/// Block device write callback (matches `fs_ext4_write_fn`). NULL when
+/// mounting read-only. NEW in v0.1.3.
+pub type fs_ext4_write_fn = Option<
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        buf: *const c_void,
+        offset: u64,
+        length: u64,
+    ) -> c_int,
+>;
+
+/// Optional flush/fsync callback (matches `fs_ext4_flush_fn`). NULL means
+/// the driver treats `flush()` as a no-op. NEW in v0.1.3.
+pub type fs_ext4_flush_fn = Option<unsafe extern "C" fn(context: *mut c_void) -> c_int>;
+
 /// Callback-based mount config (matches `fs_ext4_blockdev_cfg_t`).
+///
+/// `write` / `flush` were appended in v0.1.3 — `fs_ext4_mount_with_callbacks`
+/// ignores them (still RO), `fs_ext4_mount_rw_with_callbacks` requires
+/// `write` to be set.
 #[repr(C)]
 pub struct fs_ext4_blockdev_cfg_t {
     pub read: fs_ext4_read_fn,
     pub context: *mut c_void,
     pub size_bytes: u64,
     pub block_size: u32,
+    pub write: fs_ext4_write_fn,
+    pub flush: fs_ext4_flush_fn,
 }
 
 // ===========================================================================
@@ -367,6 +389,113 @@ unsafe fn mount_with_callbacks_inner(cfg: *const fs_ext4_blockdev_cfg_t) -> *mut
         Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
         Err(e) => {
             set_err_from(&e, "mount (callback)");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Mount read-write via caller-supplied read+write callbacks. Companion to
+/// `fs_ext4_mount_rw` for sandboxed consumers (FSKit, etc.) that own a
+/// block-device resource but cannot open `/dev/diskN`. Both `cfg.read`
+/// and `cfg.write` must be set; `cfg.flush` is optional. Returns NULL on
+/// failure with errno set (EINVAL when callbacks / cfg are missing).
+///
+/// A successful mount replays a dirty journal before returning, just like
+/// `fs_ext4_mount_rw` — the underlying `BlockDevice::is_writable()` is
+/// `true` because a write callback is attached.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_mount_rw_with_callbacks(
+    cfg: *const fs_ext4_blockdev_cfg_t,
+) -> *mut fs_ext4_fs_t {
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| mount_rw_with_callbacks_inner(cfg)),
+    )
+}
+
+unsafe fn mount_rw_with_callbacks_inner(cfg: *const fs_ext4_blockdev_cfg_t) -> *mut fs_ext4_fs_t {
+    clear_last_error();
+    if cfg.is_null() {
+        set_err_msg("null cfg", EINVAL);
+        return std::ptr::null_mut();
+    }
+    let cfg = &*cfg;
+    let Some(read_fn) = cfg.read else {
+        set_err_msg("cfg.read is null", EINVAL);
+        return std::ptr::null_mut();
+    };
+    let Some(write_fn) = cfg.write else {
+        set_err_msg("cfg.write is null (required for RW callback mount)", EINVAL);
+        return std::ptr::null_mut();
+    };
+    let flush_fn = cfg.flush; // Option — None is fine, treated as no-op.
+
+    // Stash the C context as usize so the closures are Send+Sync. Caller
+    // owns the context lifetime; FSKit guarantees serial access from the
+    // extension's queue, which matches the synchronisation model the
+    // rest of the driver assumes.
+    let ctx_addr = cfg.context as usize;
+    let size = cfg.size_bytes;
+
+    let read_closure = move |offset: u64, buf: &mut [u8]| -> std::io::Result<()> {
+        let rc = unsafe {
+            read_fn(
+                ctx_addr as *mut c_void,
+                buf.as_mut_ptr() as *mut c_void,
+                offset,
+                buf.len() as u64,
+            )
+        };
+        if rc != 0 {
+            Err(std::io::Error::other(format!(
+                "read callback returned {rc}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let write_closure = move |offset: u64, buf: &[u8]| -> std::io::Result<()> {
+        let rc = unsafe {
+            write_fn(
+                ctx_addr as *mut c_void,
+                buf.as_ptr() as *const c_void,
+                offset,
+                buf.len() as u64,
+            )
+        };
+        if rc != 0 {
+            Err(std::io::Error::other(format!(
+                "write callback returned {rc}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let flush_closure: Option<crate::block_io::FlushCb> = flush_fn.map(|f| {
+        let cb: crate::block_io::FlushCb = Box::new(move || -> std::io::Result<()> {
+            let rc = unsafe { f(ctx_addr as *mut c_void) };
+            if rc != 0 {
+                Err(std::io::Error::other(format!(
+                    "flush callback returned {rc}"
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        cb
+    });
+
+    let dev = CallbackDevice {
+        size,
+        read: Box::new(read_closure),
+        write: Some(Box::new(write_closure)),
+        flush: flush_closure,
+    };
+
+    match Filesystem::mount(Arc::new(dev) as Arc<dyn BlockDevice>) {
+        Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
+        Err(e) => {
+            set_err_from(&e, "mount_rw (callback)");
             std::ptr::null_mut()
         }
     }
