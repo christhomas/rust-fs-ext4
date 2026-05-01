@@ -3,6 +3,7 @@ name: CI
 on:
   push:
     branches: [main]
+    tags: ['v*']
   pull_request:
     branches: [main]
 
@@ -41,3 +42,53 @@ jobs:
       - run: cargo fmt --check
       - run: cargo clippy --all-targets -- -D warnings
       - run: cargo test --release
+
+  # Validate the mkfs_ext4 CLI binary's output by running the kernel's own
+  # fsck.ext4 (from e2fsprogs) against an image we generated. This is the
+  # canonical "does Linux think this is a valid ext4 volume?" check — much
+  # stricter than our own crate's read-path round-trip because it exercises
+  # every assertion in e2fsck's superblock + group-descriptor + inode-table
+  # validation, including the metadata-csum verification.
+  #
+  # Runs on every PR + push so a regression in the mkfs path is caught
+  # before the binary ships to a tag. There's no Windows equivalent for
+  # ext4 because Windows chkdsk doesn't speak ext4.
+  validate-mkfs-bin:
+    name: validate mkfs_ext4 (fsck.ext4 strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+      - name: Install e2fsprogs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs
+      - name: Cache cargo registry
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-cargo-mkfs-${{ hashFiles('**/Cargo.lock') }}
+      - name: Build mkfs_ext4
+        run: cargo build --release --bin mkfs_ext4
+      # 32 MiB is the v1 single-block-group cap. Keep it as the smoke
+      # test target and add a larger one once multi-group lands.
+      - name: Format 32 MiB image and validate with fsck.ext4
+        run: |
+          truncate -s 32M /tmp/out.img
+          ./target/release/mkfs_ext4 -L CITEST -U deadbeef-cafe-1234-5678-0123456789ab /tmp/out.img
+          # -f forces a check even if FS thinks it's clean; -n declines
+          # any repair offer (so this is read-only and exits non-zero
+          # if anything is wrong rather than silently auto-fixing).
+          fsck.ext4 -fnv /tmp/out.img
+      - name: Verify volume label and UUID round-tripped
+        run: |
+          # tune2fs prints the on-disk superblock metadata; grep confirms
+          # the CLI args propagated to the bytes fsck just validated.
+          tune2fs -l /tmp/out.img > /tmp/sb.txt
+          cat /tmp/sb.txt
+          grep -q "Filesystem volume name:.*CITEST" /tmp/sb.txt
+          grep -qi "Filesystem UUID:.*deadbeef-cafe-1234-5678-0123456789ab" /tmp/sb.txt
