@@ -94,6 +94,82 @@ fn mkfs_bin_formats_a_pre_sized_file_and_mounts_clean() {
 }
 
 #[test]
+fn mkfs_bin_create_size_creates_then_formats() {
+    // --create-size end-to-end: point at a non-existent path with
+    // --create-size 32M, expect the binary to create + size + format.
+    // No prior `truncate` step.
+    let bin = env!("CARGO_BIN_EXE_mkfs_ext4");
+    let img = unique_tmp_path("createsize");
+    let img_str = img.to_string_lossy().into_owned();
+    // Make sure the path doesn't exist (test ordering can leave files
+    // behind from a previous panic).
+    let _ = std::fs::remove_file(&img);
+
+    let out = Command::new(bin)
+        .args(["--create-size", "32M", "-L", "CREATED", &img_str])
+        .output()
+        .expect("spawn mkfs_ext4 --create-size");
+    if !out.status.success() {
+        let stderr = String::from_utf8_lossy(&out.stderr);
+        panic!("mkfs_ext4 --create-size failed: {stderr}");
+    }
+
+    // File should exist at exactly 32 MiB (1024-based suffix).
+    let meta = std::fs::metadata(&img).expect("formatted file exists");
+    assert_eq!(
+        meta.len(),
+        32 * 1024 * 1024,
+        "--create-size should size the file exactly"
+    );
+
+    // And it should be a mountable ext4 with our label.
+    let dev = FileDevice::open(&img_str).expect("open created image");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("mount created image");
+    assert!(fs.sb.volume_name.starts_with("CREATED"));
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
+fn mkfs_bin_create_size_is_idempotent_on_existing_file() {
+    // Second invocation against an already-formatted file should
+    // succeed (leave-as-is path). Catches regressions where we'd
+    // accidentally truncate an existing file back to the requested
+    // size, destroying the formatted bytes.
+    let bin = env!("CARGO_BIN_EXE_mkfs_ext4");
+    let img = unique_tmp_path("idempot");
+    let img_str = img.to_string_lossy().into_owned();
+    let _ = std::fs::remove_file(&img);
+
+    // First call creates + formats.
+    let out1 = Command::new(bin)
+        .args(["--create-size", "32M", "-L", "FIRST", &img_str])
+        .output()
+        .expect("spawn mkfs_ext4 first call");
+    assert!(out1.status.success(), "first call should succeed");
+
+    // Second call against the same path should NOT explode and should
+    // re-format (the binary's contract is "format this thing"; we
+    // just don't want it to crash on the metadata check).
+    let out2 = Command::new(bin)
+        .args(["--create-size", "32M", "-L", "SECOND", &img_str])
+        .output()
+        .expect("spawn mkfs_ext4 second call");
+    assert!(
+        out2.status.success(),
+        "second call should succeed (idempotent re-format); stderr: {}",
+        String::from_utf8_lossy(&out2.stderr)
+    );
+
+    // After the second call, the volume label should be SECOND.
+    let dev = FileDevice::open(&img_str).expect("open after second format");
+    let fs = Filesystem::mount(Arc::new(dev)).expect("mount after second format");
+    assert!(fs.sb.volume_name.starts_with("SECOND"));
+
+    let _ = std::fs::remove_file(&img);
+}
+
+#[test]
 fn mkfs_bin_dry_run_does_not_modify_file() {
     let bin = env!("CARGO_BIN_EXE_mkfs_ext4");
     let img = unique_tmp_path("dryrun");
