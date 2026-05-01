@@ -45,6 +45,7 @@ pub mod inode;
 pub mod jbd2;
 pub mod journal;
 pub mod journal_apply;
+pub mod mkfs;
 pub mod path;
 pub mod superblock;
 pub mod transaction;

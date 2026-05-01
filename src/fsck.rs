@@ -10,10 +10,19 @@
 //! Useful after a crash (to spot orphans that live-mount replay
 //! missed) and as a CI sanity check on generated images.
 //!
-//! Not exposed through the C ABI yet — the Rust-side surface is
-//! deliberately small so the signature can evolve without breaking
-//! FFI consumers. Exposed through the public [`Filesystem::audit`]
-//! method.
+//! Two surfaces:
+//! - [`audit`] — synchronous, collects every [`Anomaly`] into a
+//!   `Vec` on the returned [`AuditReport`]. Used by Rust callers and
+//!   tests.
+//! - [`audit_with_callbacks`] — same walk, but emits per-phase
+//!   progress and per-finding events through caller-supplied
+//!   closures. Used by the C ABI (`fs_ext4_fsck_run`) so the host UI
+//!   can stream progress and findings live without buffering the
+//!   full anomaly list for huge volumes.
+//!
+//! Both surfaces are read-only. Repair (link-count fixup, orphan
+//! relink, dotdot rewrite) is explicit future work — exposing it
+//! requires a journaled write path and an ABI-versioned bump.
 
 use crate::dir::{DirBlockIter, DirEntryType};
 use crate::error::{Error, Result};
@@ -60,7 +69,10 @@ pub enum Anomaly {
 /// of invariants checked all held.
 #[derive(Debug, Clone, Default)]
 pub struct AuditReport {
-    /// Every problem found, in no particular order.
+    /// Every problem found, in no particular order. Populated by the
+    /// legacy [`audit`] entry point; left empty by
+    /// [`audit_with_callbacks`] (it streams findings through the
+    /// caller's closure to avoid buffering on huge volumes).
     pub anomalies: Vec<Anomaly>,
     /// Number of distinct inodes visited via directory entries.
     pub inodes_visited: u32,
@@ -68,11 +80,42 @@ pub struct AuditReport {
     pub entries_scanned: u64,
     /// Number of directories scanned.
     pub directories_scanned: u32,
+    /// Total findings discovered. Always populated, regardless of
+    /// which entry point ran. Equal to `anomalies.len()` after a
+    /// successful [`audit`] call.
+    pub anomalies_count: u64,
 }
 
 impl AuditReport {
     pub fn is_clean(&self) -> bool {
-        self.anomalies.is_empty()
+        self.anomalies_count == 0
+    }
+}
+
+/// Phase identifier for [`audit_with_callbacks`] progress callbacks.
+///
+/// Numeric values match `fs_ext4_fsck_phase_t` in `include/fs_ext4.h`
+/// and **must not be reordered** — the C ABI is locked.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+#[repr(u32)]
+pub enum FsckPhase {
+    Superblock = 0,
+    Journal = 1,
+    Directory = 2,
+    Inodes = 3,
+    Finalize = 4,
+}
+
+impl FsckPhase {
+    /// Short ASCII label, mirrored to the C ABI.
+    pub fn name(self) -> &'static str {
+        match self {
+            FsckPhase::Superblock => "superblock",
+            FsckPhase::Journal => "journal",
+            FsckPhase::Directory => "directory",
+            FsckPhase::Inodes => "inodes",
+            FsckPhase::Finalize => "finalize",
+        }
     }
 }
 
@@ -87,6 +130,81 @@ pub fn audit(
     max_dirs_visited: u32,
     max_entries_per_dir: u32,
 ) -> Result<AuditReport> {
+    let mut report = AuditReport::default();
+    let mut collected: Vec<Anomaly> = Vec::new();
+    audit_inner(
+        fs,
+        max_dirs_visited,
+        max_entries_per_dir,
+        &mut |_, _, _| {},
+        &mut |a| collected.push(a.clone()),
+        &mut report,
+    )?;
+    report.anomalies = collected;
+    Ok(report)
+}
+
+/// Same walk as [`audit`], but emits progress and findings through
+/// caller-supplied closures. The callbacks see each [`Anomaly`] as it
+/// is discovered (no buffering of the full list) and per-phase
+/// progress so a host UI can render a live progress bar.
+///
+/// On return, `report.anomalies` is **empty** — findings are delivered
+/// only through `on_finding`. The summary counters
+/// (`directories_scanned`, `entries_scanned`, `inodes_visited`,
+/// `anomalies_found` … via the C ABI helpers) are still populated.
+///
+/// Phase emission contract:
+/// - `Superblock` once at start (0/1 → 1/1) — superblock validity
+///   was already checked at mount.
+/// - `Directory` per directory popped (`done` = directories scanned
+///   so far, `total` = scanned + queue depth).
+/// - `Inodes` once around the link-count comparison pass (0/1 → 1/1).
+/// - `Finalize` once just before return (0/1 → 1/1).
+///
+/// `Journal` is **not** emitted here — the FFI shim drives journal
+/// replay before calling this function and emits the phase from
+/// there.
+pub fn audit_with_callbacks<P, F>(
+    fs: &Filesystem,
+    max_dirs_visited: u32,
+    max_entries_per_dir: u32,
+    mut on_progress: P,
+    mut on_finding: F,
+) -> Result<AuditReport>
+where
+    P: FnMut(FsckPhase, u64, u64),
+    F: FnMut(&Anomaly),
+{
+    let mut report = AuditReport::default();
+    on_progress(FsckPhase::Superblock, 0, 1);
+    on_progress(FsckPhase::Superblock, 1, 1);
+
+    audit_inner(
+        fs,
+        max_dirs_visited,
+        max_entries_per_dir,
+        &mut on_progress,
+        &mut on_finding,
+        &mut report,
+    )?;
+
+    Ok(report)
+}
+
+/// Core walk shared by [`audit`] and [`audit_with_callbacks`].
+///
+/// Findings are emitted through `on_finding`; nothing is pushed onto
+/// `report.anomalies` from here. Callers that want the legacy
+/// "collect into a vec" behaviour wrap `on_finding` accordingly.
+fn audit_inner(
+    fs: &Filesystem,
+    max_dirs_visited: u32,
+    max_entries_per_dir: u32,
+    on_progress: &mut dyn FnMut(FsckPhase, u64, u64),
+    on_finding: &mut dyn FnMut(&Anomaly),
+    report: &mut AuditReport,
+) -> Result<()> {
     // Observed: ino → reference-count.
     let mut observed: HashMap<u32, u32> = HashMap::new();
     let mut parent_claim: HashMap<u32, u32> = HashMap::new();
@@ -94,7 +212,6 @@ pub fn audit(
     // we don't decode, bound cap). Any link-count anomalies that could
     // have been explained by their missing entries are suppressed below.
     let mut incomplete_dirs: std::collections::HashSet<u32> = std::collections::HashSet::new();
-    let mut report = AuditReport::default();
 
     let mut work: Vec<(u32, u32)> = Vec::new(); // (ino, parent_ino)
     work.push((crate::path::EXT4_ROOT_INODE, crate::path::EXT4_ROOT_INODE));
@@ -102,6 +219,9 @@ pub fn audit(
 
     let has_filetype = fs.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
     let block_size = fs.sb.block_size();
+
+    // Initial directory progress pulse: 0 of (just root).
+    on_progress(FsckPhase::Directory, 0, work.len() as u64);
 
     while let Some((dir_ino, parent_ino)) = work.pop() {
         if report.directories_scanned >= max_dirs_visited {
@@ -117,13 +237,17 @@ pub fn audit(
             Ok(p) => p,
             Err(_) => {
                 incomplete_dirs.insert(dir_ino);
+                emit_dir_progress(on_progress, report.directories_scanned, work.len());
                 continue;
             }
         };
         if !inode.is_dir() {
             // Something referenced us as a dir but the inode says otherwise.
             // Surface as a BogusEntry against the parent.
-            report.anomalies.push(Anomaly::BogusEntry { parent_ino });
+            let a = Anomaly::BogusEntry { parent_ino };
+            on_finding(&a);
+            report.anomalies_count += 1;
+            emit_dir_progress(on_progress, report.directories_scanned, work.len());
             continue;
         }
 
@@ -132,6 +256,7 @@ pub fn audit(
         // on-disk layout we don't decode here).
         if inode.has_inline_data() {
             incomplete_dirs.insert(dir_ino);
+            emit_dir_progress(on_progress, report.directories_scanned, work.len());
             continue;
         }
 
@@ -139,6 +264,7 @@ pub fn audit(
             Ok(e) => e,
             Err(_) => {
                 incomplete_dirs.insert(dir_ino);
+                emit_dir_progress(on_progress, report.directories_scanned, work.len());
                 continue;
             }
         };
@@ -170,9 +296,13 @@ pub fn audit(
         if truncated {
             incomplete_dirs.insert(dir_ino);
         }
+        emit_dir_progress(on_progress, report.directories_scanned, work.len());
     }
 
     report.inodes_visited = observed.len() as u32;
+
+    // Inode link-count compare phase.
+    on_progress(FsckPhase::Inodes, 0, 1);
 
     // Compare observed vs stored. When an inode's reference came from a
     // directory we couldn't fully enumerate, we suppress TooHigh (we
@@ -184,33 +314,41 @@ pub fn audit(
             Ok((inode, _)) => {
                 let stored = inode.links_count;
                 if stored == 0 {
-                    report.anomalies.push(Anomaly::DanglingEntry {
+                    let a = Anomaly::DanglingEntry {
                         parent_ino: 0,
                         child_ino: ino,
-                    });
+                    };
+                    on_finding(&a);
+                    report.anomalies_count += 1;
                     continue;
                 }
                 if (stored as u32) < count {
-                    report.anomalies.push(Anomaly::LinkCountTooLow {
+                    let a = Anomaly::LinkCountTooLow {
                         ino,
                         stored,
                         observed: count,
-                    });
+                    };
+                    on_finding(&a);
+                    report.anomalies_count += 1;
                 }
                 if (stored as u32) > count && !have_incomplete {
-                    report.anomalies.push(Anomaly::LinkCountTooHigh {
+                    let a = Anomaly::LinkCountTooHigh {
                         ino,
                         stored,
                         observed: count,
-                    });
+                    };
+                    on_finding(&a);
+                    report.anomalies_count += 1;
                 }
             }
             Err(_) => {
                 // Unreadable inode that somebody linked to.
-                report.anomalies.push(Anomaly::DanglingEntry {
+                let a = Anomaly::DanglingEntry {
                     parent_ino: 0,
                     child_ino: ino,
-                });
+                };
+                on_finding(&a);
+                report.anomalies_count += 1;
             }
         }
     }
@@ -220,11 +358,13 @@ pub fn audit(
         if dir_ino == crate::path::EXT4_ROOT_INODE {
             // root '..' conventionally points at root itself
             if claimed != crate::path::EXT4_ROOT_INODE {
-                report.anomalies.push(Anomaly::WrongDotDot {
+                let a = Anomaly::WrongDotDot {
                     dir_ino,
                     claims: claimed,
                     actual_parent: crate::path::EXT4_ROOT_INODE,
-                });
+                };
+                on_finding(&a);
+                report.anomalies_count += 1;
             }
         }
         // Non-root parent validation requires tracking the enqueueing
@@ -233,7 +373,21 @@ pub fn audit(
         // lost their backrefs).
     }
 
-    Ok(report)
+    on_progress(FsckPhase::Inodes, 1, 1);
+    on_progress(FsckPhase::Finalize, 0, 1);
+    on_progress(FsckPhase::Finalize, 1, 1);
+
+    Ok(())
+}
+
+fn emit_dir_progress(
+    on_progress: &mut dyn FnMut(FsckPhase, u64, u64),
+    scanned: u32,
+    queue_len: usize,
+) {
+    let done = scanned as u64;
+    let total = done + queue_len as u64;
+    on_progress(FsckPhase::Directory, done, total);
 }
 
 fn collect_dir_entries(

@@ -59,19 +59,59 @@ typedef struct {
 } fs_ext4_dirent_t;
 
 /* Volume information */
+/*
+ * Snapshot of everything in the on-disk superblock that a UI / CLI
+ * consumer might want to surface. Layout is part of the FFI ABI; new
+ * fields land at the end so existing zero-init memcpy callers stay
+ * valid. Field-by-field documentation lives in src/capi.rs alongside
+ * the rust definition.
+ */
 typedef struct {
-    char     volume_name[16];
+    /* ----- Identity ----- */
+    char     volume_name[16];     /* NUL-terminated, <= 16 bytes */
+    uint8_t  uuid[16];            /* raw 16-byte UUID */
+    char     last_mounted[64];    /* NUL-terminated last-mount path, or "" */
+
+    /* ----- Sizing ----- */
     uint32_t block_size;
     uint64_t total_blocks;
     uint64_t free_blocks;
+    uint64_t reserved_blocks;     /* root-reserve blocks */
     uint32_t total_inodes;
     uint32_t free_inodes;
+    uint16_t inode_size;
+    uint32_t first_inode;         /* first non-reserved inode (s_first_ino) */
+    uint32_t blocks_per_group;
+    uint32_t inodes_per_group;
+
+    /* ----- Provenance + capabilities ----- */
+    uint32_t creator_os;          /* 0=Linux 1=Hurd 2=Masix 3=FreeBSD 4=Lites */
+    uint32_t rev_level;
+    uint16_t minor_rev_level;
+    uint32_t feature_compat;
+    uint32_t feature_incompat;
+    uint32_t feature_ro_compat;
+    uint16_t desc_size;           /* block-group descriptor size: 32 or 64 */
+    uint8_t  default_hash_version;
+
+    /* ----- Lifecycle / health ----- */
+    uint16_t state;               /* s_state bit field */
+    uint16_t errors_behavior;     /* s_errors: 1=continue 2=remount-ro 3=panic */
+    uint32_t last_mount_time;     /* unix epoch seconds */
+    uint32_t last_write_time;     /* unix epoch seconds */
+    uint32_t last_check_time;     /* unix epoch seconds */
+    uint32_t check_interval;      /* seconds between forced fsck; 0 = disabled */
+    uint16_t mount_count;
+    uint16_t max_mount_count;     /* 0 = unlimited */
+    uint16_t def_resuid;
+    uint16_t def_resgid;
+
     /*
      * 1 if the filesystem was NOT cleanly unmounted last time it was used
      * (captured from the on-disk s_state field at mount time, before any
      * journal replay the driver may perform). 0 if clean. Consumers should
      * surface a dirty value to the user and run fsck / journal replay
-     * before permitting writes.
+     * before permitting writes. Derived from `state` for caller convenience.
      */
     uint8_t  mounted_dirty;
 } fs_ext4_volume_info_t;
@@ -425,6 +465,111 @@ int fs_ext4_removexattr(fs_ext4_fs_t *fs, const char *path,
 int fs_ext4_utimens(fs_ext4_fs_t *fs, const char *path,
                     uint32_t atime_sec, uint32_t atime_nsec,
                     uint32_t mtime_sec, uint32_t mtime_nsec);
+
+/* ---- Volume creation (mkfs) ---- */
+
+/*
+ * Format a block device as a fresh ext4 filesystem. The device is reached
+ * through the same callback shape used for mounting — `cfg->read`, `cfg->write`
+ * and `cfg->size_bytes` must all be set; `cfg->flush` is optional. Works for
+ * both `/dev/diskN` (real disk) and disk-image files when the caller wires
+ * file-backed callbacks.
+ *
+ * `label` is an optional NUL-terminated UTF-8 volume name (≤ 16 bytes; longer
+ * names are truncated). Pass NULL to leave it blank.
+ * `uuid` is either NULL (driver generates a v4 UUID from /dev/urandom) or a
+ * pointer to exactly 16 raw bytes the caller has chosen.
+ *
+ * On-disk layout (v1, single block-group, ≤ 32k blocks): boot sector zero,
+ * primary superblock, BGD table, block bitmap, inode bitmap, inode table,
+ * root directory data block. Features enabled: FILETYPE, EXTENTS, 64BIT,
+ * METADATA_CSUM. No journal — the FS mounts cleanly without one.
+ *
+ * Returns 0 on success or -errno on failure. Use fs_ext4_last_error /
+ * fs_ext4_last_errno for the cause.
+ */
+int fs_ext4_mkfs(const fs_ext4_blockdev_cfg_t *cfg,
+                 const char *label,
+                 const uint8_t *uuid);
+
+/*
+ * ----- Read-only fsck (filesystem audit) ------------------------------
+ *
+ * Walks the directory tree, counts directory-entry references to each
+ * inode, and reports inconsistencies via callbacks. Never writes — the
+ * `read_only` field of `fs_ext4_fsck_options_t` MUST be 1 in this MVP.
+ * Repair is explicit future work; a future ABI addition will cover it.
+ *
+ * Findings are streamed through `on_finding` rather than collected
+ * into a returned list, so the host UI can render progress live for
+ * very large volumes without buffering the full anomaly set.
+ */
+
+typedef enum {
+    FS_EXT4_FSCK_PHASE_SUPERBLOCK = 0,
+    FS_EXT4_FSCK_PHASE_JOURNAL    = 1,
+    FS_EXT4_FSCK_PHASE_DIRECTORY  = 2,
+    FS_EXT4_FSCK_PHASE_INODES     = 3,
+    FS_EXT4_FSCK_PHASE_FINALIZE   = 4,
+} fs_ext4_fsck_phase_t;
+
+/*
+ * Progress callback. `phase_name` points to a short ASCII string
+ * ("superblock", "journal", "directory", "inodes", "finalize") and is
+ * valid only for the duration of the call. `done` and `total` are
+ * monotonic within a single phase; `total` may grow during DIRECTORY
+ * (queued work is best-estimate). Either or both may be 0 in
+ * pathological cases.
+ */
+typedef void (*fs_ext4_fsck_progress_fn)(void *context,
+    fs_ext4_fsck_phase_t phase, const char *phase_name,
+    uint64_t done, uint64_t total);
+
+/*
+ * Per-finding callback. `kind` is one of: "link_count_low",
+ * "link_count_high", "dangling_entry", "wrong_dotdot", "bogus_entry".
+ * `inode` is the most relevant inode (the affected inode for link-
+ * count cases; the child for dangling, the directory for wrong_dotdot,
+ * the parent for bogus_entry). `detail` is a short, free-form ASCII
+ * blob like "stored=1 observed=2" — for diagnostic display only, not
+ * meant to be parsed. Both `kind` and `detail` are valid only for the
+ * duration of the call.
+ */
+typedef void (*fs_ext4_fsck_finding_fn)(void *context,
+    const char *kind, uint32_t inode, const char *detail);
+
+typedef struct {
+    uint8_t  read_only;            /* MVP: caller MUST set to 1 */
+    uint8_t  replay_journal;       /* 1 = invoke replay_journal_if_dirty first */
+    uint32_t max_dirs;             /* 0 = unbounded (use u32::MAX internally) */
+    uint32_t max_entries_per_dir;  /* 0 = unbounded */
+    fs_ext4_fsck_progress_fn on_progress; /* nullable */
+    fs_ext4_fsck_finding_fn  on_finding;  /* nullable */
+    void *context;
+} fs_ext4_fsck_options_t;
+
+typedef struct {
+    uint64_t inodes_visited;
+    uint64_t directories_scanned;
+    uint64_t entries_scanned;
+    uint64_t anomalies_found;
+    uint8_t  was_dirty;            /* 1 if SB.s_state showed dirty pre-run */
+    uint8_t  dirty_cleared;        /* MVP: always 0 (read-only) */
+} fs_ext4_fsck_report_t;
+
+/*
+ * Run a read-only fsck audit. Writes summary counters to *report and
+ * delivers each anomaly through opts->on_finding as it is discovered.
+ *
+ * Returns 0 on success regardless of how many anomalies were found —
+ * anomalies don't fail the call, they're surfaced via on_finding and
+ * counted in report->anomalies_found. Returns -1 on hard failure
+ * (null args, read_only != 1, journal replay error, I/O error during
+ * walk); use fs_ext4_last_error / _last_errno for the cause.
+ */
+int fs_ext4_fsck_run(fs_ext4_fs_t *fs,
+    const fs_ext4_fsck_options_t *opts,
+    fs_ext4_fsck_report_t *report);
 
 #ifdef __cplusplus
 }

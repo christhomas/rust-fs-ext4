@@ -182,20 +182,83 @@ pub struct fs_ext4_dirent_t {
     pub name: [c_char; 256],
 }
 
-/// Volume info (matches `fs_ext4_volume_info_t`).
+/// Volume info (matches `fs_ext4_volume_info_t`). Layout is part of
+/// the FFI ABI; new fields land at the end so existing zero-init
+/// memcpy callers stay valid. Anything that derives from the on-disk
+/// superblock can be added here — long-term goal is to give callers
+/// everything they could possibly want to surface in a UI without
+/// having to re-parse the superblock themselves.
 #[repr(C)]
 pub struct fs_ext4_volume_info_t {
+    /* ----- Identity ----- */
     pub volume_name: [c_char; 16],
+    /// Raw 16-byte UUID. Caller formats as 8-4-4-4-12 hyphenated hex
+    /// to match comparable inspection tools.
+    pub uuid: [u8; 16],
+    /// Last mount path the kernel wrote into `s_last_mounted` (64
+    /// bytes, NUL-terminated). Empty on a freshly mkfs'd FS.
+    pub last_mounted: [c_char; 64],
+
+    /* ----- Sizing ----- */
     pub block_size: u32,
     pub total_blocks: u64,
     pub free_blocks: u64,
+    /// `s_r_blocks_count` — blocks reserved for the superuser (the
+    /// "root reserve", typically ~5%). Explains the gap between
+    /// `free_blocks` and what `df` reports as available to a regular
+    /// user.
+    pub reserved_blocks: u64,
     pub total_inodes: u32,
     pub free_inodes: u32,
+    pub inode_size: u16,
+    /// First non-reserved inode (s_first_ino, dynamic-rev only;
+    /// 11 on legacy filesystems).
+    pub first_inode: u32,
+    pub blocks_per_group: u32,
+    pub inodes_per_group: u32,
+
+    /* ----- Provenance + capabilities ----- */
+    /// 0=Linux, 1=Hurd, 2=Masix, 3=FreeBSD, 4=Lites.
+    pub creator_os: u32,
+    pub rev_level: u32,
+    pub minor_rev_level: u16,
+    pub feature_compat: u32,
+    pub feature_incompat: u32,
+    pub feature_ro_compat: u32,
+    /// Block-group descriptor size: 32 or 64 (64 when 64BIT incompat
+    /// feature is set).
+    pub desc_size: u16,
+    pub default_hash_version: u8,
+
+    /* ----- Lifecycle / health ----- */
+    /// `s_state`. Bit 0 (EXT4_VALID_FS) = cleanly unmounted; bit 1
+    /// (EXT4_ERROR_FS) = errors detected; bit 2 (EXT4_ORPHAN_FS) =
+    /// orphans pending recovery.
+    pub state: u16,
+    /// `s_errors`. Kernel error policy: 1=continue, 2=remount-ro,
+    /// 3=panic.
+    pub errors_behavior: u16,
+    /// `s_mtime` — last mount time (unix epoch seconds).
+    pub last_mount_time: u32,
+    /// `s_wtime` — last write time (unix epoch seconds).
+    pub last_write_time: u32,
+    /// `s_lastcheck` — last fsck pass (unix epoch seconds).
+    pub last_check_time: u32,
+    /// `s_checkinterval` — seconds between forced fscks; 0 disables
+    /// time-based forced fsck.
+    pub check_interval: u32,
+    /// `s_mnt_count` — mounts since last fsck.
+    pub mount_count: u16,
+    /// `s_max_mnt_count` — forced fsck after this many mounts; 0 =
+    /// unlimited.
+    pub max_mount_count: u16,
+    pub def_resuid: u16,
+    pub def_resgid: u16,
+
     /// `1` if the filesystem was NOT cleanly unmounted last time it was
     /// used (dirty) — the caller should surface this to the user and
     /// run fsck / journal replay before permitting writes. `0` if the
-    /// filesystem is clean. Captured from the on-disk `s_state` field
-    /// at mount time, before any journal replay the driver may perform.
+    /// filesystem is clean. Derived from `state` for caller convenience.
     pub mounted_dirty: u8,
 }
 
@@ -668,22 +731,63 @@ pub unsafe extern "C" fn fs_ext4_get_volume_info(
             let fs = &(*fs).fs;
             let info = &mut *info;
 
-            // Zero the struct
+            // Zero the struct first so any field we don't explicitly
+            // populate (e.g. `last_mounted` when the FS was never
+            // mounted) reads as all-zero / NUL-terminated empty.
             std::ptr::write_bytes(info as *mut fs_ext4_volume_info_t, 0, 1);
 
-            // Copy volume name (up to 16 bytes incl. NUL)
+            // ----- Identity -----
+            // Volume name (up to 16 bytes incl. NUL).
             let name_bytes = fs.sb.volume_name.as_bytes();
             let copy_len = name_bytes.len().min(15);
             for (i, &b) in name_bytes[..copy_len].iter().enumerate() {
                 info.volume_name[i] = b as c_char;
             }
             info.volume_name[copy_len] = 0;
+            info.uuid = fs.sb.uuid;
+            // last_mounted (up to 64 bytes incl. NUL). Already
+            // truncated by the parser to a printable substring.
+            let lm_bytes = fs.sb.last_mounted.as_bytes();
+            let lm_copy = lm_bytes.len().min(63);
+            for (i, &b) in lm_bytes[..lm_copy].iter().enumerate() {
+                info.last_mounted[i] = b as c_char;
+            }
+            info.last_mounted[lm_copy] = 0;
 
+            // ----- Sizing -----
             info.block_size = fs.sb.block_size();
             info.total_blocks = fs.sb.blocks_count;
             info.free_blocks = fs.sb.free_blocks_count;
+            info.reserved_blocks = fs.sb.r_blocks_count;
             info.total_inodes = fs.sb.inodes_count;
             info.free_inodes = fs.sb.free_inodes_count;
+            info.inode_size = fs.sb.inode_size;
+            info.first_inode = fs.sb.first_inode;
+            info.blocks_per_group = fs.sb.blocks_per_group;
+            info.inodes_per_group = fs.sb.inodes_per_group;
+
+            // ----- Provenance + capabilities -----
+            info.creator_os = fs.sb.creator_os;
+            info.rev_level = fs.sb.rev_level;
+            info.minor_rev_level = fs.sb.minor_rev_level;
+            info.feature_compat = fs.sb.feature_compat;
+            info.feature_incompat = fs.sb.feature_incompat;
+            info.feature_ro_compat = fs.sb.feature_ro_compat;
+            info.desc_size = fs.sb.desc_size;
+            info.default_hash_version = fs.sb.default_hash_version;
+
+            // ----- Lifecycle / health -----
+            info.state = fs.sb.state;
+            info.errors_behavior = fs.sb.errors_behavior;
+            info.last_mount_time = fs.sb.mtime;
+            info.last_write_time = fs.sb.wtime;
+            info.last_check_time = fs.sb.lastcheck;
+            info.check_interval = fs.sb.checkinterval;
+            info.mount_count = fs.sb.mnt_count;
+            info.max_mount_count = fs.sb.max_mnt_count;
+            info.def_resuid = fs.sb.def_resuid;
+            info.def_resgid = fs.sb.def_resgid;
+
             info.mounted_dirty = if fs.sb.is_clean() { 0 } else { 1 };
 
             0
@@ -1778,6 +1882,400 @@ pub unsafe extern "C" fn fs_ext4_setxattr(
                 Ok(()) => 0,
                 Err(e) => {
                     set_err_from(&e, &format!("setxattr {path_str} {name_str}"));
+                    -1
+                }
+            }
+        }),
+    )
+}
+
+// ===========================================================================
+// mkfs (volume creation)
+// ===========================================================================
+
+/// Format a block device as ext4. The device is reached through the same
+/// callback config used by `fs_ext4_mount_*_with_callbacks`; `cfg->write` and
+/// `cfg->size_bytes` must be set. `label` is an optional NUL-terminated UTF-8
+/// volume name (≤ 16 bytes — longer names are truncated). `uuid` may be NULL
+/// (the driver generates one) or a pointer to 16 raw bytes.
+///
+/// Returns 0 on success or `-errno` on failure. Use `fs_ext4_last_error` /
+/// `fs_ext4_last_errno` for context.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_mkfs(
+    cfg: *const fs_ext4_blockdev_cfg_t,
+    label: *const c_char,
+    uuid: *const u8,
+) -> c_int {
+    ffi_guard(
+        -EINVAL,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if cfg.is_null() {
+                set_err_msg("null cfg", EINVAL);
+                return -EINVAL;
+            }
+            let cfg = &*cfg;
+            let Some(read_fn) = cfg.read else {
+                set_err_msg("cfg.read is null", EINVAL);
+                return -EINVAL;
+            };
+            let Some(write_fn) = cfg.write else {
+                set_err_msg("cfg.write is null (mkfs needs writes)", EINVAL);
+                return -EINVAL;
+            };
+            let flush_fn = cfg.flush; // optional
+            if cfg.size_bytes == 0 {
+                set_err_msg("cfg.size_bytes is 0", EINVAL);
+                return -EINVAL;
+            }
+            let block_size = if cfg.block_size == 0 {
+                4096
+            } else {
+                cfg.block_size
+            };
+
+            let ctx_addr = cfg.context as usize;
+
+            let read_closure = move |offset: u64, buf: &mut [u8]| -> std::io::Result<()> {
+                let rc = unsafe {
+                    read_fn(
+                        ctx_addr as *mut c_void,
+                        buf.as_mut_ptr() as *mut c_void,
+                        offset,
+                        buf.len() as u64,
+                    )
+                };
+                if rc != 0 {
+                    Err(std::io::Error::other(format!("read cb {rc}")))
+                } else {
+                    Ok(())
+                }
+            };
+            let write_closure = move |offset: u64, buf: &[u8]| -> std::io::Result<()> {
+                let rc = unsafe {
+                    write_fn(
+                        ctx_addr as *mut c_void,
+                        buf.as_ptr() as *const c_void,
+                        offset,
+                        buf.len() as u64,
+                    )
+                };
+                if rc != 0 {
+                    Err(std::io::Error::other(format!("write cb {rc}")))
+                } else {
+                    Ok(())
+                }
+            };
+            let flush_closure: Option<crate::block_io::FlushCb> = flush_fn.map(|f| {
+                let cb: crate::block_io::FlushCb = Box::new(move || -> std::io::Result<()> {
+                    let rc = unsafe { f(ctx_addr as *mut c_void) };
+                    if rc != 0 {
+                        Err(std::io::Error::other(format!("flush cb {rc}")))
+                    } else {
+                        Ok(())
+                    }
+                });
+                cb
+            });
+
+            let dev = CallbackDevice {
+                size: cfg.size_bytes,
+                read: Box::new(read_closure),
+                write: Some(Box::new(write_closure)),
+                flush: flush_closure,
+            };
+
+            let label_str: Option<&str> = if label.is_null() {
+                None
+            } else {
+                Some(cstr_to_str(label))
+            };
+            let uuid_arr: Option<[u8; 16]> = if uuid.is_null() {
+                None
+            } else {
+                let mut tmp = [0u8; 16];
+                std::ptr::copy_nonoverlapping(uuid, tmp.as_mut_ptr(), 16);
+                Some(tmp)
+            };
+
+            match crate::mkfs::format_filesystem(
+                &dev,
+                label_str,
+                uuid_arr,
+                cfg.size_bytes,
+                block_size,
+            ) {
+                Ok(()) => 0,
+                Err(e) => {
+                    let errno = e.to_errno();
+                    set_err_from(&e, "mkfs");
+                    -errno
+                }
+            }
+        }),
+    )
+}
+
+// ===========================================================================
+// Fsck (read-only audit)
+//
+// Architecture note: this is a *read-only* fsck — it never writes to disk.
+// Findings are delivered via a per-finding C callback rather than collected
+// into a Vec returned by reference, so a host UI can stream progress on huge
+// volumes without buffering the entire anomaly list. Repair (link-count
+// fixup, orphan relink, dotdot rewrite) is explicit future work and will
+// require a journaled write path plus a new ABI entry point.
+//
+// The caller-supplied `on_progress` and `on_finding` callbacks run on the
+// thread that called `fs_ext4_fsck_run`. They MUST NOT unwind / throw across
+// the FFI boundary — Rust panics inside them turn into the same EIO last-
+// error other capi functions surface (the whole body is wrapped in
+// `ffi_guard`). The `phase_name`, `kind`, and `detail` strings are valid
+// only for the duration of the callback call.
+// ===========================================================================
+
+/// Phase id (matches `fs_ext4_fsck_phase_t` in `include/fs_ext4.h`).
+#[repr(C)]
+#[derive(Copy, Clone)]
+pub enum fs_ext4_fsck_phase_t {
+    Superblock = 0,
+    Journal = 1,
+    Directory = 2,
+    Inodes = 3,
+    Finalize = 4,
+}
+
+/// Progress callback (matches `fs_ext4_fsck_progress_fn`).
+pub type fs_ext4_fsck_progress_fn = Option<
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        phase: fs_ext4_fsck_phase_t,
+        phase_name: *const c_char,
+        done: u64,
+        total: u64,
+    ),
+>;
+
+/// Per-finding callback (matches `fs_ext4_fsck_finding_fn`).
+pub type fs_ext4_fsck_finding_fn = Option<
+    unsafe extern "C" fn(
+        context: *mut c_void,
+        kind: *const c_char,
+        inode: u32,
+        detail: *const c_char,
+    ),
+>;
+
+/// Fsck options struct (matches `fs_ext4_fsck_options_t`).
+#[repr(C)]
+pub struct fs_ext4_fsck_options_t {
+    /// MVP: caller MUST set this to 1. Non-1 values are rejected with
+    /// EINVAL (this entry point never writes; a future repair entry
+    /// point will accept `read_only = 0`).
+    pub read_only: u8,
+    /// 1 = call `fs_ext4_replay_journal_if_dirty` before the audit.
+    /// Useful when the volume was mounted via the lazy variant and the
+    /// caller wants a single fsck call to replay-then-audit.
+    pub replay_journal: u8,
+    /// 0 = unbounded (fsck visits every directory). Otherwise capped.
+    pub max_dirs: u32,
+    /// 0 = unbounded. Otherwise per-directory entry cap.
+    pub max_entries_per_dir: u32,
+    /// Nullable. Called with phase + done/total counters. See module
+    /// note for which phases are emitted.
+    pub on_progress: fs_ext4_fsck_progress_fn,
+    /// Nullable. Called once per `Anomaly` discovered.
+    pub on_finding: fs_ext4_fsck_finding_fn,
+    /// Opaque pointer threaded through both callbacks. Not interpreted
+    /// by Rust.
+    pub context: *mut c_void,
+}
+
+/// Fsck report (matches `fs_ext4_fsck_report_t`).
+#[repr(C)]
+pub struct fs_ext4_fsck_report_t {
+    pub inodes_visited: u64,
+    pub directories_scanned: u64,
+    pub entries_scanned: u64,
+    pub anomalies_found: u64,
+    /// 1 if the on-disk superblock `s_state` showed dirty before the
+    /// run started. Captured *before* journal replay (so the caller
+    /// can tell whether the volume was crash-state on entry).
+    pub was_dirty: u8,
+    /// MVP: always 0. Reserved for the future repair path.
+    pub dirty_cleared: u8,
+}
+
+/// Map an [`Anomaly`] variant to its locked C ABI kind string + the
+/// most relevant inode + a short free-form detail blob.
+fn anomaly_to_capi(a: &crate::fsck::Anomaly) -> (&'static str, u32, String) {
+    use crate::fsck::Anomaly;
+    match *a {
+        Anomaly::LinkCountTooLow {
+            ino,
+            stored,
+            observed,
+        } => (
+            "link_count_low",
+            ino,
+            format!("stored={stored} observed={observed}"),
+        ),
+        Anomaly::LinkCountTooHigh {
+            ino,
+            stored,
+            observed,
+        } => (
+            "link_count_high",
+            ino,
+            format!("stored={stored} observed={observed}"),
+        ),
+        Anomaly::DanglingEntry {
+            parent_ino,
+            child_ino,
+        } => (
+            "dangling_entry",
+            child_ino,
+            format!("parent_ino={parent_ino}"),
+        ),
+        Anomaly::WrongDotDot {
+            dir_ino,
+            claims,
+            actual_parent,
+        } => (
+            "wrong_dotdot",
+            dir_ino,
+            format!("claims={claims} actual_parent={actual_parent}"),
+        ),
+        Anomaly::BogusEntry { parent_ino } => (
+            "bogus_entry",
+            parent_ino,
+            format!("parent_ino={parent_ino}"),
+        ),
+    }
+}
+
+/// Run a read-only fsck audit on `fs`. Findings are delivered live via
+/// `opts->on_finding`; counters are written to `*report` before return.
+///
+/// Returns 0 on success (regardless of how many anomalies were found —
+/// they're surfaced through `on_finding` and counted in
+/// `report->anomalies_found`). Returns -1 on hard failure (null args,
+/// `read_only != 1`, journal replay failure, etc.) with the cause in
+/// `fs_ext4_last_error` / `fs_ext4_last_errno`.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_fsck_run(
+    fs: *mut fs_ext4_fs_t,
+    opts: *const fs_ext4_fsck_options_t,
+    report: *mut fs_ext4_fsck_report_t,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || opts.is_null() || report.is_null() {
+                set_err_msg("null fs/opts/report", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let opts_ref = &*opts;
+            if opts_ref.read_only != 1 {
+                set_err_msg(
+                    "fsck: only read-only audit is supported in this MVP (set opts.read_only = 1)",
+                    EINVAL,
+                );
+                return -1;
+            }
+
+            // Zero the report so partial fills on early-error paths don't
+            // leave stale stack data visible to the caller.
+            std::ptr::write_bytes(report, 0, 1);
+            let report_out = &mut *report;
+
+            // Capture pre-run dirty flag (before any replay).
+            report_out.was_dirty = if fs_ref.sb.is_clean() { 0 } else { 1 };
+
+            // Stash callbacks + context for the closures.
+            let progress_cb = opts_ref.on_progress;
+            let finding_cb = opts_ref.on_finding;
+            let ctx = opts_ref.context;
+
+            // Helper: push a progress event through the C callback (if set).
+            let emit_progress = |phase: crate::fsck::FsckPhase, done: u64, total: u64| {
+                if let Some(cb) = progress_cb {
+                    let phase_c = match phase {
+                        crate::fsck::FsckPhase::Superblock => fs_ext4_fsck_phase_t::Superblock,
+                        crate::fsck::FsckPhase::Journal => fs_ext4_fsck_phase_t::Journal,
+                        crate::fsck::FsckPhase::Directory => fs_ext4_fsck_phase_t::Directory,
+                        crate::fsck::FsckPhase::Inodes => fs_ext4_fsck_phase_t::Inodes,
+                        crate::fsck::FsckPhase::Finalize => fs_ext4_fsck_phase_t::Finalize,
+                    };
+                    // phase_name strings are short ASCII literals; CString
+                    // construction can't fail.
+                    let name = CString::new(phase.name()).unwrap();
+                    cb(ctx, phase_c, name.as_ptr(), done, total);
+                }
+            };
+
+            // Optional journal replay before the audit. We drive the
+            // Journal phase ourselves (the audit walker doesn't know
+            // whether the FFI shim asked for replay).
+            if opts_ref.replay_journal != 0 {
+                emit_progress(crate::fsck::FsckPhase::Journal, 0, 1);
+                if let Err(e) = fs_ref.replay_journal_if_dirty() {
+                    set_err_from(&e, "fsck: replay_journal_if_dirty");
+                    return -1;
+                }
+                emit_progress(crate::fsck::FsckPhase::Journal, 1, 1);
+            }
+
+            // Map opts.max_* (0 = unbounded → u32::MAX).
+            let max_dirs = if opts_ref.max_dirs == 0 {
+                u32::MAX
+            } else {
+                opts_ref.max_dirs
+            };
+            let max_entries = if opts_ref.max_entries_per_dir == 0 {
+                u32::MAX
+            } else {
+                opts_ref.max_entries_per_dir
+            };
+
+            // Helper: push a finding through the C callback (if set).
+            let emit_finding = |a: &crate::fsck::Anomaly| {
+                if let Some(cb) = finding_cb {
+                    let (kind, ino, detail) = anomaly_to_capi(a);
+                    // Both strings are static / format!-derived ASCII, no
+                    // interior NUL — CString::new can't fail here, but we
+                    // still fall back gracefully if it ever does.
+                    let kind_c = CString::new(kind).unwrap_or_else(|_| CString::new("?").unwrap());
+                    let detail_c =
+                        CString::new(detail).unwrap_or_else(|_| CString::new("").unwrap());
+                    // Safety: callbacks run synchronously; the CStrings
+                    // outlive the call because they're local stack vars.
+                    cb(ctx, kind_c.as_ptr(), ino, detail_c.as_ptr());
+                }
+            };
+
+            let result = crate::fsck::audit_with_callbacks(
+                fs_ref,
+                max_dirs,
+                max_entries,
+                emit_progress,
+                emit_finding,
+            );
+
+            match result {
+                Ok(audit_report) => {
+                    report_out.inodes_visited = audit_report.inodes_visited as u64;
+                    report_out.directories_scanned = audit_report.directories_scanned as u64;
+                    report_out.entries_scanned = audit_report.entries_scanned;
+                    report_out.anomalies_found = audit_report.anomalies_count;
+                    // dirty_cleared stays 0 in the read-only MVP.
+                    0
+                }
+                Err(e) => {
+                    set_err_from(&e, "fsck: audit");
                     -1
                 }
             }
