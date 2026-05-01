@@ -58,6 +58,26 @@ impl Filesystem {
     /// When `RO_COMPAT_METADATA_CSUM` is set, the superblock checksum is
     /// verified — failure aborts the mount with `Error::BadChecksum`.
     pub fn mount(dev: Arc<dyn BlockDevice>) -> Result<Self> {
+        Self::mount_inner(dev, false)
+    }
+
+    /// Like `mount`, but skips the mount-time journal replay even when the
+    /// device is writable. The caller is responsible for invoking
+    /// [`Filesystem::replay_journal_if_dirty`] once the underlying write
+    /// path is actually ready to service writes (e.g. in the FSKit case the
+    /// kernel-level write FD on `FSBlockDeviceResource` only becomes
+    /// writable AFTER `loadResource` returns successfully — replaying mid-
+    /// `loadResource` produces EIO).
+    ///
+    /// Until replay runs, reads observe the on-disk pre-replay state and
+    /// any write through this handle will fail (the journal still says
+    /// dirty). This is the lazy/deferred-replay sibling of `mount`; for
+    /// most callers `mount` is correct.
+    pub fn mount_lazy(dev: Arc<dyn BlockDevice>) -> Result<Self> {
+        Self::mount_inner(dev, true)
+    }
+
+    fn mount_inner(dev: Arc<dyn BlockDevice>, defer_replay: bool) -> Result<Self> {
         let sb = Superblock::read(dev.as_ref())?;
         features::check_mountable(sb.feature_incompat, sb.feature_ro_compat)?;
         let csum = Checksummer::from_superblock(&sb);
@@ -76,7 +96,7 @@ impl Filesystem {
         // for read-only mounts — the read path tolerates a non-clean journal
         // (pending transactions are invisible, which is correct for a
         // read-only view).
-        if fs.dev.is_writable() {
+        if !defer_replay && fs.dev.is_writable() {
             // Best-effort: a replay failure here is logged via the returned
             // error but does NOT abort the mount, because many images have
             // cosmetic journal issues that shouldn't prevent read access.
@@ -85,6 +105,14 @@ impl Filesystem {
             crate::journal_apply::replay_if_dirty(&fs)?;
         }
         Ok(fs)
+    }
+
+    /// Run journal replay now if the journal is dirty. Idempotent — calling
+    /// this on a clean (or read-only) volume is a no-op that returns 0.
+    /// Designed to pair with [`Filesystem::mount_lazy`], but safe to call
+    /// on any handle.
+    pub fn replay_journal_if_dirty(&self) -> Result<usize> {
+        crate::journal_apply::replay_if_dirty(self)
     }
 
     /// Read a whole block by its logical block number.

@@ -501,6 +501,139 @@ unsafe fn mount_rw_with_callbacks_inner(cfg: *const fs_ext4_blockdev_cfg_t) -> *
     }
 }
 
+/// Mount RW via callbacks WITHOUT performing journal replay automatically.
+/// Same semantics as `fs_ext4_mount_rw_with_callbacks` except a dirty
+/// journal is recorded but NOT replayed during this call. Use this when
+/// the consumer is in a context where its write callback can't service
+/// writes yet (e.g. inside FSKit's `loadResource`, before the kernel opens
+/// the writable FD on `FSBlockDeviceResource`).
+///
+/// After mount, call `fs_ext4_replay_journal_if_dirty(fs)` once the
+/// consumer's write path is ready.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_mount_rw_with_callbacks_lazy(
+    cfg: *const fs_ext4_blockdev_cfg_t,
+) -> *mut fs_ext4_fs_t {
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| mount_rw_with_callbacks_lazy_inner(cfg)),
+    )
+}
+
+unsafe fn mount_rw_with_callbacks_lazy_inner(
+    cfg: *const fs_ext4_blockdev_cfg_t,
+) -> *mut fs_ext4_fs_t {
+    clear_last_error();
+    if cfg.is_null() {
+        set_err_msg("null cfg", EINVAL);
+        return std::ptr::null_mut();
+    }
+    let cfg = &*cfg;
+    let Some(read_fn) = cfg.read else {
+        set_err_msg("cfg.read is null", EINVAL);
+        return std::ptr::null_mut();
+    };
+    let Some(write_fn) = cfg.write else {
+        set_err_msg("cfg.write is null (required for RW callback mount)", EINVAL);
+        return std::ptr::null_mut();
+    };
+    let flush_fn = cfg.flush;
+
+    let ctx_addr = cfg.context as usize;
+    let size = cfg.size_bytes;
+
+    let read_closure = move |offset: u64, buf: &mut [u8]| -> std::io::Result<()> {
+        let rc = unsafe {
+            read_fn(
+                ctx_addr as *mut c_void,
+                buf.as_mut_ptr() as *mut c_void,
+                offset,
+                buf.len() as u64,
+            )
+        };
+        if rc != 0 {
+            Err(std::io::Error::other(format!(
+                "read callback returned {rc}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let write_closure = move |offset: u64, buf: &[u8]| -> std::io::Result<()> {
+        let rc = unsafe {
+            write_fn(
+                ctx_addr as *mut c_void,
+                buf.as_ptr() as *const c_void,
+                offset,
+                buf.len() as u64,
+            )
+        };
+        if rc != 0 {
+            Err(std::io::Error::other(format!(
+                "write callback returned {rc}"
+            )))
+        } else {
+            Ok(())
+        }
+    };
+    let flush_closure: Option<crate::block_io::FlushCb> = flush_fn.map(|f| {
+        let cb: crate::block_io::FlushCb = Box::new(move || -> std::io::Result<()> {
+            let rc = unsafe { f(ctx_addr as *mut c_void) };
+            if rc != 0 {
+                Err(std::io::Error::other(format!(
+                    "flush callback returned {rc}"
+                )))
+            } else {
+                Ok(())
+            }
+        });
+        cb
+    });
+
+    let dev = CallbackDevice {
+        size,
+        read: Box::new(read_closure),
+        write: Some(Box::new(write_closure)),
+        flush: flush_closure,
+    };
+
+    match Filesystem::mount_lazy(Arc::new(dev) as Arc<dyn BlockDevice>) {
+        Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
+        Err(e) => {
+            set_err_from(&e, "mount_rw_lazy (callback)");
+            std::ptr::null_mut()
+        }
+    }
+}
+
+/// Replay the JBD2 journal on `fs` now if it is dirty. Idempotent — safe to
+/// call on a clean volume (returns 0, performs no writes). Returns 0 on
+/// success or already-clean, -1 on failure (call `fs_ext4_last_error` /
+/// `fs_ext4_last_errno` for details). Pairs with
+/// `fs_ext4_mount_rw_with_callbacks_lazy`; calling this on a handle that
+/// was eager-mounted is a no-op (journal already clean) and returns 0.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_replay_journal_if_dirty(fs: *mut fs_ext4_fs_t) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() {
+                set_err_msg("null fs handle", EINVAL);
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            match fs_ref.replay_journal_if_dirty() {
+                Ok(_) => 0,
+                Err(e) => {
+                    set_err_from(&e, "replay_journal_if_dirty");
+                    -1
+                }
+            }
+        }),
+    )
+}
+
 /// Unmount and free the filesystem handle.
 #[no_mangle]
 pub unsafe extern "C" fn fs_ext4_umount(fs: *mut fs_ext4_fs_t) {

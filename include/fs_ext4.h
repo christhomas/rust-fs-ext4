@@ -163,6 +163,35 @@ fs_ext4_fs_t *fs_ext4_mount_rw_with_callbacks(
     const fs_ext4_blockdev_cfg_t *cfg);
 
 /*
+ * Mount RW via callbacks WITHOUT performing journal replay automatically.
+ * Same semantics as `fs_ext4_mount_rw_with_callbacks` except a dirty
+ * journal is recorded but NOT replayed during this call. Use this when
+ * the consumer is in a context where its write callback can't service
+ * writes yet (e.g. inside FSKit's loadResource, before the kernel opens
+ * the writable FD on FSBlockDeviceResource).
+ *
+ * After mount, call `fs_ext4_replay_journal_if_dirty(fs)` once the
+ * consumer's write path is ready. Until journal replay runs, the
+ * mounted state may reflect a partially-applied journal — readers
+ * see what's on disk, not the post-replay view. Writes through the
+ * crate will fail until replay completes.
+ *
+ * Returns NULL on failure (cfg->read or cfg->write NULL, etc).
+ */
+fs_ext4_fs_t *fs_ext4_mount_rw_with_callbacks_lazy(
+    const fs_ext4_blockdev_cfg_t *cfg);
+
+/*
+ * If the volume's journal is dirty, replay it now. Idempotent — safe
+ * to call when clean (returns 0, no writes). Returns 0 on success or
+ * already-clean, -1 on failure (call fs_ext4_last_error / _last_errno
+ * for details). The handle must have been mounted via the `_lazy`
+ * variant above; calling on a handle from the eager mount is a no-op
+ * and returns 0.
+ */
+int fs_ext4_replay_journal_if_dirty(fs_ext4_fs_t *fs);
+
+/*
  * Unmount and free all resources.
  */
 void fs_ext4_umount(fs_ext4_fs_t *fs);
