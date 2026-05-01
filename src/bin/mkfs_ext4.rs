@@ -1,0 +1,213 @@
+//! mkfs.ext4 — standalone CLI for creating fresh ext4 filesystems.
+//!
+//! Linux-CLI-compatible subset of e2fsprogs' `mkfs.ext4`. Same flag names
+//! and the same positional `device` argument so existing scripts /
+//! Makefiles / CI pipelines work against this binary unchanged.
+//!
+//! Cross-platform: pure Rust, no OS-specific syscalls beyond `open` /
+//! `seek` / `write` (all via std::fs). Builds and runs identically on
+//! Linux, macOS, Windows. The same `format_filesystem()` entry point is
+//! also called by the DiskJockey FSKit extension's `startFormat`, so
+//! "format an SD card from the GUI" and "format a disk image from this
+//! CLI" exercise the exact same code path.
+//!
+//! Convention follows e2fsprogs: the device/file MUST already exist at
+//! the target size. Use `truncate -s 64M out.img` (Linux/macOS) or
+//! `fsutil file createnew out.img 67108864` (Windows) to pre-create an
+//! image, then `mkfs.ext4 out.img` formats it.
+//!
+//! Exit codes: 0 success, 1 any failure (matches e2fsprogs convention).
+
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::mkfs::format_filesystem;
+use std::process::ExitCode;
+
+const USAGE: &str = "\
+Usage: mkfs.ext4 [options] device
+
+Options:
+  -L <label>        Volume label (max 16 bytes UTF-8).
+  -b <size>         Block size in bytes. Power of 2, 1024..=65536. Default: 4096.
+  -U <uuid>         Volume UUID (32 hex chars, dashes optional). Default: random.
+  -F                Force; format even if device looks in use. (Accepted; we do
+                    not currently inspect for active mounts.)
+  -n                Dry-run: parse args + open device but do not write.
+  -q                Quiet (suppress non-error output).
+  -V, --version     Print version and exit.
+  -h, --help        Print this help and exit.
+
+Positional:
+  device            Path to a block device or pre-sized regular file. The
+                    file/device MUST already exist at the target size; this
+                    tool does not grow files. Pre-create with
+                      truncate -s 64M out.img    (Linux/macOS)
+                      fsutil file createnew out.img 67108864    (Windows)
+
+Unsupported flags from e2fsprogs are accepted with a warning if they take an
+argument we can ignore safely (-m, -N, -i), and rejected as errors otherwise.
+The full feature set will land incrementally as the underlying crate grows.
+";
+
+fn main() -> ExitCode {
+    match run() {
+        Ok(()) => ExitCode::SUCCESS,
+        Err(msg) => {
+            eprintln!("mkfs.ext4: {msg}");
+            ExitCode::FAILURE
+        }
+    }
+}
+
+#[derive(Default)]
+struct Opts {
+    label: Option<String>,
+    block_size: Option<u32>,
+    uuid: Option<[u8; 16]>,
+    force: bool,
+    dry_run: bool,
+    quiet: bool,
+    device: Option<String>,
+}
+
+fn run() -> Result<(), String> {
+    let opts = parse_args()?;
+    let device = opts
+        .device
+        .as_deref()
+        .ok_or_else(|| format!("missing positional <device> argument\n\n{USAGE}"))?;
+
+    let block_size = opts.block_size.unwrap_or(4096);
+
+    // Open RW first so we both fail fast on permission and learn the device
+    // size without a separate stat call (FileDevice caches it).
+    let dev =
+        FileDevice::open_rw(device).map_err(|e| format!("open {device} read-write: {e:?}"))?;
+    let size = dev.size_bytes();
+    if size == 0 {
+        return Err(format!(
+            "device {device} reports size 0 — pre-create with truncate / fsutil first"
+        ));
+    }
+
+    if !opts.quiet {
+        eprintln!(
+            "mkfs.ext4: formatting {device} ({size} bytes, block_size={block_size}{})",
+            if opts.dry_run { ", dry-run" } else { "" }
+        );
+    }
+
+    if opts.dry_run {
+        if !opts.quiet {
+            eprintln!("mkfs.ext4: dry-run — no writes performed");
+        }
+        let _ = opts.force; // suppress unused warning when neither path uses it
+        return Ok(());
+    }
+
+    format_filesystem(&dev, opts.label.as_deref(), opts.uuid, size, block_size)
+        .map_err(|e| format!("format failed: {e:?}"))?;
+
+    // Flush so the file's bytes hit the underlying storage before exit —
+    // without this a fast caller (`mkfs && mount`) can race the kernel
+    // page cache.
+    dev.flush().map_err(|e| format!("flush failed: {e:?}"))?;
+
+    if !opts.quiet {
+        eprintln!("mkfs.ext4: {device} formatted successfully");
+    }
+    Ok(())
+}
+
+/// Parse CLI args. Hand-rolled to keep the dep tree at zero — pulling in
+/// clap just to handle ten flags would more than double the binary size.
+fn parse_args() -> Result<Opts, String> {
+    let mut opts = Opts::default();
+    let mut args = std::env::args().skip(1).peekable();
+
+    while let Some(arg) = args.next() {
+        match arg.as_str() {
+            "-h" | "--help" => {
+                print!("{USAGE}");
+                std::process::exit(0);
+            }
+            "-V" | "--version" => {
+                println!("mkfs.ext4 (fs-ext4) {}", env!("CARGO_PKG_VERSION"));
+                std::process::exit(0);
+            }
+            "-L" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "-L requires a label argument".to_string())?;
+                if v.len() > 16 {
+                    return Err(format!(
+                        "label too long ({} bytes); ext4 max is 16 bytes UTF-8",
+                        v.len()
+                    ));
+                }
+                opts.label = Some(v);
+            }
+            "-b" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "-b requires a block size argument".to_string())?;
+                let n: u32 = v
+                    .parse()
+                    .map_err(|_| format!("-b: not a valid number: {v}"))?;
+                opts.block_size = Some(n);
+            }
+            "-U" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| "-U requires a UUID argument".to_string())?;
+                opts.uuid = Some(parse_uuid(&v)?);
+            }
+            "-F" => opts.force = true,
+            "-n" => opts.dry_run = true,
+            "-q" => opts.quiet = true,
+            // Accepted-but-ignored e2fsprogs flags. Each takes one argument.
+            // Warn on first encounter so users don't think the value was
+            // honored, but don't fail — keeps existing scripts portable.
+            "-m" | "-N" | "-i" | "-c" | "-E" | "-O" | "-T" => {
+                let v = args
+                    .next()
+                    .ok_or_else(|| format!("{arg} requires an argument"))?;
+                if !opts.quiet {
+                    eprintln!("mkfs.ext4: warning: {arg} {v} not yet honored, ignoring");
+                }
+            }
+            other if other.starts_with('-') => {
+                return Err(format!("unknown flag: {other}\n\n{USAGE}"));
+            }
+            // First non-flag positional is the device path. Reject duplicates
+            // because mkfs.ext4 only formats one target per invocation.
+            _ => {
+                if opts.device.is_some() {
+                    return Err(format!(
+                        "extra positional argument: {arg} (only one device may be given)"
+                    ));
+                }
+                opts.device = Some(arg);
+            }
+        }
+    }
+
+    Ok(opts)
+}
+
+/// Parse a UUID from its standard text form. Accepts both with-dashes
+/// (8-4-4-4-12) and bare-32-hex variants — same as e2fsprogs.
+fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
+    let cleaned: String = s.chars().filter(|c| *c != '-').collect();
+    if cleaned.len() != 32 {
+        return Err(format!(
+            "UUID must be 32 hex chars (with optional dashes), got {} chars",
+            cleaned.len()
+        ));
+    }
+    let mut out = [0u8; 16];
+    for i in 0..16 {
+        out[i] = u8::from_str_radix(&cleaned[i * 2..i * 2 + 2], 16)
+            .map_err(|_| format!("UUID has non-hex character near position {}", i * 2))?;
+    }
+    Ok(out)
+}

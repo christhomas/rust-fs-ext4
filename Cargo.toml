@@ -10,6 +10,20 @@ repository = "https://github.com/christhomas/rust-fs-ext4"
 name = "fs_ext4"
 crate-type = ["staticlib", "rlib"]
 
+# Standalone CLI tool. Cross-platform — builds + runs identically on
+# Linux/macOS/Windows because it only depends on this crate's own
+# pure-Rust format path. Distributed via Homebrew tap on macOS and
+# `cargo install` everywhere; the DiskJockey app does NOT bundle this
+# binary (App Store rules forbid bundling CLI tools), it routes through
+# FSKit's startFormat which calls the same format_filesystem() entry.
+#
+# Binary name uses underscore — Cargo's bin name field doesn't accept
+# dots. Homebrew formula symlinks /usr/local/bin/mkfs.ext4 → mkfs_ext4
+# at install time so the user-visible command matches Linux convention.
+[[bin]]
+name = "mkfs_ext4"
+path = "src/bin/mkfs_ext4.rs"
+
 [dependencies]
 crc32c = "0.6"
 bitflags = "2"
