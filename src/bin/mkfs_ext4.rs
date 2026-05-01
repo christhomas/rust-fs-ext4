@@ -104,17 +104,27 @@ fn run() -> Result<(), String> {
     if let Some(n) = opts.create_size {
         match std::fs::metadata(device) {
             Ok(meta) => {
-                use std::os::unix::fs::FileTypeExt;
                 let ft = meta.file_type();
-                if ft.is_block_device() || ft.is_char_device() {
-                    return Err(format!(
-                        "--create-size refuses to apply to {device}: looks like a real block/char device, \
-                         not a regular file. Did you mean to leave --create-size off?"
-                    ));
+                // Block/char-device check is Unix-only — Windows
+                // doesn't expose /dev/diskN-style raw devices through
+                // std::fs (block-level access uses different APIs).
+                // On Windows the safety guard is just "must be a
+                // regular file"; on Unix we additionally refuse real
+                // block/char devices so a typo'd `--create-size 32M
+                // /dev/disk5` can't sail through.
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::FileTypeExt;
+                    if ft.is_block_device() || ft.is_char_device() {
+                        return Err(format!(
+                            "--create-size refuses to apply to {device}: looks like a real block/char device, \
+                             not a regular file. Did you mean to leave --create-size off?"
+                        ));
+                    }
                 }
                 if !ft.is_file() {
                     return Err(format!(
-                        "--create-size: {device} exists but is neither a regular file nor a device"
+                        "--create-size: {device} exists but is not a regular file"
                     ));
                 }
                 // Regular file already there — leave it alone (idempotent).
