@@ -35,7 +35,10 @@ fn root_inode_parses() {
     );
     assert!(ino.links_count > 0, "root should have >= 1 link");
     assert!(ino.size > 0, "root dir size should be > 0");
-    assert!(ino.has_extents(), "modern ext4 formatter root must use extents");
+    assert!(
+        ino.has_extents(),
+        "modern ext4 formatter root must use extents"
+    );
     assert!(!ino.is_file());
     assert!(!ino.is_symlink());
 }
