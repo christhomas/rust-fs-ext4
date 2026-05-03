@@ -52,6 +52,7 @@ pub mod mkfs;
 pub mod path;
 pub mod superblock;
 pub mod transaction;
+pub mod verify;
 pub mod xattr;
 
 // C ABI exports — surface defined in `include/fs_ext4.h`.

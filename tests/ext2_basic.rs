@@ -15,6 +15,7 @@ use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::{Inode, InodeFlags};
 use fs_ext4::mkfs::format_filesystem_with_flavor;
+use fs_ext4::verify;
 use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
@@ -222,6 +223,18 @@ fn mkfs_ext2_then_write_and_read_back_each_tier() {
             "{name}: byte-for-byte content mismatch through ext2 indirect roundtrip"
         );
     }
+
+    // Final assertion: structural verifier must agree the volume is sane
+    // after every tier of writes. Catches regressions where the writer
+    // forgets to mark indirect-tree blocks as allocated, double-claims a
+    // physical block, or strands data outside any inode's reach.
+    let report = verify::verify(&fs).expect("verify walked the volume");
+    assert!(
+        report.is_clean(),
+        "structural verifier rejected the post-write volume: {}\nerrors:\n  {}",
+        report.summary(),
+        report.errors.join("\n  ")
+    );
 }
 
 /// `EXT4_FEATURE_COMPAT_HAS_JOURNAL` (bit 0x0004 in `feature_compat` at SB
