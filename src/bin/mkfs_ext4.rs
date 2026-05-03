@@ -1,8 +1,11 @@
 //! mkfs.ext4 — standalone CLI for creating fresh ext4 filesystems.
 //!
-//! Linux-CLI-compatible subset of the standard `mkfs.ext4`. Same flag names
-//! and the same positional `device` argument so existing scripts /
-//! Makefiles / CI pipelines work against this binary unchanged.
+//! Linux-CLI-compatible: same flag names and the same positional
+//! `device` argument as the conventional Linux ext4 formatter, so
+//! existing scripts / Makefiles / CI pipelines work against this binary
+//! unchanged. Independent implementation, written from the on-disk spec
+//! (kernel.org ext4 wiki + Carrier's *File System Forensic Analysis*);
+//! no derivation from any GPL prior-art codebase.
 //!
 //! Cross-platform: pure Rust, no OS-specific syscalls beyond `open` /
 //! `seek` / `write` (all via std::fs). Builds and runs identically on

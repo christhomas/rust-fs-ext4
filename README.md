@@ -1,88 +1,394 @@
-# ext4rs
+# fs-ext4 — pure-Rust ext2/3/4 driver
 
-Pure-Rust ext4 filesystem driver. Exposes a stable C ABI (`fs_ext4_*`)
-designed to be linked from C, C++, Go (via CGo), or any other
-language with FFI. Portable cargo crate — no platform-specific
-dependencies.
+Pure-Rust read/write driver for the ext2, ext3, and ext4 on-disk
+formats. Mounts disk images and block devices, journals writes
+through JBD2, replays the journal on dirty mounts, and exposes a
+stable C ABI (`fs_ext4_*`) so any FFI host (Swift/C/C++/Go/…) can
+link `libfs_ext4.a` and `#include "fs_ext4.h"`. MIT-licensed. Zero
+kernel calls; zero non-MIT/BSD/Apache dependencies; the only
+runtime crates are `crc32c` and `bitflags`.
 
-It is used in production by
-[DiskJockey](https://github.com/christhomas/diskjockey), but carries
-no coupling back to that project — any FFI host can consume it.
-
-## Origins
-
-ext4rs is an independent pure-Rust implementation of the ext4
-on-disk format. It is **not** a dependency wrapper — it has no
-runtime dependency on any other ext4 Rust crate or C library, only
-on `crc32c` + `bitflags`. The code draws research reference from
-[yuoo655/ext4_rs](https://github.com/yuoo655/ext4_rs) (MIT) and
-[lwext4](https://github.com/gkostka/lwext4) (BSD), both credited in
-the license section.
-
-## What this adds over the research references
-
-`yuoo655/ext4_rs` is a read-oriented port of lwext4 to Rust;
-`lwext4` is a C ext4 library intended for embedded use. Neither
-exposes a stable Rust-native C ABI shaped around generic FFI
-consumers, and both have gaps around mutation coverage + host
-integration. ext4rs keeps the on-disk knowledge but reshapes the
-surface:
-
-| Area | ext4rs | yuoo655/ext4_rs | lwext4 |
-|---|---|---|---|
-| Pure Rust, no `unsafe` in read path | ✓ | ✓ | n/a (C) |
-| Stable C ABI (`fs_ext4_*`, `fs_ext4.h`) | ✓ | ✗ | ✓ (different ABI) |
-| Thread-local error state with inferred errno | ✓ | ✗ | partial |
-| `mount_with_callbacks` (block-device callback transport) | ✓ | ✗ | ✗ |
-| Opt-in LRU block cache for remote/callback devices | ✓ (`CachingDevice`) | ✗ | ✗ |
-| Extent tree mutation (depth 0→1 promotion, depth-1 inserts) | ✓ | partial | ✓ |
-| `metadata_csum` + `csum_seed` verification on read *and* write | ✓ | partial | ✓ |
-| htree directory reads + writes | ✓ | ✓ | ✓ |
-| `rename` with POSIX semantics (`EEXIST`, `EINVAL` into own subtree) | ✓ | partial | partial |
-| `setxattr` / `removexattr` (in-inode) | ✓ | ✗ | ✓ |
-| `chmod` / `chown` / `utimens` via C ABI | ✓ | ✗ | ✓ |
-| Inline-data files (read + write) | ✓ | ✓ | ✓ |
-| JBD2 journal replay on mount | ✓ | ✗ | partial |
-| Read-only audit (`Filesystem::audit`, link counts, dangling entries) | ✓ | ✗ | ✗ |
-| Integration tests against ext4 formatter reference images (Alpine VM) | ✓ | ✗ | ✗ |
-
-Scope notes and known gaps are listed in the status table below.
+Used in production by [DiskJockey](https://github.com/christhomas/diskjockey)
+but carries no coupling back — any FFI host can consume it.
 
 ## Status
 
-| Capability | Status |
-|---|---|
-| Mount ext4 image or block device | done |
-| stat, readdir, read file | done |
-| readlink, listxattr, getxattr | done |
-| inline data, htree directories | done |
-| extent trees (leaf + single-level internal) | done |
-| checksum verification (metadata_csum, csum_seed) | done |
-| create, unlink, mkdir, rmdir | done |
-| rename (no-clobber, POSIX `EINVAL` into own subtree) | done |
-| hardlink, truncate (shrink), write file (replace body) | done |
-| multi-level extent tree mutation (depth 0→1 promotion + depth-1 inserts) | done |
-| multi-level extent tree mutation (depth ≥2, leaf-block split) | **not supported** |
-| sparse grow via truncate (i_size bump, reads return zeros) | done |
-| setxattr, removexattr (in-inode) | done (via `fs_ext4_setxattr` / `fs_ext4_removexattr`) |
-| setxattr/removexattr on external xattr block | **not supported** |
-| chmod, chown, utimens | done (via `fs_ext4_chmod` / `fs_ext4_chown` / `fs_ext4_utimens`) |
-| journaled transactions | partial (jbd2 replay; write path unjournaled) |
-| read-only fsck audit (link counts, dangling entries) | done (via `Filesystem::audit`) |
-| opt-in LRU block cache (for remote callback devices) | done (via `CachingDevice`) |
+Read/write driver for the common case across ext2, ext3, and ext4.
+Mount + read is exhaustive against the ext4 feature matrix we test
+against; write is journaled through JBD2 and crash-safe under
+fault-injection sweeps for every multi-block op the driver
+exposes. Specific gaps are listed under "What doesn't work" below.
 
-Roughly a read/write driver for the common case. Directories that have
-been promoted to depth 1 can keep growing up to their leaf block's
-capacity (~340 extents on a 4 KiB block); beyond that, or for sparse-
-file extension, are the known gaps. POSIX errnos are mapped through
-(`ENOENT`, `ENOTDIR`, `EISDIR`, `EINVAL`, `EEXIST`, `ENOTEMPTY`,
-`EROFS`, `ENAMETOOLONG`, `ENOTSUP`).
+- 814 tests passing — 186 lib unit tests + 628 integration tests
+  across 95 test binaries.
+- All 15 multi-block write ops (`5.2.1`–`5.2.15` of the write-support
+  plan) committed atomically through the JBD2 writer with explicit
+  crash-safety sweeps.
+- ext2 and ext3 RW are unlocked (Phase 9.1/9.2/Phase B) via the
+  same flavor-aware extent/indirect dispatcher.
+
+## Features
+
+### Read
+
+- Mount ext2 / ext3 / ext4 images and block devices (block sizes
+  1 KiB, 2 KiB, 4 KiB).
+- Inode parse with extra-fields support; `stat`, `readdir`,
+  `readlink`, `read`, `getxattr`, `listxattr`.
+- Extent trees (depth 0, depth 1, depth ≥ 2 read; uninitialized
+  extents present as zero on read).
+- Indirect-block trees (legacy ext2/3 — direct, indirect,
+  double-indirect, triple-indirect).
+- HTree directory traversal (legacy / `half_md4` / `tea` hash).
+- Inline data (≤ 60 bytes inline file body, plus inline xattr
+  overflow).
+- External xattr blocks; ACL attributes (`system.posix_acl_*`).
+- `metadata_csum` and `csum_seed` verification on every block that
+  has an on-disk checksum (superblock, BGD, inode table, dir tail,
+  extent tail, htree tail, xattr block, journal commit/descriptor
+  blocks).
+- JBD2 journal replay on mount: descriptor / commit / revoke
+  blocks all honoured, including v2 (csum-tail) format.
+- Read-only audit pass (`Filesystem::audit`) reconciles link
+  counts and reports dangling directory entries.
+- Optional LRU block cache (`CachingDevice`) for callback-mode
+  hosts where every read hits a remote/RPC boundary.
+
+### Write
+
+All mutating ops route through the same multi-block transaction
+buffer and commit atomically through `JournalWriter`:
+
+- `chmod`, `chown`, `utimens`, in-inode `setxattr` / `removexattr`.
+- `create`, `unlink`, `mkdir`, `rmdir`.
+- `link` (in-place), `symlink` (inline + slow path), `rename`
+  (POSIX semantics: `EEXIST` on no-clobber, `EINVAL` into own
+  subtree, cross-parent `..` updates).
+- `truncate` shrink and grow (sparse-grow leaves holes; reads
+  return zeros).
+- `setxattr` / `removexattr` on the external xattr block (alloc
+  on first overflow, free when the block becomes empty).
+- File replace (full-content overwrite via fresh extent allocation).
+- `fallocate(KEEP_SIZE)`, `fallocate(PUNCH_HOLE)`,
+  `fallocate(ZERO_RANGE)`.
+- Extent-tree mutation: depth 0 → 1 promotion and depth-1 inserts.
+
+Crash-safety guarantees: the four-fence JBD2 protocol
+(journal-write → dirty-flag → final-write → clean-flag) is enforced
+per transaction with an explicit flush between each fence. A
+post-remount state is always either pre-op or post-op — never
+torn. Pinned by parameterized fault-injection sweeps (see "Test
+contract" below).
+
+### Filesystem variants
+
+| Variant | Read | Write |
+|---|---|---|
+| ext2 | done | done (indirect-block extents, no journal) |
+| ext3 | done | done (indirect-block extents, JBD2) |
+| ext4 | done | done (extent trees, JBD2) |
+
+ext3 RW landed via Phase B's flavor-aware journal dispatch
+(`jbd2::journal_block_to_physical` and `JournalWriter::open`
+both branch on `EXTENTS_FL`). ext2 has no journal but otherwise
+shares the same write helpers.
+
+## What works
+
+Per-operation, on a clean image:
+
+- `mount` / `mount_rw` / `mount_with_callbacks` /
+  `mount_rw_with_callbacks` / `mount_rw_with_callbacks_lazy`
+  (lazy variant defers journal replay).
+- `stat`, `readdir`, `readlink`, `read`.
+- `getxattr`, `listxattr`, `setxattr` (in-inode + external block),
+  `removexattr` (in-inode + external block).
+- `chmod`, `chown`, `utimens`.
+- `create`, `unlink`, `mkdir`, `rmdir`, `link`, `symlink`, `rename`.
+- `truncate` (shrink and grow).
+- `write` (replace-content; allocates fresh extents and frees old
+  ones in one journaled transaction).
+- `fallocate(KEEP_SIZE)`, `fallocate(PUNCH_HOLE)`,
+  `fallocate(ZERO_RANGE)`.
+- `audit` (read-only fsck — link counts, dangling entries).
+- `fsck_run` (callback-mode audit exposed through the C ABI).
+- `format_filesystem` (in-process `mkfs` — same entry FFI hosts
+  call when the user formats a fresh volume).
+
+## What doesn't work
+
+Honest gap list — pulled from `docs/ext4-full-write-support.md`
+and the in-tree TODOs:
+
+- **Extent-tree depth ≥ 2 mutation.** Read works; write refuses
+  with a structured error in `extent_mut.rs`. Phase 4 of the
+  write-support plan covers the design (`docs/extent-tree-depth2-design.md`).
+- **HTree internal split.** Leaf split is implemented; once a
+  directory grows past the depth-1 leaf-block capacity (~340
+  extents on 4 KiB blocks), further inserts return `ENOSPC`-shaped
+  errors.
+- **`extend_dir_and_add_entry` buffer-twin.** The fallback path
+  used when an in-place dir-entry insert can't fit still does
+  direct disk writes rather than going through `BlockBuffer`.
+  Refactor pending (~150 LoC of `plan_promote_leaf` adaptation).
+- **JBD2 journal modes.** The writer effectively runs `data=ordered`
+  semantics today; `data=writeback` and `data=journal` are not
+  selectable.
+- **Orphan-list inserts on still-open unlink.** The driver
+  doesn't see open-fd state today; the host (FSKit / FUSE) would
+  need to plumb that through. Reads + replay of pre-existing
+  orphan chains *is* implemented.
+- **Casefold lookups.** The hash function is implemented in
+  `casefold.rs`; HTree wiring is not.
+- **fs-verity, fscrypt, project quota, user/group quota,
+  online-resize, mmap shared writes** — not implemented.
+- **EA refcount sharing on external xattr blocks** — single-owner
+  only; never shares (deferred until a consumer needs it).
+- **Indirect-path file replace is un-journaled.** The
+  indirect-block replace helper writes data blocks directly. Only
+  applies to ext2 mounts (which have no journal anyway) and
+  ext3 mounts that disable the journal.
+
+## Architecture
+
+The driver is split into read modules, write modules, and the
+JBD2 / transaction layer that ties them together.
+
+- **`block_io`** — `BlockDevice` trait. File-backed and
+  callback-backed implementations both live here; `CachingDevice`
+  wraps either for LRU read caching.
+- **`superblock`, `bgd`, `inode`, `features`** — on-disk parse +
+  validate. All reject malformed geometry with structured errors;
+  `cargo fuzz`-style harness in `tests/fuzz_smoke.rs` proves no
+  panic on truncated / zeroed / bit-flipped inputs.
+- **`extent.rs` vs `indirect.rs`** — the two ways an inode can
+  map logical blocks. Read paths dispatch on `EXTENTS_FL`
+  (`indirect::map_logical_any` / `extent::lookup`).
+- **`extent_mut.rs`, `indirect_mut.rs`** — mutation planners.
+  Compute "what the new tree would look like" without touching
+  the device, then hand the planned writes to a `BlockBuffer`.
+- **`BlockBuffer` (in `fs.rs`)** — accumulates bitmap, BGD, SB,
+  inode-table, dir-block, xattr-block, and payload-data
+  mutations for a single high-level op. `commit_block_buffer`
+  routes the whole buffer through `JournalWriter` when a journal
+  is present, falling back to direct writes when not.
+- **`JournalWriter` (`journal_writer.rs`)** — owns the JBD2
+  inode's extent map, allocates a fresh transaction slot,
+  emits descriptor + data + commit blocks with the four-fence
+  protocol, and rewrites the super-state to clean once the
+  final-write phase completes.
+- **`DeepReader`** — read-side helper that consults the
+  in-flight transaction's pending writes before going to disk,
+  so post-write reads inside the same transaction return the new
+  data.
+- **`verify.rs`** — structural verifier reconciling bitmap vs.
+  inode-tree-claimed blocks; used both in tests and in the
+  read-only audit FFI surface.
+- **`capi.rs`** — C ABI. Thread-local error state with errno
+  inference (`fs_ext4_last_error()`, `fs_ext4_last_errno()`);
+  `catch_unwind` fence at every entry so a panic in the Rust
+  interior never crosses the FFI boundary.
+
+Deeper write-up of each phase lives in `docs/`:
+
+- `docs/IMPROVEMENT-PLAN.md` — triaged stability / hardening backlog.
+- `docs/ext4-full-write-support.md` — the 9-phase write-feature plan
+  this README's roadmap mirrors.
+- `docs/extent-tree-depth2-design.md` — the index-block split design
+  for Phase 4.
+- `docs/TEST-DISKS.md` — fixture / feature coverage matrix.
+
+Spec sources: the on-disk format documentation on kernel.org's
+ext4 wiki, plus Carrier, *File System Forensic Analysis*
+(Addison-Wesley, 2005). Research-reference Rust/C code is
+[`yuoo655/ext4_rs`](https://github.com/yuoo655/ext4_rs) (MIT) and
+[`lwext4`](https://github.com/gkostka/lwext4) (BSD-2-Clause); both
+credited in the License section.
+
+## Test contract
+
+- **Lib unit tests:** 186 across 36 modules
+  (`alloc`, `bgd`, `block_cache`, `block_io`, `casefold`,
+  `checksum`, `dir`, `extent`, `extent_mut`, `features`, `fs`,
+  `hash`, `htree`, `htree_mut`, `indirect`, `indirect_mut`,
+  `inline_data`, `inode`, `jbd2`, `journal_apply`,
+  `journal_writer`, `mkfs`, `path`, `superblock`, `transaction`,
+  `verify`, `xattr`, …).
+- **Integration tests:** 628 across 95 test binaries in `tests/`,
+  covering every C ABI entry point, end-to-end mutation
+  round-trips, journaled-path regressions, htree large-dir
+  growth, ACL parse, large-dir HTree, deep-extent reads,
+  multi-tier indirect maps, ext2/3 RW round-trips, fuzz smoke,
+  fsck audit, orphan recovery, sparse-grow, fallocate variants,
+  and the cross-validators below.
+- **Crash-safety sweeps** (parameterized over 0..=N "drop the
+  next write" budgets, asserting post-remount state is always
+  either pre-op or post-op):
+  - `journal_writer_crash_safety.rs` — `chmod` (0..=20 budget).
+  - `journal_writer_crash_dir_ops.rs` — `create` /
+    `mkdir` / `link` / `symlink`.
+  - `journal_writer_crash_rename_write.rs` — `rename`,
+    file-replace, external xattr.
+  - `journal_writer_truncate_shrink.rs` — `truncate_shrink`
+    (0..=30 budget).
+  - `journal_writer_unlink_rmdir.rs` — `unlink` / `rmdir`
+    (0..=40 budget).
+  - `fallocate_crash_safety.rs` — KEEP_SIZE / PUNCH_HOLE /
+    ZERO_RANGE.
+  - `orphan_recovery_crash_safety.rs` — orphan replay budget sweep.
+- **Cross-validators:** `tests/lwext4_cross_validate.rs` (BSD-2-Clause
+  reference, opt-in via env flag — built as a library, never linked
+  by default); a FreeBSD-VM cross-validator (`tests/vagrant/freebsd/`,
+  `tests/qemu/`) is in flight.
+- **Structural verifier:** `crate::verify::verify` reconciles
+  the on-disk bitmap against every block claimed by the inode
+  tree; pinned by `tests/verify_basic.rs`, also runnable as a
+  post-mutation check from any integration test.
+
+## Roadmap
+
+Pulled from `docs/ext4-full-write-support.md` — items not yet
+ticked. Numbering follows the plan doc.
+
+- [ ] **3.5** EA refcount sharing on external xattr blocks.
+- [ ] **4.1–4.6** Extent-tree depth ≥ 2 mutation (index-block
+      split, recursive descent, merge-on-shrink, index csum).
+- [ ] **5.3.1–5.3.3** JBD2 journal modes (`data=ordered`
+      explicit / `data=writeback` / `data=journal`).
+- [ ] **6.3** Orphan-list insert on still-open unlink (gated on
+      host fd-tracking).
+- [ ] **6.4** Link-count audit auto-repair under a recovery
+      transaction.
+- [ ] **7.2** Checked arithmetic in remaining hot sites (rare in
+      practice; cosmetic).
+- [ ] **7.3** Full FFI input-validation sweep.
+- [ ] **7.4** Richer `Error` variants (cosmetic; `Corrupt(&str)`
+      carries enough context today).
+- [ ] **8.2** Cross-call extent-lookup memoization.
+- [ ] **8.4** Coalesce adjacent dirty blocks inside the
+      `BlockBuffer`.
+- [ ] **9.3** Casefold HTree wiring.
+- [ ] **9.4** Project quota.
+- [ ] **9.5** User/group disk quota.
+- [ ] **9.6** fs-verity.
+- [ ] **9.7** fscrypt v2.
+- [ ] **9.8** Online resize.
+- [ ] **9.9** mmap shared writes (host-integration dependent).
+- [ ] `extend_dir_and_add_entry` buffer-twin (the last direct-disk-write
+      helper inside the otherwise-buffered write path).
+
+## Changelog
+
+Highlights from the last 50 commits, grouped by date.
+
+### 2026-05-03 — Phase 1+3+5+6 rollup, ext2/3 RW, crash sweeps
+
+- `64d6e6b` crash-safety sweeps for the remaining multi-block ops.
+- `c800223` regression tests pinning rename / write / external-xattr
+  to the journaled path.
+- `a9fe115` Phase 5.2.5 / 5.2.10 / 5.2.15 — finish 5.2.x multi-block
+  journal coverage.
+- `7f51ece` Phase 5.2.9 + 5.2.14 — `unlink` + `rmdir` multi-block
+  journaled.
+- `455438d` Phase 5.2.8 / 5.2.11 / 5.2.12 / 5.2.13 — `create` / `link` /
+  `symlink` / `mkdir` journaled.
+- `165391c` Phase 5.2.6 `truncate_shrink` + multi-block tx
+  (introduces `BlockBuffer`).
+- `df526b5` Phase 1+3+5 write-path foundation — journaled writes,
+  external xattr blocks.
+- `5c4a2f8` Phase 2.3 + 2.4 — `fallocate` punch-hole + zero-range.
+- `77a9ef3` Phase 2.2 — `fallocate(FALLOC_FL_KEEP_SIZE)`.
+- `8edbd98` Phase 6.2 — orphan replay.
+- `92fdcb9` Phase 6.1 — orphan list parser.
+- `487eebd` Phase 6.2 crash-safety probe sweep.
+- `47dfc33` ext3 RW unlocked via flavor-aware journal dispatch
+  (Phase B).
+- `76b36d8` write `s_journal_inum` at 0xE0 (not 0xD8) so ext3 images
+  mount.
+- `58558ed` Phase 8.1 + 8.3 — LRU block cache + vectorized bitmap
+  scan.
+- `8140470` Phase 7.5 write-path fuzz coverage + clippy fix in
+  `verify.rs`.
+- `5a0bfdf` Phase 1.2 + Phase 4 design doc.
+- `1baa872` license sweep — scrub references to copyleft-licensed
+  Linux/NTFS tooling.
+- `9d2f2ff` `72bbad4` direct-qemu FreeBSD cross-validator scaffolding.
+
+### 2026-05-01 — `mkfs_ext4` binary, lazy replay, fsck FFI
+
+- `b788435` `54ec273` standalone `mkfs_ext4` binary
+  (`--create-size` for one-shot create+format).
+- `7f64a38` gate Unix-only `FileTypeExt` behind `cfg(unix)` for
+  Windows builds.
+- `987f8d5` `fs_ext4_mount_rw_with_callbacks_lazy` +
+  `fs_ext4_replay_journal_if_dirty` for deferred journal replay.
+- `2679e60` expose `fs_ext4_fsck_run` + `audit_with_callbacks`.
+- `60974c2` CI validation of the binary's output.
+
+### 2026-04-30 — Sandboxed RW callbacks
+
+- `f08ec2e` `fs_ext4_mount_rw_with_callbacks` for sandboxed FSKit
+  consumers.
+
+### 2026-04-22 — 0.1.3, pre-commit hook
+
+- `b182836` release 0.1.3.
+- `4352d37` pre-commit hook (`cargo fmt --check` + `clippy`).
+
+### 2026-04-20 — 0.1.1 / 0.1.2 releases
+
+- `8248ff4` 0.1.2: expose `s_state` via
+  `fs_ext4_volume_info_t.mounted_dirty`.
+- `47dfbb5` 0.1.1: docs rewrite, neutral framing, plain-English
+  disclaimer.
+
+### 2026-04-19 — Stability hardening, perf, fsck audit
+
+- `f8603e9` hard-cap extent tree depth; refuse cycles + spec
+  overflow.
+- `ed8223c` checked arithmetic on physical block offsets.
+- `b7f805f` reject malformed geometry; never panic.
+- `e1d2c82` `CachingDevice` — optional LRU read cache.
+- `c684481` word-at-a-time scan in `find_first_free`.
+- `c5ea3ba` memoize last extent across a single read call.
+- `1e9bda4` read-only link-count audit (`Filesystem::audit`).
+- `708dcff` fuzz-smoke harness (dir-walk, parser-fuzz,
+  exhaustive bit-flip).
+- `e1c18e6` IMPROVEMENT-PLAN.md — triaged gaps, phased roadmap.
+- `d731e71` pin `rust-toolchain` to 1.94.1.
+
+### 2026-04-18 — Crate rename, test-disk matrix
+
+- `a8bcaa4` rename crate `ext4rs` → `fs-ext4`, C ABI
+  `ext4rs_*` → `fs_ext4_*`.
+- `2af0108` add `TEST-DISKS.md` — feature coverage matrix.
+
+Full changelog in `CHANGELOG.md`.
+
+## License
+
+MIT — see [LICENSE](LICENSE). Copyright (c) 2026 Chris Thomas.
+
+Research references credited under their own licenses:
+
+- [`yuoo655/ext4_rs`](https://github.com/yuoo655/ext4_rs) — MIT.
+- [`lwext4`](https://github.com/gkostka/lwext4) — BSD-2-Clause.
+  Used opt-in as a cross-validator (`tests/lwext4_cross_validate.rs`),
+  never linked into the shipping binary.
+
+Spec sources: kernel.org ext4 wiki documentation; Carrier, *File
+System Forensic Analysis* (Addison-Wesley, 2005). The driver does
+not derive from any GPL/LGPL/AGPL source.
 
 ## Building
 
+Standard cargo:
+
 ```sh
 cargo build --release
-# produces target/release/libfs_ext4.a and the rlib
+# produces target/release/libfs_ext4.a (static lib for FFI consumers)
+#         + target/release/libfs_ext4.rlib
+#         + target/release/mkfs_ext4 (the standalone formatter binary)
 ```
 
 Cross-compile to a specific target the usual way:
@@ -90,16 +396,14 @@ Cross-compile to a specific target the usual way:
 ```sh
 cargo build --release --target aarch64-unknown-linux-gnu
 cargo build --release --target x86_64-pc-windows-gnu
-# … etc.
 ```
 
-Platform-specific packaging (e.g. macOS `lipo` to build a universal
-static archive, producing an Xcode `.xcframework`, or cross-compile
-matrices for a particular SDK) belongs in the consuming project.
-`ext4rs` itself stays portable cargo — it does not carry platform-
-specific build scripts.
+Platform-specific packaging (macOS `lipo` for a universal static
+archive, an Xcode `.xcframework`, deb/rpm/Homebrew formulae)
+belongs in the consuming project. `fs-ext4` itself stays portable
+cargo — no platform-specific build scripts.
 
-## Using from C
+### Using from C
 
 Link `libfs_ext4.a` and include `fs_ext4.h`:
 
@@ -122,11 +426,11 @@ fs_ext4_umount(fs);
 
 See `examples/capi_demo.rs` for the Rust-side equivalent.
 
-## Using from Rust
+### Using from Rust
 
 ```toml
 [dependencies]
-ext4rs = "0.1"
+fs-ext4 = "0.1"
 ```
 
 ```rust
@@ -136,30 +440,29 @@ let fs = Filesystem::mount("/path/to/disk.img")?;
 let attrs = fs.stat("/hello.txt")?;
 ```
 
-## Testing
+### Testing
 
 ```sh
 cargo test --release
 ```
 
 Integration tests use ext4 image fixtures under `test-disks/`.
-The fixtures are gitignored — regenerate them with:
+Fixtures are gitignored — regenerate them with:
 
 ```sh
 bash test-disks/build-ext4-feature-images.sh
 ```
 
-The generator runs standard formatter tools inside a
-short-lived Alpine Linux VM booted under `qemu-system-x86_64`, so
-the same script works on macOS, Linux, and in CI (no docker
-required). First run downloads the Alpine virt ISO + kernel (~75 MB,
-cached under `test-disks/.vm-cache/`).
+The generator runs standard formatter tools inside a short-lived
+Alpine Linux VM booted under `qemu-system-x86_64`, so the same
+script works on macOS, Linux, and in CI (no Docker required).
+First run downloads the Alpine virt ISO + kernel (~75 MB, cached
+under `test-disks/.vm-cache/`).
 
-## Git hooks
+### Git hooks
 
-One-time setup per clone, so every commit runs the same `cargo fmt
---check` + `cargo clippy` checks CI does and CI doesn't have to catch
-what your machine could have:
+One-time setup per clone, so every commit runs the same
+`cargo fmt --check` + `cargo clippy` checks CI does:
 
 ```sh
 ./scripts/install-hooks.sh
@@ -167,29 +470,23 @@ what your machine could have:
 
 Bypass a single commit with `git commit --no-verify`.
 
-## License
-
-MIT — see [LICENSE](LICENSE). Derives research from
-[yuoo655/ext4_rs](https://github.com/yuoo655/ext4_rs) (MIT) and
-[lwext4](https://github.com/gkostka/lwext4) (BSD).
-
 ## Disclaimer — use at your own risk
 
 **Read this before pointing the crate at anything you care about.**
 
 This is experimental filesystem code that reads *and writes* the
-on-disk structures of live filesystems. Bugs in this class of code
-can — and sooner or later will — corrupt or destroy data. The MIT
-license above already contains the standard no-warranty and
-limitation-of-liability clauses; this section restates them in
-plain English so there is no ambiguity about what you are agreeing
-to when you use the software.
+on-disk structures of live filesystems. Bugs in this class of
+code can — and sooner or later will — corrupt or destroy data.
+The MIT license above already contains the standard no-warranty
+and limitation-of-liability clauses; this section restates them
+in plain English so there is no ambiguity about what you are
+agreeing to when you use the software.
 
 **By using this software you accept that:**
 
-- The author(s) and contributors provide this crate **as is**, with
-  **no warranty of any kind**, express or implied — including but
-  not limited to warranties of merchantability, fitness for a
+- The author(s) and contributors provide this crate **as is**,
+  with **no warranty of any kind**, express or implied — including
+  but not limited to warranties of merchantability, fitness for a
   particular purpose, correctness, data integrity, durability,
   security, or non-infringement.
 - The author(s) and contributors are **not liable** for any loss,
@@ -200,12 +497,12 @@ to when you use the software.
   deadlines, support costs, or any direct, indirect, incidental,
   special, consequential, or punitive damages — regardless of the
   legal theory under which such damages might be sought.
-- You are **solely responsible** for backing up any data that could
-  be touched by this software *before* running it. The only safe
-  workflow when experimenting with an unofficial filesystem driver
-  is: work on disk *images* or on *copies*, never on your only
-  copy of anything irreplaceable.
+- You are **solely responsible** for backing up any data that
+  could be touched by this software *before* running it. The
+  only safe workflow when experimenting with an unofficial
+  filesystem driver is: work on disk *images* or on *copies*,
+  never on your only copy of anything irreplaceable.
 - If that is not acceptable to you, **do not use this software**.
 
-This disclaimer is a plain-English restatement of the license terms
-above, not a separate license. The license terms apply in full.
+This disclaimer is a plain-English restatement of the license
+terms above, not a separate license. The license terms apply in full.
