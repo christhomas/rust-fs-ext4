@@ -81,6 +81,37 @@ impl IndirectCache {
     }
 }
 
+/// Flavor-aware logical→physical block lookup for any inode regardless of
+/// block-mapping scheme. Dispatches on `EXT4_EXTENTS_FL` in `inode_flags`:
+///
+/// - flag set → traverses the extent tree via [`crate::extent::map_logical`]
+/// - flag absent → walks the legacy direct/indirect tree via [`lookup`]
+///
+/// Use this from any code that walks a generic inode's block map (directory
+/// scans, file reads outside the dedicated `file_io` paths, etc.). Without
+/// it, an ext2/3 inode with raw block pointers in `i_block` will be
+/// misparsed as a depth-0 extent header, returning
+/// `CorruptExtentTree("bad extent header magic")`.
+///
+/// The indirect path constructs a fresh single-entry block cache per call.
+/// Hot loops that need cross-call caching (sequential file reads) should
+/// instead branch manually on the flag and pass a long-lived
+/// [`IndirectCache`] into [`lookup`].
+pub fn map_logical_any(
+    i_block: &[u8; 60],
+    inode_flags: u32,
+    dev: &dyn BlockDevice,
+    block_size: u32,
+    logical_block: u64,
+) -> Result<Option<u64>> {
+    if (inode_flags & crate::inode::InodeFlags::EXTENTS.bits()) != 0 {
+        crate::extent::map_logical(i_block, dev, block_size, logical_block)
+    } else {
+        let mut cache = IndirectCache::new();
+        lookup(i_block, dev, block_size, logical_block, &mut cache)
+    }
+}
+
 /// Look up the physical block backing `logical_block` for an inode that uses
 /// the legacy direct/indirect scheme.
 ///

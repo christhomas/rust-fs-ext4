@@ -17,8 +17,8 @@
 use crate::block_io::BlockDevice;
 use crate::dir::{self, DirEntry};
 use crate::error::{Error, Result};
-use crate::extent;
 use crate::htree;
+use crate::indirect;
 use crate::inode::{Inode, InodeFlags};
 use crate::superblock::Superblock;
 
@@ -97,9 +97,9 @@ fn find_entry(
     name: &[u8],
     csum: &crate::checksum::Checksummer,
 ) -> Result<u32> {
-    if !dir_inode.has_extents() {
-        return Err(Error::Corrupt("legacy (non-extent) dirs not yet supported"));
-    }
+    // Both extent-backed and legacy direct/indirect-backed directories are
+    // supported here — `find_entry_linear` and `find_entry_htree` use
+    // `indirect::map_logical_any` for flavor-aware logical→physical mapping.
     if dir_inode.has_inline_data() {
         return find_inline(dir_inode, name);
     }
@@ -148,7 +148,13 @@ fn find_entry_linear(
 
     let mut block = vec![0u8; block_size as usize];
     for logical in 0..total_blocks {
-        let phys = match extent::map_logical(&dir_inode.block, dev, block_size, logical)? {
+        let phys = match indirect::map_logical_any(
+            &dir_inode.block,
+            dir_inode.flags,
+            dev,
+            block_size,
+            logical,
+        )? {
             Some(p) => p,
             None => continue,
         };
@@ -192,20 +198,29 @@ fn find_entry_htree(
 ) -> Result<Option<u32>> {
     let block_size = sb.block_size();
 
-    // Read logical block 0 of the directory: the dx_root.
-    let phys0 = match extent::map_logical(&dir_inode.block, dev, block_size, 0)? {
-        Some(p) => p,
-        None => return Ok(None),
-    };
+    // Read logical block 0 of the directory: the dx_root. Flavor-aware
+    // dispatch — htree directories on ext2/3 (rare but legal) use the
+    // legacy block-map scheme, not extents.
+    let phys0 =
+        match indirect::map_logical_any(&dir_inode.block, dir_inode.flags, dev, block_size, 0)? {
+            Some(p) => p,
+            None => return Ok(None),
+        };
     let mut root_block = vec![0u8; block_size as usize];
     dev.read_at(phys0 * block_size as u64, &mut root_block)?;
 
     // Walk the htree. lookup_leaf needs a closure for reading further dx
-    // blocks (intermediate nodes); we map logical->physical via the inode's
-    // extent tree.
+    // blocks (intermediate nodes); we map logical→physical via whichever
+    // block-map scheme the dir's inode uses.
     let read_dx_block = |logical: u32| -> Result<Vec<u8>> {
-        let phys = extent::map_logical(&dir_inode.block, dev, block_size, logical as u64)?
-            .ok_or(Error::CorruptDirEntry("htree pointed at sparse block"))?;
+        let phys = indirect::map_logical_any(
+            &dir_inode.block,
+            dir_inode.flags,
+            dev,
+            block_size,
+            logical as u64,
+        )?
+        .ok_or(Error::CorruptDirEntry("htree pointed at sparse block"))?;
         let mut buf = vec![0u8; block_size as usize];
         dev.read_at(phys * block_size as u64, &mut buf)?;
         Ok(buf)
@@ -217,8 +232,14 @@ fn find_entry_htree(
     };
 
     // Read the leaf block and linear-scan it for the name.
-    let phys = extent::map_logical(&dir_inode.block, dev, block_size, leaf_logical as u64)?
-        .ok_or(Error::CorruptDirEntry("htree leaf at sparse block"))?;
+    let phys = indirect::map_logical_any(
+        &dir_inode.block,
+        dir_inode.flags,
+        dev,
+        block_size,
+        leaf_logical as u64,
+    )?
+    .ok_or(Error::CorruptDirEntry("htree leaf at sparse block"))?;
     let mut leaf = vec![0u8; block_size as usize];
     dev.read_at(phys * block_size as u64, &mut leaf)?;
 
@@ -272,6 +293,7 @@ mod tests {
     use super::*;
     use crate::bgd;
     use crate::block_io::FileDevice;
+    use crate::extent;
     use crate::fs::Filesystem;
     use std::sync::Arc;
 

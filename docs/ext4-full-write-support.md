@@ -190,7 +190,16 @@ Each existing mutating fn gains a transaction:
   still does direct `dev.write_at` for the xattr block itself; needs a
   multi-block transaction (xattr block + inode + bitmap + BGD + SB).
   Inode write on the same op IS journaled via `bump_inode_ctime`.
-- [ ] **5.2.6 `apply_truncate_shrink`**
+- [x] **5.2.6 `apply_truncate_shrink`** — refactored as a multi-block
+  journaled transaction. New `BlockBuffer` type accumulates inode +
+  bitmap + BGD + SB mutations via `buffer_*` helpers
+  (`buffer_free_block_run_and_bgd`, `buffer_patch_bgd_counters`,
+  `buffer_patch_sb_counters`, `buffer_write_inode`). The whole buffer
+  commits atomically through `commit_block_buffer` (journal when
+  available, direct writes otherwise). Pinned by
+  `tests/journal_writer_truncate_shrink.rs` including a 0..=30 budget
+  sweep that proves crash atomicity (size is always either original
+  or target, never torn).
 - [x] **5.2.7 `apply_truncate_grow`** — same `commit_inode_write` route.
 
 All four single-inode ops (chmod, chown, utimens, in-inode setxattr,

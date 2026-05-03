@@ -7,7 +7,47 @@ use crate::error::{Error, Result};
 use crate::features;
 use crate::inode::Inode;
 use crate::superblock::Superblock;
+use std::collections::BTreeMap;
 use std::sync::Arc;
+
+/// In-memory accumulator for journaled multi-block writes. Each helper
+/// mutation reads the latest version of a block (from this buffer if
+/// already touched, else from disk via the live `Filesystem`) and writes
+/// back into the buffer. The op then commits the whole buffer atomically.
+///
+/// `BTreeMap` so the commit order is deterministic — replay applies
+/// blocks in journal-stored order, which is what e2fsck expects.
+pub(crate) struct BlockBuffer {
+    pub block_size: u32,
+    pub dirty: BTreeMap<u64, Vec<u8>>,
+}
+
+impl BlockBuffer {
+    pub fn new(block_size: u32) -> Self {
+        Self {
+            block_size,
+            dirty: BTreeMap::new(),
+        }
+    }
+
+    /// Fetch a mutable handle to `block`, loading from `fs` on first
+    /// touch. Subsequent calls for the same block return the in-buffer
+    /// copy so multiple helpers can compose patches.
+    pub fn get_mut(&mut self, fs: &Filesystem, block: u64) -> Result<&mut Vec<u8>> {
+        if let std::collections::btree_map::Entry::Vacant(e) = self.dirty.entry(block) {
+            let buf = fs.read_block(block)?;
+            e.insert(buf);
+        }
+        Ok(self.dirty.get_mut(&block).unwrap())
+    }
+
+    /// Stage an already-built block image directly (no read-modify cycle).
+    /// Useful when the caller has the bytes in hand (e.g. data blocks of
+    /// a file write).
+    pub fn put(&mut self, block: u64, bytes: Vec<u8>) {
+        self.dirty.insert(block, bytes);
+    }
+}
 
 /// Split a `/a/b/c` path into (`/a/b`, `c`). Returns an error for empty or
 /// `"/"` paths (no basename to act on).
@@ -177,6 +217,38 @@ impl Filesystem {
         Ok((inode, raw))
     }
 
+    /// Map a logical block within `inode` to its physical block, choosing
+    /// between the extent tree and the legacy direct/indirect scheme based
+    /// on `EXT4_EXTENTS_FL`. Returns `None` for sparse holes and (for the
+    /// extent path) uninitialised extents — callers wanting zeros there
+    /// must handle the `None` case explicitly.
+    ///
+    /// This is the per-inode dispatcher every directory traversal /
+    /// extent-walking call site should use instead of touching
+    /// `extent::map_logical` directly — without it, an ext2/3 inode with
+    /// raw block pointers in `i_block` gets misparsed as an extent header
+    /// (yielding `CorruptExtentTree("bad extent header magic")`).
+    ///
+    /// The indirect path internally maintains its own block cache for the
+    /// duration of the call; sequential lookups via repeated calls don't
+    /// share that cache (file_io's read paths build a longer-lived cache
+    /// to amortize across blocks).
+    pub fn map_inode_logical(&self, inode: &Inode, logical_block: u64) -> Result<Option<u64>> {
+        let bs = self.sb.block_size();
+        if (inode.flags & crate::inode::InodeFlags::EXTENTS.bits()) != 0 {
+            crate::extent::map_logical(&inode.block, self.dev.as_ref(), bs, logical_block)
+        } else {
+            let mut cache = crate::indirect::IndirectCache::new();
+            crate::indirect::lookup(
+                &inode.block,
+                self.dev.as_ref(),
+                bs,
+                logical_block,
+                &mut cache,
+            )
+        }
+    }
+
     /// Write the given raw inode bytes back to disk. Read-only devices return
     /// the default `Error::Corrupt` from `BlockDevice::write_at`.
     ///
@@ -263,22 +335,22 @@ impl Filesystem {
             self.sb.block_size(),
         )?;
 
+        let bs = self.sb.block_size() as u64;
         let mut freed_sectors: u64 = 0;
         let mut freed_blocks: u64 = 0;
-        let bs = self.sb.block_size() as u64;
+
+        // Multi-block transaction: accumulate inode + bitmap + BGD + SB
+        // mutations into one buffer, commit through the journal atomically.
+        let mut buf = BlockBuffer::new(self.sb.block_size());
 
         for m in &muts {
             match m {
                 crate::extent_mut::ExtentMutation::WriteRoot { bytes } => {
-                    // Splice new 60-byte i_block into the inode image.
                     Self::patch_inode_block_area(&mut raw, bytes)?;
                 }
                 crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } => {
-                    // Free run + credit the containing group's BGD in one
-                    // step; SB is patched once below.
-                    freed_blocks += self.free_block_run_and_bgd(*start, *len as u64)?;
-                    // Each fs block is `bs / 512` 512-byte sectors for the
-                    // `i_blocks` counter.
+                    freed_blocks +=
+                        self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
                     freed_sectors += (*len as u64) * (bs / 512);
                 }
                 _ => {
@@ -289,32 +361,17 @@ impl Filesystem {
             }
         }
 
-        // Patch size + blocks_count in the inode image.
+        // Patch size + blocks_count in the inode image, finalize csum.
         let new_blocks = inode.blocks.saturating_sub(freed_sectors);
         Self::patch_inode_size_and_blocks(&mut raw, new_size, new_blocks)?;
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.buffer_write_inode(&mut buf, ino, &raw)?;
 
-        // Single SB credit covers all freed runs. Skipped when nothing was
-        // freed (e.g. shrink that only adjusts size within the tail extent).
         if freed_blocks > 0 {
-            self.patch_sb_counters(freed_blocks as i64, 0)?;
+            self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 0)?;
         }
 
-        // Write the inode back. Recompute + splice the inode checksum first
-        // so CSUM-enabled mounts see a valid inode on the next read.
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(ino, inode.generation, &raw)
-            {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
-        self.write_inode_raw(ino, &raw)?;
-        self.dev.flush()?;
-        Ok(())
+        self.commit_block_buffer(buf)
     }
 
     /// Extend a file to `new_size`. The new range is a sparse hole — ext4's
@@ -382,25 +439,236 @@ impl Filesystem {
     /// chmod, chown, utimens, and the in-place xattr ops once they're
     /// migrated to the journaled path.
     fn commit_inode_write(&self, ino: u32, new_inode_raw: &[u8]) -> Result<()> {
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+        self.buffer_write_inode(&mut buf, ino, new_inode_raw)?;
+        self.commit_block_buffer(buf)
+    }
+
+    // ----------------------------------------------------------------------
+    // BlockBuffer helpers (Phase 5.2 multi-block transactions)
+    // ----------------------------------------------------------------------
+    //
+    // These mirror the disk-touching helpers (free_block_run_and_bgd,
+    // patch_bgd_counters, patch_sb_counters, write_inode_raw) but operate
+    // on an in-memory BlockBuffer instead. A multi-block op accumulates
+    // its mutations into one buffer and commits the whole thing atomically
+    // — either through the journal writer (when present) or via a flush-
+    // gated direct-write fallback.
+
+    /// Splice a freshly-built inode into the inode-table block buffer.
+    pub(crate) fn buffer_write_inode(
+        &self,
+        buf: &mut BlockBuffer,
+        ino: u32,
+        inode_raw: &[u8],
+    ) -> Result<()> {
+        let (block, offset) = bgd::locate_inode(&self.sb, &self.groups, ino)?;
+        let it_buf = buf.get_mut(self, block)?;
+        let off = offset as usize;
+        it_buf[off..off + inode_raw.len()].copy_from_slice(inode_raw);
+        Ok(())
+    }
+
+    /// Buffer-side equivalent of `free_block_run_and_bgd`: clears the
+    /// bitmap bits AND patches the BGD counters in the buffer. Returns
+    /// `len` so callers can accumulate a running freed-block total to
+    /// feed to `buffer_patch_sb_counters`.
+    pub(crate) fn buffer_free_block_run_and_bgd(
+        &self,
+        buf: &mut BlockBuffer,
+        start: u64,
+        len: u64,
+    ) -> Result<u64> {
+        let bpg = self.sb.blocks_per_group as u64;
+        let first_data = self.sb.first_data_block as u64;
+        let gi = ((start - first_data) / bpg) as usize;
+        if gi >= self.groups.len() {
+            return Err(Error::InvalidBlock(start));
+        }
+        let group_start = first_data + gi as u64 * bpg;
+        let bit_start = (start - group_start) as u32;
+        let bitmap_block = self.groups[gi].block_bitmap;
+        {
+            let bm = buf.get_mut(self, bitmap_block)?;
+            for i in 0..len {
+                let bit = bit_start as u64 + i;
+                let byte = (bit / 8) as usize;
+                let mask = 1u8 << (bit % 8);
+                if byte < bm.len() {
+                    bm[byte] &= !mask;
+                }
+            }
+        }
+        self.buffer_patch_bgd_counters(buf, gi, len as i32, 0, 0)?;
+        Ok(len)
+    }
+
+    /// Buffer-side equivalent of `mark_block_run_used`: sets the bitmap
+    /// bits for `[start, start+len)` in the buffer's bitmap block.
+    pub(crate) fn buffer_mark_block_run_used(
+        &self,
+        buf: &mut BlockBuffer,
+        start: u64,
+        len: u64,
+    ) -> Result<()> {
+        let bpg = self.sb.blocks_per_group as u64;
+        let first_data = self.sb.first_data_block as u64;
+        let gi = ((start - first_data) / bpg) as usize;
+        if gi >= self.groups.len() {
+            return Err(Error::InvalidBlock(start));
+        }
+        let group_start = first_data + gi as u64 * bpg;
+        let bit_start = (start - group_start) as u32;
+        let bitmap_block = self.groups[gi].block_bitmap;
+        let bm = buf.get_mut(self, bitmap_block)?;
+        for i in 0..len {
+            let bit = bit_start as u64 + i;
+            let byte = (bit / 8) as usize;
+            let mask = 1u8 << (bit % 8);
+            if byte < bm.len() {
+                bm[byte] |= mask;
+            }
+        }
+        Ok(())
+    }
+
+    /// Buffer-side BGD counter patch. Mirrors `patch_bgd_counters` byte
+    /// for byte; only the I/O target differs (the BGD block is read from
+    /// the buffer if already touched, else from disk).
+    pub(crate) fn buffer_patch_bgd_counters(
+        &self,
+        buf: &mut BlockBuffer,
+        gi: usize,
+        free_blocks_delta: i32,
+        free_inodes_delta: i32,
+        used_dirs_delta: i32,
+    ) -> Result<()> {
+        let bs = self.sb.block_size() as u64;
+        let desc_size = self.sb.desc_size as u64;
+        let bgt_first_block = self.sb.first_data_block as u64 + 1;
+        let byte_in_bgt = gi as u64 * desc_size;
+        let bgt_block = bgt_first_block + byte_in_bgt / bs;
+        let off_in_block = (byte_in_bgt % bs) as usize;
+
+        let block = buf.get_mut(self, bgt_block)?;
+        // Same patch logic as patch_bgd_counters.
+        let patch_u32 = |block: &mut [u8], lo: usize, hi: Option<usize>, delta: i32| {
+            let cur_lo = u16::from_le_bytes(block[lo..lo + 2].try_into().unwrap()) as u32;
+            let cur_hi = hi
+                .map(|h| u16::from_le_bytes(block[h..h + 2].try_into().unwrap()) as u32)
+                .unwrap_or(0);
+            let cur = (cur_hi << 16) | cur_lo;
+            let new = (cur as i64 + delta as i64).max(0) as u32;
+            block[lo..lo + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
+            if let Some(h) = hi {
+                block[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
+            }
+        };
+        patch_u32(
+            block,
+            off_in_block + 0x0C,
+            if desc_size >= 0x40 {
+                Some(off_in_block + 0x2A)
+            } else {
+                None
+            },
+            free_blocks_delta,
+        );
+        patch_u32(
+            block,
+            off_in_block + 0x0E,
+            if desc_size >= 0x40 {
+                Some(off_in_block + 0x2C)
+            } else {
+                None
+            },
+            free_inodes_delta,
+        );
+        patch_u32(
+            block,
+            off_in_block + 0x10,
+            if desc_size >= 0x40 {
+                Some(off_in_block + 0x2E)
+            } else {
+                None
+            },
+            used_dirs_delta,
+        );
+
+        if self.csum.enabled {
+            let stored_at = off_in_block + 0x1E;
+            let end_desc = off_in_block + desc_size as usize;
+            block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
+            let seed = self.csum.seed;
+            let mut c = crate::checksum::linux_crc32c(seed, &(gi as u32).to_le_bytes());
+            c = crate::checksum::linux_crc32c(c, &block[off_in_block..end_desc]);
+            let new_csum = c as u16;
+            block[stored_at..stored_at + 2].copy_from_slice(&new_csum.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Buffer-side SB counter patch. The SB lives at byte offset 1024
+    /// inside the device; for 4 KiB blocks that's offset 1024 within fs
+    /// block 0, for 1 KiB blocks the SB IS fs block 1. We patch the
+    /// 1024-byte SB region in-place inside the relevant whole block, so
+    /// the journal can transport it as a normal full-block write.
+    pub(crate) fn buffer_patch_sb_counters(
+        &self,
+        buf: &mut BlockBuffer,
+        free_blocks_delta: i64,
+        free_inodes_delta: i32,
+    ) -> Result<()> {
+        let bs = self.sb.block_size() as u64;
+        let sb_offset = crate::superblock::SUPERBLOCK_OFFSET; // 1024
+        let sb_block = sb_offset / bs;
+        let off_in_block = (sb_offset % bs) as usize;
+
+        let block = buf.get_mut(self, sb_block)?;
+        let sb = &mut block[off_in_block..off_in_block + 1024];
+
+        // s_free_inodes_count at 0x10..0x14 (u32 le)
+        let fi = u32::from_le_bytes(sb[0x10..0x14].try_into().unwrap()) as i64;
+        let fi_new = (fi + free_inodes_delta as i64).max(0) as u32;
+        sb[0x10..0x14].copy_from_slice(&fi_new.to_le_bytes());
+
+        // s_free_blocks_count split lo (0x0C..0x10, u32) + hi (0x158..0x15C, u32)
+        let lo = u32::from_le_bytes(sb[0x0C..0x10].try_into().unwrap()) as u64;
+        let hi = u32::from_le_bytes(sb[0x158..0x15C].try_into().unwrap()) as u64;
+        let cur = ((hi << 32) | lo) as i64;
+        let new = (cur + free_blocks_delta).max(0) as u64;
+        sb[0x0C..0x10].copy_from_slice(&(new as u32).to_le_bytes());
+        sb[0x158..0x15C].copy_from_slice(&((new >> 32) as u32).to_le_bytes());
+
+        if self.csum.enabled {
+            let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+            sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Commit a `BlockBuffer` atomically. Routes through the journal
+    /// writer when one is available (crash-safe four-fence protocol);
+    /// falls back to direct device writes + flush otherwise.
+    pub(crate) fn commit_block_buffer(&self, buf: BlockBuffer) -> Result<()> {
+        if buf.dirty.is_empty() {
+            return Ok(());
+        }
         if let Some(jw_mu) = &self.journal {
             let mut jw = jw_mu.lock().map_err(|_| {
                 Error::Corrupt("journal writer mutex poisoned (prior write panicked)")
             })?;
-            // Build the full inode-table block image with `new_inode_raw`
-            // spliced over the target inode's slot. The journal needs
-            // whole-block writes; one inode is a fraction of that.
-            let (block, offset) = bgd::locate_inode(&self.sb, &self.groups, ino)?;
-            let mut buf = self.read_block(block)?;
-            let off = offset as usize;
-            buf[off..off + new_inode_raw.len()].copy_from_slice(new_inode_raw);
             let mut tx = jw.begin();
-            tx.add_write(block, buf)?;
-            jw.commit(self.dev.as_ref(), &tx)?;
-            Ok(())
+            for (block, bytes) in buf.dirty {
+                tx.add_write(block, bytes)?;
+            }
+            jw.commit(self.dev.as_ref(), &tx)
         } else {
-            self.write_inode_raw(ino, new_inode_raw)?;
-            self.dev.flush()?;
-            Ok(())
+            let bs = self.sb.block_size() as u64;
+            for (block, bytes) in buf.dirty {
+                self.dev.write_at(block * bs, &bytes)?;
+            }
+            self.dev.flush()
         }
     }
 
@@ -1003,9 +1271,7 @@ impl Filesystem {
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut added = false;
         for logical in 0..parent_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
+            let Some(phys) = self.map_inode_logical(&parent_inode, logical)? else {
                 continue;
             };
             let mut block = self.read_block(phys)?;
@@ -1745,9 +2011,7 @@ impl Filesystem {
         let bs = self.sb.block_size();
         let n_blocks = dir_inode.size.div_ceil(bs as u64);
         for logical in 0..n_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&dir_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
+            let Some(phys) = self.map_inode_logical(dir_inode, logical)? else {
                 continue;
             };
             let block = self.read_block(phys)?;
