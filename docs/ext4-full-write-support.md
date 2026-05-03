@@ -218,17 +218,24 @@ All four single-inode ops (chmod, chown, utimens, in-inode setxattr,
 truncate_grow) pinned by `tests/journal_writer_inode_ops.rs` which
 asserts each one advances `jsb.sequence` in production, AND that the
 journal self-checkpoints back to clean.
-- [ ] **5.2.8 `apply_create`** — needs buffer-aware refactor of the
-  `add_dir_entry` / `extend_dir_and_add_entry` helpers first.
+- [x] **5.2.8 `apply_create`** — multi-block journaled. Buffers
+  inode-bitmap + BGD + SB + new inode + parent dir entry. When parent
+  has no room, falls back to un-journaled extend (documented limit
+  until extend has a buffer-twin).
 - [x] **5.2.9 `apply_unlink`** — multi-block journaled. Buffers the
   parent-dir-block edit, target-data-block frees, target-inode-bitmap
   clear, BGD/SB counter updates, and zeroed-inode write into one
   transaction. Pinned by `tests/journal_writer_unlink_rmdir.rs` with
   budget sweep 0..=40.
 - [ ] **5.2.10 `apply_rename`**
-- [ ] **5.2.11 `apply_link`**
-- [ ] **5.2.12 `apply_symlink`**
-- [ ] **5.2.13 `apply_mkdir`** — same blocker as `apply_create`.
+- [x] **5.2.11 `apply_link`** — multi-block journaled. Buffers nlink
+  bump + parent dir entry; in-place case fully atomic.
+- [x] **5.2.12 `apply_symlink`** — multi-block journaled. Both fast
+  (inline) and slow (data-block) paths buffered; data block written
+  via `BlockBuffer::put`.
+- [x] **5.2.13 `apply_mkdir`** — multi-block journaled. Buffers two
+  allocator plans + inode + seeded data block + parent dir entry +
+  parent nlink bump. Same extend-fallback caveat as create.
 - [x] **5.2.14 `apply_rmdir`** — multi-block journaled. Buffers
   target-data-block frees, inode-slot free + used_dirs decrement,
   BGD/SB counters, parent-dir-entry removal, parent nlink decrement

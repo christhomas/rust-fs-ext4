@@ -870,6 +870,70 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Buffer-side equivalent of `add_dir_entry` for the IN-PLACE case
+    /// only (an existing parent block has room for the new entry). The
+    /// dir block is read into the buffer (or reused if already touched),
+    /// `add_entry_to_block` rewrites it, csum patched, returns Ok(()).
+    ///
+    /// Returns `Error::OutOfBounds` when no existing parent block has
+    /// room — caller should then fall through to
+    /// `buffer_extend_dir_and_add_entry` to grow the directory by one
+    /// block (which has its own scope limits).
+    pub(crate) fn buffer_add_dir_entry_inplace(
+        &self,
+        buf: &mut BlockBuffer,
+        parent_ino: u32,
+        parent_inode: &Inode,
+        name: &[u8],
+        target_ino: u32,
+        file_type: crate::dir::DirEntryType,
+    ) -> Result<()> {
+        let bs = self.sb.block_size();
+        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+        let n_blocks = parent_inode.size.div_ceil(bs as u64);
+        for logical in 0..n_blocks {
+            let Some(phys) = self.map_inode_logical(parent_inode, logical)? else {
+                continue;
+            };
+            let block = buf.get_mut(self, phys)?;
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
+                12
+            } else {
+                0
+            };
+            match crate::dir::add_entry_to_block(
+                block,
+                target_ino,
+                name,
+                file_type,
+                has_ft,
+                reserved_tail,
+            ) {
+                Ok(()) => {
+                    if self.csum.enabled && reserved_tail == 12 {
+                        let end = block.len();
+                        let mut c = crate::checksum::linux_crc32c(
+                            self.csum.seed,
+                            &parent_ino.to_le_bytes(),
+                        );
+                        c = crate::checksum::linux_crc32c(
+                            c,
+                            &parent_inode.generation.to_le_bytes(),
+                        );
+                        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
+                        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                    }
+                    return Ok(());
+                }
+                Err(Error::OutOfBounds) => continue,
+                Err(e) => return Err(e),
+            }
+        }
+        // No existing block has room — caller must extend the directory
+        // (or fall back to the un-journaled extend path).
+        Err(Error::OutOfBounds)
+    }
+
     /// Commit a `BlockBuffer` atomically. Routes through the journal
     /// writer when one is available (crash-safe four-fence protocol);
     /// falls back to direct device writes + flush otherwise.
@@ -1435,79 +1499,57 @@ impl Filesystem {
         )?;
         let new_ino = plan.inode;
 
-        // Persist the allocation: bitmap bit, BGD counters, SB counters.
-        self.mark_inode_used(new_ino)?;
-        self.patch_bgd_counters(
+        // Multi-block transaction: inode bitmap + BGD + SB + new inode +
+        // parent dir entry, all atomic. The fall-through to extend-dir
+        // (when the parent has no room) must commit the buffer first
+        // and then run extend un-journaled — see end of fn.
+        let mut buf = BlockBuffer::new(bs);
+        self.buffer_mark_inode_used(&mut buf, new_ino)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
             plan.bgd.group_idx as usize,
             plan.bgd.free_blocks_delta,
             plan.bgd.free_inodes_delta,
             plan.bgd.used_dirs_delta,
         )?;
-        self.patch_sb_counters(plan.sb.free_blocks_delta as i64, plan.sb.free_inodes_delta)?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            plan.sb.free_blocks_delta,
+            plan.sb.free_inodes_delta,
+        )?;
 
-        // Build + write the inode.
         let raw = self.build_regular_file_inode(new_ino, mode)?;
-        self.write_inode_raw(new_ino, &raw)?;
+        self.buffer_write_inode(&mut buf, new_ino, &raw)?;
 
-        // Insert the dir entry into the first parent block with room.
-        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
-        let parent_blocks = parent_inode.size.div_ceil(bs as u64);
-        let mut added = false;
-        for logical in 0..parent_blocks {
-            let Some(phys) = self.map_inode_logical(&parent_inode, logical)? else {
-                continue;
-            };
-            let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
-                12
-            } else {
-                0
-            };
-            match crate::dir::add_entry_to_block(
-                &mut block,
-                new_ino,
-                base_name.as_bytes(),
-                crate::dir::DirEntryType::RegFile,
-                has_ft,
-                reserved_tail,
-            ) {
-                Ok(()) => {
-                    if self.csum.enabled && reserved_tail == 12 {
-                        let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(
-                            self.csum.seed,
-                            &parent_ino_num.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(
-                            c,
-                            &parent_inode.generation.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
-                    }
-                    self.dev.write_at(phys * bs as u64, &block)?;
-                    added = true;
-                    break;
-                }
-                Err(Error::OutOfBounds) => {
-                    // No room in this block — try the next.
-                    continue;
-                }
-                Err(e) => return Err(e),
+        match self.buffer_add_dir_entry_inplace(
+            &mut buf,
+            parent_ino_num,
+            &parent_inode,
+            base_name.as_bytes(),
+            new_ino,
+            crate::dir::DirEntryType::RegFile,
+        ) {
+            Ok(()) => {
+                self.commit_block_buffer(buf)?;
+                Ok(new_ino)
             }
+            Err(Error::OutOfBounds) => {
+                // Parent dir is full → commit what we have so the inode
+                // allocation is durable, then run the un-journaled extend
+                // path. If the extend crashes mid-way we leak the
+                // already-allocated inode (orphan candidate); this is a
+                // documented limitation until extend has a buffer-twin.
+                self.commit_block_buffer(buf)?;
+                self.extend_dir_and_add_entry(
+                    parent_ino_num,
+                    base_name.as_bytes(),
+                    new_ino,
+                    crate::dir::DirEntryType::RegFile,
+                )?;
+                Ok(new_ino)
+            }
+            Err(e) => Err(e),
         }
-        if !added {
-            // No existing block has room → grow the directory.
-            self.extend_dir_and_add_entry(
-                parent_ino_num,
-                base_name.as_bytes(),
-                new_ino,
-                crate::dir::DirEntryType::RegFile,
-            )?;
-        }
-
-        self.dev.flush()?;
-        Ok(new_ino)
     }
 
     /// Create a symbolic link at `linkpath` whose target is `target`.
@@ -1571,23 +1613,32 @@ impl Filesystem {
         )?;
         let new_ino = plan.inode;
 
-        self.mark_inode_used(new_ino)?;
-        self.patch_bgd_counters(
+        // Multi-block transaction: inode bitmap + counters + new inode +
+        // (optionally) data block + parent dir entry.
+        let mut buf = BlockBuffer::new(bs);
+        self.buffer_mark_inode_used(&mut buf, new_ino)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
             plan.bgd.group_idx as usize,
             plan.bgd.free_blocks_delta,
             plan.bgd.free_inodes_delta,
             plan.bgd.used_dirs_delta,
         )?;
-        self.patch_sb_counters(plan.sb.free_blocks_delta as i64, plan.sb.free_inodes_delta)?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            plan.sb.free_blocks_delta,
+            plan.sb.free_inodes_delta,
+        )?;
 
-        // Fast-symlink if target fits inline; otherwise allocate a block.
+        // Fast-symlink if target fits inline; otherwise allocate a block
+        // and stage its bytes into the buffer.
         let raw = if target.len() <= 60 {
             self.build_fast_symlink_inode(new_ino, target.as_bytes())?
         } else {
             let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-                let mut buf = vec![0u8; bs as usize];
-                self.dev.read_at(block * bs as u64, &mut buf)?;
-                Ok(buf)
+                let mut buf2 = vec![0u8; bs as usize];
+                self.dev.read_at(block * bs as u64, &mut buf2)?;
+                Ok(buf2)
             };
             let bplan = crate::alloc::plan_block_allocation(
                 &self.sb,
@@ -1598,80 +1649,52 @@ impl Filesystem {
             )?;
             let data_phys = bplan.first_block;
 
-            self.mark_block_run_used(data_phys, 1)?;
-            self.patch_bgd_counters(
+            self.buffer_mark_block_run_used(&mut buf, data_phys, 1)?;
+            self.buffer_patch_bgd_counters(
+                &mut buf,
                 bplan.bgd.group_idx as usize,
                 bplan.bgd.free_blocks_delta,
                 bplan.bgd.free_inodes_delta,
                 bplan.bgd.used_dirs_delta,
             )?;
-            self.patch_sb_counters(bplan.sb.free_blocks_delta, bplan.sb.free_inodes_delta)?;
+            self.buffer_patch_sb_counters(
+                &mut buf,
+                bplan.sb.free_blocks_delta,
+                bplan.sb.free_inodes_delta,
+            )?;
 
             let mut block = vec![0u8; bs as usize];
             block[..target.len()].copy_from_slice(target.as_bytes());
-            self.dev.write_at(data_phys * bs as u64, &block)?;
+            buf.put(data_phys, block);
 
             self.build_slow_symlink_inode(new_ino, target.as_bytes(), data_phys)?
         };
-        self.write_inode_raw(new_ino, &raw)?;
+        self.buffer_write_inode(&mut buf, new_ino, &raw)?;
 
-        // Install dir entry.
-        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
-        let parent_blocks = parent_inode.size.div_ceil(bs as u64);
-        let mut added = false;
-        for logical in 0..parent_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
-                continue;
-            };
-            let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
-                12
-            } else {
-                0
-            };
-            match crate::dir::add_entry_to_block(
-                &mut block,
-                new_ino,
-                base_name.as_bytes(),
-                crate::dir::DirEntryType::Symlink,
-                has_ft,
-                reserved_tail,
-            ) {
-                Ok(()) => {
-                    if self.csum.enabled && reserved_tail == 12 {
-                        let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(
-                            self.csum.seed,
-                            &parent_ino_num.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(
-                            c,
-                            &parent_inode.generation.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
-                    }
-                    self.dev.write_at(phys * bs as u64, &block)?;
-                    added = true;
-                    break;
-                }
-                Err(Error::OutOfBounds) => continue,
-                Err(e) => return Err(e),
+        match self.buffer_add_dir_entry_inplace(
+            &mut buf,
+            parent_ino_num,
+            &parent_inode,
+            base_name.as_bytes(),
+            new_ino,
+            crate::dir::DirEntryType::Symlink,
+        ) {
+            Ok(()) => {
+                self.commit_block_buffer(buf)?;
+                Ok(new_ino)
             }
+            Err(Error::OutOfBounds) => {
+                self.commit_block_buffer(buf)?;
+                self.extend_dir_and_add_entry(
+                    parent_ino_num,
+                    base_name.as_bytes(),
+                    new_ino,
+                    crate::dir::DirEntryType::Symlink,
+                )?;
+                Ok(new_ino)
+            }
+            Err(e) => Err(e),
         }
-        if !added {
-            self.extend_dir_and_add_entry(
-                parent_ino_num,
-                base_name.as_bytes(),
-                new_ino,
-                crate::dir::DirEntryType::Symlink,
-            )?;
-        }
-
-        self.dev.flush()?;
-        Ok(new_ino)
     }
 
     /// Compose a fresh fast-symlink inode image: `S_IFLNK | 0o777`, 1 link,
@@ -2680,104 +2703,82 @@ impl Filesystem {
         )?;
         let data_block = bplan.first_block;
 
-        // 3. Commit inode allocator side-effects first so a later failure
-        //    leaves a self-consistent filesystem (inode will be freed by the
-        //    rollback branch below if needed).
-        self.mark_inode_used(new_ino)?;
-        self.patch_bgd_counters(
+        // Multi-block transaction: inode bitmap + block bitmap + counters
+        // + new dir inode + seeded data block + parent dir entry +
+        // parent nlink bump, all atomic.
+        let mut buf = BlockBuffer::new(bs);
+        self.buffer_mark_inode_used(&mut buf, new_ino)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
             iplan.bgd.group_idx as usize,
             iplan.bgd.free_blocks_delta,
             iplan.bgd.free_inodes_delta,
             iplan.bgd.used_dirs_delta,
         )?;
-        self.patch_sb_counters(iplan.sb.free_blocks_delta, iplan.sb.free_inodes_delta)?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            iplan.sb.free_blocks_delta,
+            iplan.sb.free_inodes_delta,
+        )?;
 
-        // 4. Commit block allocator side-effects.
-        self.mark_block_run_used(data_block, 1)?;
-        self.patch_bgd_counters(
+        self.buffer_mark_block_run_used(&mut buf, data_block, 1)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
             bplan.bgd.group_idx as usize,
             bplan.bgd.free_blocks_delta,
             bplan.bgd.free_inodes_delta,
             bplan.bgd.used_dirs_delta,
         )?;
-        self.patch_sb_counters(bplan.sb.free_blocks_delta, bplan.sb.free_inodes_delta)?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            bplan.sb.free_blocks_delta,
+            bplan.sb.free_inodes_delta,
+        )?;
 
-        // 5. Build + write the dir inode.
         let raw = self.build_directory_inode(new_ino, mode, data_block)?;
-        // Extract generation from the freshly-built raw for seed_directory_block CSUM.
         let gen = u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap());
-        self.write_inode_raw(new_ino, &raw)?;
+        self.buffer_write_inode(&mut buf, new_ino, &raw)?;
 
-        // 6. Seed + write the data block.
+        // Seed the data block (`.` and `..` entries) and stage it.
         let seed = self.seed_directory_block(new_ino, parent_ino, gen)?;
-        self.dev.write_at(data_block * bs as u64, &seed)?;
+        buf.put(data_block, seed);
 
-        // 7. Add dir entry in parent for the new directory.
-        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
-        let parent_blocks = parent_inode.size.div_ceil(bs as u64);
-        let mut added = false;
-        for logical in 0..parent_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
-                continue;
-            };
-            let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
-                12
-            } else {
-                0
-            };
-            match crate::dir::add_entry_to_block(
-                &mut block,
-                new_ino,
-                base_name.as_bytes(),
-                crate::dir::DirEntryType::Directory,
-                has_ft,
-                reserved_tail,
-            ) {
-                Ok(()) => {
-                    if self.csum.enabled && reserved_tail == 12 {
-                        let end = block.len();
-                        let mut c = crate::checksum::linux_crc32c(
-                            self.csum.seed,
-                            &parent_ino.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(
-                            c,
-                            &parent_inode.generation.to_le_bytes(),
-                        );
-                        c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
-                        block[end - 4..end].copy_from_slice(&c.to_le_bytes());
-                    }
-                    self.dev.write_at(phys * bs as u64, &block)?;
-                    added = true;
-                    break;
-                }
-                Err(Error::OutOfBounds) => continue,
-                Err(e) => return Err(e),
-            }
-        }
-        if !added {
-            // No existing block has room → grow the directory. extend_dir_...
-            // rewrites the parent inode on disk with a larger size + new
-            // extent, so `parent_raw` here is now stale — re-read before the
-            // nlink patch so we don't stomp the extension.
+        // Try to install the dir entry in the parent in-place first.
+        let parent_extends = match self.buffer_add_dir_entry_inplace(
+            &mut buf,
+            parent_ino,
+            &parent_inode,
+            base_name.as_bytes(),
+            new_ino,
+            crate::dir::DirEntryType::Directory,
+        ) {
+            Ok(()) => false,
+            Err(Error::OutOfBounds) => true,
+            Err(e) => return Err(e),
+        };
+
+        if !parent_extends {
+            // In-place add succeeded — bump parent's nlink in the same buffer.
+            self.patch_inode_nlink(parent_ino, &mut parent_raw, &parent_inode, 1)?;
+            self.buffer_write_inode(&mut buf, parent_ino, &parent_raw)?;
+            self.commit_block_buffer(buf)?;
+        } else {
+            // Parent dir is full → commit what we have, then run the
+            // un-journaled extend, then commit the parent nlink bump as a
+            // small follow-up.
+            self.commit_block_buffer(buf)?;
             self.extend_dir_and_add_entry(
                 parent_ino,
                 base_name.as_bytes(),
                 new_ino,
                 crate::dir::DirEntryType::Directory,
             )?;
-            let refreshed = self.read_inode_verified(parent_ino)?;
-            parent_raw = refreshed.1;
+            // Re-read parent (extend rewrote it) before patching nlink.
+            let (refreshed_parent, mut refreshed_raw) = self.read_inode_verified(parent_ino)?;
+            self.patch_inode_nlink(parent_ino, &mut refreshed_raw, &refreshed_parent, 1)?;
+            self.commit_inode_write(parent_ino, &refreshed_raw)?;
         }
 
-        // 8. Parent gets +1 nlink (the child's ".." adds a reference back).
-        self.patch_inode_nlink(parent_ino, &mut parent_raw, &parent_inode, 1)?;
-        self.write_inode_raw(parent_ino, &parent_raw)?;
-
-        self.dev.flush()?;
         Ok(new_ino)
     }
 
@@ -2822,14 +2823,6 @@ impl Filesystem {
             return Err(Error::AlreadyExists);
         }
 
-        // Bump nlink BEFORE adding the entry. If we crash after the nlink
-        // bump but before writing the new entry we leak at most 1 link
-        // (inode stays allocated one step longer than necessary). If we did
-        // it the other way a crash could leave the entry pointing at a
-        // soon-to-be-freed inode.
-        self.patch_inode_nlink(src_ino, &mut src_raw, &src_inode, 1)?;
-        self.write_inode_raw(src_ino, &src_raw)?;
-
         let dir_type = match src_inode.file_type() {
             crate::inode::S_IFREG => crate::dir::DirEntryType::RegFile,
             crate::inode::S_IFLNK => crate::dir::DirEntryType::Symlink,
@@ -2839,16 +2832,37 @@ impl Filesystem {
             crate::inode::S_IFSOCK => crate::dir::DirEntryType::Socket,
             _ => crate::dir::DirEntryType::Unknown,
         };
-        self.add_dir_entry(
+
+        // Build the multi-block transaction: bump nlink + add dir entry,
+        // both staged into one buffer so a crash either applies both or
+        // neither.
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+        self.patch_inode_nlink(src_ino, &mut src_raw, &src_inode, 1)?;
+        self.buffer_write_inode(&mut buf, src_ino, &src_raw)?;
+
+        match self.buffer_add_dir_entry_inplace(
+            &mut buf,
             dst_parent_ino,
             &dst_parent_inode,
             dst_name.as_bytes(),
             src_ino,
             dir_type,
-        )?;
-
-        self.dev.flush()?;
-        Ok(())
+        ) {
+            Ok(()) => self.commit_block_buffer(buf),
+            Err(Error::OutOfBounds) => {
+                // Parent dir is full → fall back to the un-journaled extend
+                // path. Commit the inode-only buffer first so the nlink bump
+                // is atomic w.r.t. itself, then run the legacy extend.
+                self.commit_block_buffer(buf)?;
+                self.extend_dir_and_add_entry(
+                    dst_parent_ino,
+                    dst_name.as_bytes(),
+                    src_ino,
+                    dir_type,
+                )
+            }
+            Err(e) => Err(e),
+        }
     }
 
     /// Rename `src` → `dst` within the same filesystem.
