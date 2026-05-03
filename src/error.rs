@@ -139,6 +139,8 @@ pub mod errno {
     pub const ENAMETOOLONG: i32 = 63; // macOS POSIX value
     pub const ENOTSUP: i32 = 45;
     pub const ENOTEMPTY: i32 = 66; // macOS POSIX value
+    pub const ENOSYS: i32 = 78; // macOS POSIX value (Linux: 38). Surfaced
+                                // by capi when a feature isn't implemented yet.
 }
 
 use errno::*;

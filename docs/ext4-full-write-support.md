@@ -83,14 +83,19 @@ Acceptance: new test `tests/alloc_counter_consistency.rs` round-trips
   head bytes, reads zeros from holes, leaves `i_blocks` unchanged,
   survives remount). `plan_truncate_grow` deliberately stays a size-
   only delta — IMPROVEMENT-PLAN.md item B3 was an outdated worry.
-- [ ] **2.2 fallocate (FALLOC_FL_KEEP_SIZE)** — preallocate blocks as
-  uninitialized extents without changing `i_size`. New FFI:
-  `fs_ext4_fallocate(ino, offset, len, flags) -> int`.
+- [x] **2.2 fallocate (FALLOC_FL_KEEP_SIZE)** — `apply_fallocate_keep_size`
+  in `src/fs.rs`: allocates a contiguous physical run via
+  `plan_block_allocation`, inserts as one uninitialized extent through
+  `extent_mut::plan_insert_extent`, commits the bitmap + BGD + SB +
+  inode update via `BlockBuffer` (atomic journaled tx). FFI:
+  `fs_ext4_fallocate(fs, path, offset, len, flags)` in capi.rs;
+  `FS_EXT4_FALLOC_FL_KEEP_SIZE = 0x01`. Pinned by
+  `tests/fallocate_keep_size.rs` (4 tests). v1 limits documented:
+  no partial overlaps, single contiguous alloc, depth-0 root only.
 - [ ] **2.3 fallocate punch-hole (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)** —
-  split intersecting extents, free the data blocks of the punched range,
-  leave a hole. Requires Phase 1 counter consistency.
-- [ ] **2.4 fallocate zero-range (FALLOC_FL_ZERO_RANGE)** — implemented
-  by punching then re-emitting uninitialized extents.
+  FFI returns ENOSYS (78). Needs cross-extent splitting.
+- [ ] **2.4 fallocate zero-range (FALLOC_FL_ZERO_RANGE)** — FFI returns
+  ENOSYS. Composes from punch-hole + KEEP_SIZE.
 
 Acceptance: sparse 1 MiB file from 4 KiB original reads as
 `[orig 4KiB][zeros up to 1MiB]`; `du` reports unchanged block count.

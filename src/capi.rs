@@ -46,7 +46,7 @@
 
 use crate::block_io::{BlockDevice, CallbackDevice, FileDevice};
 use crate::dir::{self, DirBlockIter, DirEntryType};
-use crate::error::errno::{EINVAL, EISDIR, ENOENT, ENOTDIR};
+use crate::error::errno::{EINVAL, EISDIR, ENOENT, ENOSYS, ENOTDIR};
 use crate::error::{Error, Result};
 use crate::extent;
 use crate::features;
@@ -1362,6 +1362,66 @@ pub unsafe extern "C" fn fs_ext4_truncate(
                 Ok(()) => 0,
                 Err(e) => {
                     set_err_from(&e, &format!("truncate {path_str} -> {new_size}"));
+                    -1
+                }
+            }
+        }),
+    )
+}
+
+/// Linux `fallocate(2)` mode flags. Only KEEP_SIZE is implemented in v1;
+/// PUNCH_HOLE / ZERO_RANGE / COLLAPSE_RANGE / INSERT_RANGE return ENOSYS.
+pub const FS_EXT4_FALLOC_FL_KEEP_SIZE: c_int = 0x01;
+pub const FS_EXT4_FALLOC_FL_PUNCH_HOLE: c_int = 0x02;
+pub const FS_EXT4_FALLOC_FL_ZERO_RANGE: c_int = 0x10;
+
+/// `fallocate(path, offset, len, flags)` — preallocate blocks (or punch
+/// a hole) without writing data. Only [`FS_EXT4_FALLOC_FL_KEEP_SIZE`]
+/// is implemented in v1; other flag combinations return ENOSYS (38).
+///
+/// KEEP_SIZE semantics: blocks covering `[offset, offset+len)` are
+/// allocated as uninitialized extents (reads see zeros). `i_size` is
+/// not changed. Caller can then write into the range without further
+/// allocation. Idempotent against the same range only when the range
+/// is currently entirely unmapped — partial overlaps return EINVAL
+/// (v1 limitation; multi-extent split is a follow-up).
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_fallocate(
+    fs: *mut fs_ext4_fs_t,
+    path: *const c_char,
+    offset: u64,
+    len: u64,
+    flags: c_int,
+) -> c_int {
+    ffi_guard(
+        -1,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return -1;
+            }
+            // V1: only KEEP_SIZE supported. Reject any other flag bit.
+            if flags != FS_EXT4_FALLOC_FL_KEEP_SIZE {
+                set_err_msg(
+                    "fallocate: only FALLOC_FL_KEEP_SIZE is implemented in v1",
+                    ENOSYS,
+                );
+                return -1;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            let ino = match resolve_path(fs_ref, path_str) {
+                Ok(n) => n,
+                Err(e) => {
+                    set_err_from(&e, &format!("fallocate {path_str}"));
+                    return -1;
+                }
+            };
+            match fs_ref.apply_fallocate_keep_size(ino, offset, len) {
+                Ok(()) => 0,
+                Err(e) => {
+                    set_err_from(&e, &format!("fallocate {path_str} @{offset}+{len}"));
                     -1
                 }
             }

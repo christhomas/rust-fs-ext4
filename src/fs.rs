@@ -422,6 +422,139 @@ impl Filesystem {
         self.commit_inode_write(ino, &raw)
     }
 
+    /// Phase 2.2: `fallocate(FALLOC_FL_KEEP_SIZE)` — preallocate blocks
+    /// in the byte range `[offset, offset+len)` as uninitialized
+    /// extents. The blocks are reserved (count against `i_blocks`) but
+    /// reads return zeros until they're written. `i_size` is left
+    /// unchanged per KEEP_SIZE semantics.
+    ///
+    /// v1 limitations:
+    /// - Range must be entirely unmapped — partially-overlapping ranges
+    ///   return `Error::InvalidArgument`. (Splitting around existing
+    ///   extents is a follow-up.)
+    /// - Single contiguous physical allocation. If the bitmap can't
+    ///   serve `ceil(len / block_size)` contiguous blocks, returns
+    ///   `Error::Corrupt("no group has a contiguous free run...")`.
+    /// - Extent insertion must succeed against the inline-root depth-0
+    ///   tree (or trigger the existing depth-1 promotion). Multi-level
+    ///   trees aren't yet supported.
+    pub fn apply_fallocate_keep_size(&self, ino: u32, offset: u64, len: u64) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let bs = self.sb.block_size() as u64;
+        let bs_u32 = self.sb.block_size();
+        let first_block = offset / bs;
+        let last_block_excl = offset
+            .checked_add(len)
+            .ok_or(Error::InvalidArgument("fallocate: offset+len overflow"))?
+            .div_ceil(bs);
+        let need_blocks_u64 = last_block_excl - first_block;
+        if need_blocks_u64 > u32::MAX as u64 {
+            return Err(Error::InvalidArgument(
+                "fallocate: range exceeds u32 block count",
+            ));
+        }
+        let need_blocks = need_blocks_u64 as u32;
+
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+        if !inode.is_file() {
+            return Err(Error::InvalidArgument(
+                "fallocate: target is not a regular file",
+            ));
+        }
+        if !inode.has_extents() {
+            return Err(Error::InvalidArgument(
+                "fallocate: legacy (non-extents) inodes not supported",
+            ));
+        }
+
+        // V1: refuse if any block in range is already mapped — handling
+        // the partial-overlap case requires splitting existing extents
+        // mid-range, deferred to a follow-up.
+        for log in first_block..last_block_excl {
+            if crate::extent::map_logical(&inode.block, self.dev.as_ref(), bs_u32, log)?.is_some() {
+                return Err(Error::InvalidArgument(
+                    "fallocate: range partially mapped (v1 limitation)",
+                ));
+            }
+        }
+
+        // Allocate one contiguous physical run.
+        let inode_group = (ino - 1) / self.sb.inodes_per_group;
+        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; bs as usize];
+            self.dev.read_at(block * bs, &mut buf)?;
+            Ok(buf)
+        };
+        let plan = crate::alloc::plan_block_allocation(
+            &self.sb,
+            &self.groups,
+            need_blocks,
+            inode_group,
+            &mut bitmap_reader,
+        )?;
+
+        // Insert as an uninitialized extent so reads see zeros without
+        // hitting disk. Clamp to u16 — the range check above already
+        // bounded need_blocks, but the on-disk extent length is u16.
+        if need_blocks > 0x7FFF {
+            return Err(Error::InvalidArgument(
+                "fallocate: single-extent length > 32K blocks (split needed)",
+            ));
+        }
+        let new_extent = crate::extent::Extent {
+            logical_block: first_block as u32,
+            length: need_blocks as u16,
+            physical_block: plan.first_block,
+            uninitialized: true,
+        };
+        let muts = crate::extent_mut::plan_insert_extent(&inode.block, new_extent)?;
+
+        // Apply via BlockBuffer — atomic across bitmap, BGD, SB, inode.
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+        self.buffer_mark_block_run_used(&mut buf, plan.first_block, need_blocks as u64)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            plan.sb.free_blocks_delta,
+            plan.sb.free_inodes_delta,
+        )?;
+
+        // Splice the new extent root into the inode image.
+        for m in &muts {
+            if let crate::extent_mut::ExtentMutation::WriteRoot { bytes } = m {
+                Self::patch_inode_block_area(&mut raw, bytes)?;
+            }
+        }
+
+        // Bump i_blocks (sectors). KEEP_SIZE: i_size unchanged.
+        let sectors_per_block = bs / 512;
+        let new_i_blocks = inode
+            .blocks
+            .saturating_add(need_blocks as u64 * sectors_per_block);
+        Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_i_blocks)?;
+
+        // POSIX: fallocate bumps mtime + ctime.
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes());
+
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.buffer_write_inode(&mut buf, ino, &raw)?;
+
+        self.commit_block_buffer(buf)
+    }
+
     /// Change the permission bits on `path`. Only the low 12 bits of `mode`
     /// (`S_ISUID|S_ISGID|S_ISVTX` plus rwx/rwx/rwx) are applied; the file-type
     /// bits (`S_IFMT`) are preserved from the existing inode.
