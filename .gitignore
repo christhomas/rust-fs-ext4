@@ -19,4 +19,5 @@ test-disks/*.img
 # Both are produced by scripts/cross-validate-lwext4.sh and `vagrant up`
 # inside tests/vagrant/freebsd/. Re-runnable, never in source control.
 .lwext4/
+.qemu/
 **/.vagrant/

@@ -1,0 +1,55 @@
+#cloud-config
+#
+# cloud-init NoCloud user-data for the FreeBSD cross-validator VM.
+#
+# On first boot:
+#   1. Probe every /dev/vd[b-z] secondary disk (the host attaches our
+#      test-disks/*.img images as virtio-blk devices).
+#   2. mount_ext2fs each one read-only.
+#   3. Walk every regular file and dump <relpath>\t<size>\t<sha256>
+#      bracketed by `[manifest:<imgname>]` markers on the serial console.
+#   4. Power off so the host's qemu wrapper can detect "done".
+#
+# Output is captured by the host script via `-serial stdio`, parsed,
+# and diffed against an equivalent manifest produced by mounting the
+# same images via `Filesystem::mount`.
+
+users:
+  - name: validator
+    lock_passwd: true
+
+# `runcmd` runs once on first boot, after the system is fully up.
+# Keep the script self-contained — no SSH, no networking, no package
+# install. Everything we need (mount_ext2fs, sha256, find) ships in
+# the FreeBSD base system.
+runcmd:
+  - |
+    set -eu
+    {
+      echo "[manifest:start]"
+      for dev in /dev/vd[b-z]; do
+        [ -e "$dev" ] || continue
+        name=$(basename "$dev")
+        mp=$(mktemp -d "/tmp/${name}.XXXXXX")
+        echo "[manifest:disk:${name}:begin]"
+        if mount_ext2fs -o ro "$dev" "$mp" 2>/dev/null; then
+          # find prints null-delimited paths; xargs sha256 each one
+          # and emit a stable, sortable manifest line per file.
+          (cd "$mp" && find . -type f -print0 \
+            | sort -z \
+            | xargs -0 -I{} sh -c '
+                rel="{}"
+                size=$(stat -f %z "$rel")
+                sha=$(sha256 -q "$rel")
+                printf "%s\t%s\t%s\n" "$rel" "$size" "$sha"
+              ')
+          umount "$mp" 2>/dev/null || true
+          echo "[manifest:disk:${name}:end:ok]"
+        else
+          echo "[manifest:disk:${name}:end:mount_failed]"
+        fi
+        rmdir "$mp" 2>/dev/null || true
+      done
+      echo "[manifest:end]"
+    } > /dev/ttyu0 2>&1
+    /sbin/poweroff
