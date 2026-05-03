@@ -45,7 +45,6 @@
 //! ```
 
 use crate::error::{Error, Result};
-use crate::extent;
 use crate::fs::Filesystem;
 use crate::inode::Inode;
 
@@ -193,18 +192,23 @@ impl JournalSuperblock {
     }
 }
 
-/// Map a journal-relative block number to its physical fs block, using the
-/// journal inode's extent tree. Journal block 0 contains the superblock.
+/// Map a journal-relative block number to its physical fs block. Journal
+/// block 0 contains the superblock.
+///
+/// Flavor-aware via [`crate::indirect::map_logical_any`]: ext4 journals
+/// (whose journal inode carries `EXT4_EXTENTS_FL`) traverse the extent
+/// tree; ext3 journals (legacy direct/indirect block pointers) walk the
+/// indirect tree. Both schemes return `Ok(Some(physical))` for mapped
+/// blocks, `Ok(None)` for sparse holes (which a healthy journal should
+/// never have, but we don't enforce that here).
 pub fn journal_block_to_physical(
     fs: &Filesystem,
     journal_inode: &Inode,
     journal_block: u64,
 ) -> Result<Option<u64>> {
-    if (journal_inode.flags & crate::inode::InodeFlags::EXTENTS.bits()) == 0 {
-        return Err(Error::Corrupt("journal inode uses legacy indirect blocks"));
-    }
-    extent::map_logical(
+    crate::indirect::map_logical_any(
         &journal_inode.block,
+        journal_inode.flags,
         fs.dev.as_ref(),
         fs.sb.block_size(),
         journal_block,

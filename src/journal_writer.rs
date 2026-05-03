@@ -50,7 +50,6 @@
 
 use crate::block_io::BlockDevice;
 use crate::error::{Error, Result};
-use crate::extent;
 use crate::fs::Filesystem;
 use crate::inode::Inode;
 use crate::jbd2::{self, JournalSuperblock, JBD2_MAGIC_NUMBER, JBD2_SUPERBLOCK_V2};
@@ -79,8 +78,11 @@ impl JournalWriter {
     /// Returns `Ok(None)` when the FS has no journal (`s_journal_inum == 0`)
     /// — callers should fall back to unjournaled writes in that case.
     /// Returns `Err` when the journal is misconfigured (e.g. the journal
-    /// inode uses legacy indirect blocks instead of extents — we don't
-    /// support those journals).
+    /// inode is missing or unparsable).
+    ///
+    /// Flavor-aware: walks the journal inode's block tree via
+    /// [`crate::indirect::map_logical_any`], so ext3 journals (legacy
+    /// indirect block pointers) work the same as ext4 ones (extent tree).
     pub fn open(fs: &Filesystem) -> Result<Option<Self>> {
         let Some(jsb) = jbd2::read_superblock(fs)? else {
             return Ok(None);
@@ -94,9 +96,16 @@ impl JournalWriter {
         let bs = fs.sb.block_size();
         let mut physical_map = Vec::with_capacity(jsb.max_len as usize);
         for logical in 0..jsb.max_len as u64 {
-            let phys = extent::map_logical(&jinode.block, fs.dev.as_ref(), bs, logical)?.ok_or(
-                Error::Corrupt("journal_writer: journal inode has unmapped logical block"),
-            )?;
+            let phys = crate::indirect::map_logical_any(
+                &jinode.block,
+                jinode.flags,
+                fs.dev.as_ref(),
+                bs,
+                logical,
+            )?
+            .ok_or(Error::Corrupt(
+                "journal_writer: journal inode has unmapped logical block",
+            ))?;
             physical_map.push(phys);
         }
 
@@ -226,10 +235,11 @@ impl JournalWriter {
         buf[0x1C..0x20].copy_from_slice(&self.jsb.start.to_be_bytes());
 
         // V2 superblocks carry s_checksum at 0xFC. We don't recompute it
-        // here — the kernel does NOT verify the JSB checksum on mount,
-        // and e2fsck's check is a warning, not a failure. Phase 5 may
-        // patch this once we wire JSB checksums end-to-end. For now leave
-        // the existing bytes (best-effort: it'll mismatch but not block).
+        // here — the kernel does NOT verify the JSB checksum on mount;
+        // a userspace consistency-checker would warn but not refuse.
+        // Phase 5 may patch this once we wire JSB checksums end-to-end.
+        // For now leave the existing bytes (best-effort: it'll mismatch
+        // but not block).
         let _ = JBD2_SUPERBLOCK_V2; // silence unused import warning
 
         dev.write_at(phys * bs_u64, &buf)?;

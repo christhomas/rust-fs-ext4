@@ -16,7 +16,8 @@ use std::sync::Arc;
 /// back into the buffer. The op then commits the whole buffer atomically.
 ///
 /// `BTreeMap` so the commit order is deterministic — replay applies
-/// blocks in journal-stored order, which is what e2fsck expects.
+/// blocks in journal-stored order, matching the kernel's expected
+/// transaction layout.
 pub(crate) struct BlockBuffer {
     pub block_size: u32,
     pub dirty: BTreeMap<u64, Vec<u8>>,
@@ -145,28 +146,16 @@ impl Filesystem {
             journal: None,
         };
 
-        // Phase A scope: ext3 RW mount is not yet supported. The journal
-        // inode uses legacy indirect-block addressing (no EXTENTS_FL), and
-        // the journal walker / writer (`jbd2::journal_block_to_physical`,
-        // `JournalWriter::open`) currently both bail on indirect-block
-        // journals. Refusing RW here gives the caller a clear error
-        // instead of a deeper "journal inode uses legacy indirect blocks"
-        // bail, and leaves RO mounts working (they skip the journal
-        // entirely — see `replay_if_dirty`).
-        //
-        // Phase B will lift this restriction once `journal_block_to_physical`
-        // and `JournalWriter::open` route through `indirect::map_logical_any`
-        // (the same dispatcher every other inode walker now uses).
-        if fs.dev.is_writable() && fs.flavor == features::FsFlavor::Ext3 {
-            return Err(Error::Corrupt(
-                "ext3 RW mount not supported in Phase A — open the device read-only",
-            ));
-        }
-
         // Replay a dirty journal if the device is writable. Silently skips
         // for read-only mounts — the read path tolerates a non-clean journal
         // (pending transactions are invisible, which is correct for a
         // read-only view).
+        //
+        // Both the walker (`journal_block_to_physical`) and the writer
+        // (`JournalWriter::open`) now dispatch on `indirect::map_logical_any`,
+        // so ext3 (whose journal inode uses legacy indirect block pointers)
+        // works the same as ext4 (extent tree). The Phase A blanket refusal
+        // of ext3 RW is therefore lifted.
         if !defer_replay && fs.dev.is_writable() {
             // Best-effort: a replay failure here is logged via the returned
             // error but does NOT abort the mount, because many images have
@@ -178,10 +167,10 @@ impl Filesystem {
 
         // Open the live-write journal writer once replay is done. Any
         // pending transactions are now applied; the writer can take over
-        // the JBD2 cursor from a clean state. Skipped for ext3 — the
-        // RW-mount refusal above means we never reach here for ext3, but
-        // the explicit guard makes the dispatch story self-evident.
-        if fs.dev.is_writable() && fs.flavor != features::FsFlavor::Ext3 {
+        // the JBD2 cursor from a clean state. Returns None when there is
+        // no journal at all (ext2), so the if-let handles every flavor
+        // uniformly.
+        if fs.dev.is_writable() {
             if let Some(jw) = crate::journal_writer::JournalWriter::open(&fs)? {
                 fs.journal = Some(std::sync::Mutex::new(jw));
             }

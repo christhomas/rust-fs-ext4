@@ -386,25 +386,82 @@ fn mkfs_ext3_then_mount_ro_and_read_root() {
 }
 
 #[test]
-fn ext3_rw_mount_refused_in_phase_a() {
-    let path = scratch_path("ext3-rw-refused");
+fn mkfs_ext3_rw_roundtrip_create_write_read() {
+    // End-to-end ext3 read+write: mkfs ext3, mount RW (no Phase A blanket
+    // refusal anymore — both jbd2 walker and JournalWriter::open now
+    // dispatch on indirect::map_logical_any), create a file, write content
+    // through the indirect-block writer, read it back via file_io, assert
+    // structural verifier is clean, assert FsFlavor::Ext3 throughout.
+    //
+    // Geometry: 4 MiB image, 1 KiB blocks. Journal lives at the head of
+    // the data region (1024 blocks); user files allocate from what's left.
+    let path = scratch_path("ext3-rw-roundtrip");
     let size: u64 = 4 * 1024 * 1024;
     let block_size: u32 = 1024;
-    mkfs_ext2_image(&path, size, block_size);
+    {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("create scratch");
+        f.set_len(size).expect("set_len");
+    }
+    let dev_rw = FileDevice::open_rw(path.to_str().unwrap()).expect("open rw for mkfs");
+    format_filesystem_with_flavor(
+        &dev_rw,
+        Some("EXT3RW"),
+        None,
+        size,
+        block_size,
+        FsFlavor::Ext3,
+    )
+    .expect("mkfs ext3");
+    drop(dev_rw);
     let _cleanup = ScratchGuard(path.clone());
-    flip_to_ext3_flavor(&path);
 
-    // Read-write mount: must refuse with the Phase A ext3 guard, NOT bail
-    // deep in the journal walker. Either path returns an Err, but the
-    // top-level guard yields a stable, user-facing message.
+    // Mount RW — this is the path the Phase A guard used to refuse.
     let dev = Arc::new(FileDevice::open_rw(path.to_str().unwrap()).expect("open rw"));
-    let err = match Filesystem::mount(dev) {
-        Err(e) => e,
-        Ok(_) => panic!("ext3 RW mount must be refused in Phase A"),
-    };
-    let msg = format!("{err:?}");
+    let fs = Filesystem::mount(dev).expect("ext3 RW mount must succeed in Phase B");
+    assert_eq!(fs.flavor, FsFlavor::Ext3);
+    assert!(fs.dev.is_writable());
     assert!(
-        msg.contains("ext3 RW mount not supported"),
-        "expected Phase A ext3 refusal message, got: {msg}"
+        fs.journal.is_some(),
+        "ext3 RW mount must open the JournalWriter (proves indirect-block dispatch works)"
+    );
+
+    // Create a small file in root + write a deterministic payload that
+    // straddles into the single-indirect tier so the writer exercises
+    // both direct and single-indirect allocation against an ext3 volume.
+    let payload: Vec<u8> = (0..15 * block_size as usize)
+        .map(|i| ((i as u32).wrapping_mul(31) & 0xFF) as u8)
+        .collect();
+    let _ino = fs.apply_create("/hello.bin", 0o644).expect("apply_create");
+    let written = fs
+        .apply_replace_file_content("/hello.bin", &payload)
+        .expect("apply_replace_file_content");
+    assert_eq!(written as usize, payload.len());
+
+    // Read it back via the indirect read path.
+    let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
+    let ino =
+        fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, "/hello.bin").expect("lookup");
+    let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+    assert!(
+        (inode.flags & InodeFlags::EXTENTS.bits()) == 0,
+        "ext3 file inode must not carry EXTENTS_FL"
+    );
+    let read_back = file_io::read_all(&fs, &inode).expect("read_all");
+    assert_eq!(read_back, payload, "ext3 write+read roundtrip mismatch");
+
+    // Structural verifier must report clean — proves the writer credited
+    // every data + indirect-tree block in the bitmap on an ext3 volume.
+    let report = verify::verify(&fs).expect("verify");
+    assert!(
+        report.is_clean(),
+        "ext3 RW post-write verify failed: {}\nerrors:\n  {}",
+        report.summary(),
+        report.errors.join("\n  ")
     );
 }
