@@ -23,10 +23,12 @@
 #   - Linux/x86_64: the default `virtualbox` provider works as-is.
 
 Vagrant.configure("2") do |config|
-  # bento/freebsd-14 is community-maintained, BSD-licensed, and stays
-  # current with FreeBSD point releases. Pinning to a major release tag
-  # avoids surprise-mount-behavior bumps.
-  config.vm.box = "bento/freebsd-14"
+  # generic/freebsd14 ships qemu + libvirt + virtualbox + vmware builds,
+  # so the same Vagrantfile works on every host platform. (The earlier
+  # bento/freebsd-14 alternative is vmware/parallels-only and doesn't
+  # boot on Apple Silicon without a paid hypervisor.) Pin to the major
+  # release tag — point bumps land transparently.
+  config.vm.box = "generic/freebsd14"
 
   # Map the test-disks dir into the VM so the validator script can read
   # them directly. /vagrant is the standard shared-folder mountpoint;

@@ -64,9 +64,20 @@ fi
 if [[ ! -f "$LWEXT4_DIR/build_generic/src/liblwext4.a" ]]; then
     echo "[lwext4] building (cmake + make)"
     pushd "$LWEXT4_DIR" >/dev/null
-    # lwext4 ships a Makefile that drives several cmake builds. The
-    # `generic` flavor is host-tooling-friendly (no embedded targets).
-    make generic >/dev/null
+    # lwext4's Makefile drives several cmake builds. The `generic` flavor
+    # is host-tooling-friendly (no embedded targets). It also pins an old
+    # `cmake_minimum_required(2.x)` which cmake 4.x rejects, so we
+    # configure manually with `CMAKE_POLICY_VERSION_MINIMUM=3.5` and
+    # then run make against the produced build dir.
+    rm -rf build_generic
+    mkdir build_generic
+    (cd build_generic && cmake -G "Unix Makefiles" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DVERSION_MAJOR=1 -DVERSION_MINOR=0 -DVERSION_PATCH=0 -DVERSION=1.0.0 \
+        -DCMAKE_TOOLCHAIN_FILE=../toolchain/generic.cmake \
+        -DCMAKE_POLICY_VERSION_MINIMUM=3.5 \
+        ..) >/dev/null
+    (cd build_generic && make) >/dev/null
     popd >/dev/null
 fi
 

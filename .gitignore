@@ -14,3 +14,9 @@ Cargo.lock.bak
 # Test artifacts
 test-disks/*.img
 !test-disks/.gitkeep
+
+# Cross-validator scratch areas (lwext4 source tree, Vagrant per-VM state).
+# Both are produced by scripts/cross-validate-lwext4.sh and `vagrant up`
+# inside tests/vagrant/freebsd/. Re-runnable, never in source control.
+.lwext4/
+**/.vagrant/
