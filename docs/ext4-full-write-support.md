@@ -198,10 +198,10 @@ Each existing mutating fn gains a transaction:
 - [x] **5.2.2 `apply_chown`** — same `commit_inode_write` route.
 - [x] **5.2.3 `apply_utimens`** — same.
 - [x] **5.2.4 `apply_setxattr` (in-inode)** — same.
-- [ ] **5.2.5 `apply_setxattr` (external block, depends on Phase 3)** —
-  still does direct `dev.write_at` for the xattr block itself; needs a
-  multi-block transaction (xattr block + inode + bitmap + BGD + SB).
-  Inode write on the same op IS journaled via `bump_inode_ctime`.
+- [x] **5.2.5 `apply_setxattr` (external block)** — fully multi-block
+  journaled. xattr block (with patched checksum) + bitmap + BGD + SB
+  + inode update all stage into one BlockBuffer. Path A (rewrite
+  existing block) and Path B (allocate fresh) both atomic.
 - [x] **5.2.6 `apply_truncate_shrink`** — refactored as a multi-block
   journaled transaction. New `BlockBuffer` type accumulates inode +
   bitmap + BGD + SB mutations via `buffer_*` helpers
@@ -227,7 +227,10 @@ journal self-checkpoints back to clean.
   clear, BGD/SB counter updates, and zeroed-inode write into one
   transaction. Pinned by `tests/journal_writer_unlink_rmdir.rs` with
   budget sweep 0..=40.
-- [ ] **5.2.10 `apply_rename`**
+- [x] **5.2.10 `apply_rename`** — multi-block journaled. Buffers
+  add-dst-entry + remove-src-entry + (cross-parent dir) update-`..`
+  + parent-nlink adjustments into one tx. Falls back to un-journaled
+  extend when the dst parent has no room.
 - [x] **5.2.11 `apply_link`** — multi-block journaled. Buffers nlink
   bump + parent dir entry; in-place case fully atomic.
 - [x] **5.2.12 `apply_symlink`** — multi-block journaled. Both fast
@@ -240,12 +243,28 @@ journal self-checkpoints back to clean.
   target-data-block frees, inode-slot free + used_dirs decrement,
   BGD/SB counters, parent-dir-entry removal, parent nlink decrement
   into one transaction.
-- [ ] **5.2.15 `apply_replace_file_content`**
+- [x] **5.2.15 `apply_replace_file_content`** — multi-block journaled
+  (extents path). Buffers: free old data runs (per-extent BGD credit)
+  + alloc new run + bitmap + BGD + SB + payload data blocks (via
+  `BlockBuffer::put`) + extent root + inode update. Atomic across the
+  whole replace. Indirect path (`apply_replace_file_content_indirect`)
+  remains un-journaled — applies only to ext2/3 mounts which don't
+  have a journal anyway.
 
-Helpers needing a "buffer-twin" before the rest of 5.2 can ship
-journaled: `add_dir_entry`, `extend_dir_and_add_entry`,
-`extend_dir_and_add_entry_depth1`, `mark_inode_used` (already done),
-`set_block_run_used` (mostly done — see `buffer_mark_block_run_used`).
+All single-helper buffer-twins now exist:
+- `buffer_write_inode`
+- `buffer_mark_inode_used`, `buffer_free_inode_slot`
+- `buffer_mark_block_run_used`, `buffer_free_block_run_and_bgd`
+- `buffer_patch_bgd_counters`, `buffer_patch_sb_counters`
+- `buffer_add_dir_entry_inplace`, `buffer_remove_dir_entry`
+- `buffer_update_dotdot`
+- `commit_block_buffer`
+
+Outstanding helper that still does direct disk writes:
+`extend_dir_and_add_entry` (and depth-1 variant). Used as the
+fallback path when an in-place dir entry insert fails. Refactoring
+it requires a buffer-aware `plan_promote_leaf` adaptation which is
+~150 LoC of careful work; deferred.
 
 ### 5.3 Journal modes
 

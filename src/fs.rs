@@ -870,6 +870,73 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Buffer-side equivalent of `remove_dir_entry`: scans `parent`'s
+    /// dir blocks, removes the named entry, recomputes the tail csum,
+    /// stages the modified block in `buf`. Returns `Error::NotFound`
+    /// when the name isn't present.
+    pub(crate) fn buffer_remove_dir_entry(
+        &self,
+        buf: &mut BlockBuffer,
+        parent_ino: u32,
+        parent_inode: &Inode,
+        name: &[u8],
+    ) -> Result<()> {
+        let bs = self.sb.block_size();
+        let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+        let n_blocks = parent_inode.size.div_ceil(bs as u64);
+        for logical in 0..n_blocks {
+            let Some(phys) = self.map_inode_logical(parent_inode, logical)? else {
+                continue;
+            };
+            let block = buf.get_mut(self, phys)?;
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
+                12
+            } else {
+                0
+            };
+            if crate::dir::remove_entry_from_block(block, name, has_ft, reserved_tail)? {
+                if self.csum.enabled && reserved_tail == 12 {
+                    let end = block.len();
+                    let mut c =
+                        crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
+                    c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
+                    c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
+                    block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+                }
+                return Ok(());
+            }
+        }
+        Err(Error::NotFound)
+    }
+
+    /// Buffer-side equivalent of `update_dotdot`: rewrites the `..`
+    /// entry in `dir_inode`'s first data block (in-buffer) to point at
+    /// `new_parent_ino`, recomputes the tail csum.
+    pub(crate) fn buffer_update_dotdot(
+        &self,
+        buf: &mut BlockBuffer,
+        dir_ino: u32,
+        dir_inode: &Inode,
+        new_parent_ino: u32,
+    ) -> Result<()> {
+        let phys = self
+            .map_inode_logical(dir_inode, 0)?
+            .ok_or(Error::Corrupt("buffer_update_dotdot: dir block 0 missing"))?;
+        let block = buf.get_mut(self, phys)?;
+        if block.len() < 24 {
+            return Err(Error::Corrupt("buffer_update_dotdot: dir block too small"));
+        }
+        block[12..16].copy_from_slice(&new_parent_ino.to_le_bytes());
+        if self.csum.enabled && crate::dir::has_csum_tail(block) {
+            let end = block.len();
+            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &dir_ino.to_le_bytes());
+            c = crate::checksum::linux_crc32c(c, &dir_inode.generation.to_le_bytes());
+            c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
+            block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        }
+        Ok(())
+    }
+
     /// Buffer-side equivalent of `add_dir_entry` for the IN-PLACE case
     /// only (an existing parent block has room for the new entry). The
     /// dir block is read into the buffer (or reused if already touched),
@@ -1156,7 +1223,11 @@ impl Filesystem {
         let bs = self.sb.block_size();
         let bs_u64 = bs as u64;
 
-        // Path A: existing external block — read, rewrite, re-checksum, write.
+        // Multi-block transaction: xattr block bytes + (alloc-side bitmap +
+        // BGD + SB when fresh-block) + inode body. Atomic across the op.
+        let mut buf = BlockBuffer::new(bs);
+
+        // Path A: existing external block — rewrite in-buffer, re-checksum.
         if inode.file_acl != 0 {
             let block_nr = inode.file_acl;
             let mut block = vec![0u8; bs as usize];
@@ -1165,20 +1236,21 @@ impl Filesystem {
             if self.csum.enabled {
                 self.csum.patch_xattr_block(block_nr, &mut block);
             }
-            self.dev.write_at(block_nr * bs_u64, &block)?;
-            // i_file_acl unchanged — no need to rewrite the inode body, but
-            // POSIX wants ctime bumped on any attribute write.
-            self.bump_inode_ctime(ino, inode.generation, raw)?;
-            self.dev.flush()?;
-            return Ok(());
+            buf.put(block_nr, block);
+            // i_file_acl unchanged — only need to bump ctime.
+            let now = now_unix_seconds();
+            raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+            self.finalize_inode_raw(ino, inode.generation, raw)?;
+            self.buffer_write_inode(&mut buf, ino, raw)?;
+            return self.commit_block_buffer(buf);
         }
 
-        // Path B: no external block yet — allocate, build, write, then
+        // Path B: no external block yet — allocate, build, stage, then
         // point i_file_acl + i_blocks at it.
         let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs_u64, &mut buf)?;
-            Ok(buf)
+            let mut tmp = vec![0u8; bs as usize];
+            self.dev.read_at(block * bs_u64, &mut tmp)?;
+            Ok(tmp)
         };
         let inode_group = (ino - 1) / self.sb.inodes_per_group;
         let plan = crate::alloc::plan_block_allocation(
@@ -1195,13 +1267,25 @@ impl Filesystem {
         if self.csum.enabled {
             self.csum.patch_xattr_block(block_nr, &mut block);
         }
-        self.dev.write_at(block_nr * bs_u64, &block)?;
+        buf.put(block_nr, block);
 
-        // Apply the allocator plan: bitmap bit, BGD, SB (single helper).
-        self.commit_block_alloc(&plan)?;
+        // Stage allocator side-effects in the buffer.
+        self.buffer_mark_block_run_used(&mut buf, block_nr, 1)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            plan.sb.free_blocks_delta,
+            plan.sb.free_inodes_delta,
+        )?;
 
         // Splice block_nr into the inode: i_file_acl_lo at 0x68..0x6C, hi
-        // at 0x74..0x76 (matches `Inode::file_acl` decode in inode.rs).
+        // at 0x74..0x76.
         let acl_lo = (block_nr & 0xFFFF_FFFF) as u32;
         let acl_hi = ((block_nr >> 32) & 0xFFFF) as u16;
         raw[0x68..0x6C].copy_from_slice(&acl_lo.to_le_bytes());
@@ -1213,13 +1297,12 @@ impl Filesystem {
         let sectors_per_block = bs_u64 / 512;
         let new_blocks = inode.blocks.saturating_add(sectors_per_block);
         Self::patch_inode_size_and_blocks(raw, inode.size, new_blocks)?;
-        // ctime bump + checksum + write inode.
         let now = now_unix_seconds();
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
         self.finalize_inode_raw(ino, inode.generation, raw)?;
-        self.write_inode_raw(ino, raw)?;
-        self.dev.flush()?;
-        Ok(())
+        self.buffer_write_inode(&mut buf, ino, raw)?;
+
+        self.commit_block_buffer(buf)
     }
 
     /// Bump `i_ctime` to now and re-checksum + write the inode. Used on
@@ -1928,48 +2011,49 @@ impl Filesystem {
         let sectors_per_block = bs as u64 / 512;
         let group_idx_of_inode = ((ino - 1) / self.sb.inodes_per_group) as usize;
 
-        // Phase 1: free any existing data blocks. Reuses the extent-shrink
-        // planner which handles partial tail extents cleanly. Each freed
-        // run credits its own group's BGD via `free_block_run_and_bgd`,
-        // so cross-group fragmented files are accounted for correctly.
+        // Multi-block transaction: free existing data + alloc new run +
+        // bitmap + BGD + SB + new data block contents + inode update.
+        // Atomic across the whole replace.
+        let mut buf = BlockBuffer::new(bs);
+
+        // Phase 1: free existing data blocks. Each freed run credits its
+        // own group's BGD via `buffer_free_block_run_and_bgd`.
         let mut freed_fs_blocks: u64 = 0;
         if inode.size > 0 {
             let (_sc, muts) =
                 crate::file_mut::plan_truncate_shrink(inode.size, 0, &inode.block, bs)?;
             for m in &muts {
                 if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                    freed_fs_blocks += self.free_block_run_and_bgd(*start, *len as u64)?;
+                    freed_fs_blocks +=
+                        self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
                 }
             }
         }
-        // Reset the inode's extent root to an empty leaf. Any prior content
-        // is now unreferenced.
+
+        // Reset the inode's extent root to an empty leaf.
         let mut root = vec![0u8; 60];
         root[0..2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
         root[4..6].copy_from_slice(&4u16.to_le_bytes()); // max entries
         Self::patch_inode_block_area(&mut raw, &root)?;
 
         // Empty write: BGDs already credited per-run above; only SB needs
-        // a single update.
+        // a single update + inode rewrite.
         if data.is_empty() {
-            self.finalize_inode_after_write(ino, &mut raw, &inode, 0, 0)?;
+            self.finalize_inode_raw_after_write(ino, &mut raw, &inode, 0, 0)?;
             if freed_fs_blocks > 0 {
-                self.patch_sb_counters(freed_fs_blocks as i64, 0)?;
+                self.buffer_patch_sb_counters(&mut buf, freed_fs_blocks as i64, 0)?;
             }
-            self.dev.flush()?;
+            self.buffer_write_inode(&mut buf, ino, &raw)?;
+            self.commit_block_buffer(buf)?;
             return Ok(0);
         }
 
         // Phase 2: allocate one contiguous run for the whole payload.
-        //
-        // plan_block_allocation refuses to split; callers with highly
-        // fragmented images get an Err back and can fall back to a
-        // piecewise strategy (not implemented yet).
         let needed_blocks: u32 = data.len().div_ceil(bs as usize) as u32;
         let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs as u64, &mut buf)?;
-            Ok(buf)
+            let mut tmp = vec![0u8; bs as usize];
+            self.dev.read_at(block * bs as u64, &mut tmp)?;
+            Ok(tmp)
         };
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
@@ -1981,27 +2065,28 @@ impl Filesystem {
 
         // Phase 3: mark allocated bitmap + patch destination BGD; SB nets
         // the alloc delta against the freed total computed above.
-        self.set_block_run_used(plan.first_block, needed_blocks as u64)?;
-        self.patch_bgd_counters(
+        self.buffer_mark_block_run_used(&mut buf, plan.first_block, needed_blocks as u64)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
             plan.bgd.group_idx as usize,
             plan.bgd.free_blocks_delta,
             plan.bgd.free_inodes_delta,
             plan.bgd.used_dirs_delta,
         )?;
         let net_block_delta = freed_fs_blocks as i64 - needed_blocks as i64;
-        self.patch_sb_counters(net_block_delta, 0)?;
+        self.buffer_patch_sb_counters(&mut buf, net_block_delta, 0)?;
 
-        // Phase 4: write the payload into the allocated physical run.
+        // Phase 4: stage the payload into the allocated physical run.
         for i in 0..needed_blocks as u64 {
             let off_in_data = (i as usize) * bs as usize;
             let chunk_end = ((i as usize + 1) * bs as usize).min(data.len());
             let mut block = vec![0u8; bs as usize];
             block[..chunk_end - off_in_data].copy_from_slice(&data[off_in_data..chunk_end]);
-            self.dev
-                .write_at((plan.first_block + i) * bs as u64, &block)?;
+            buf.put(plan.first_block + i, block);
         }
 
-        // Phase 5: insert the single extent into the (now-empty) inline root.
+        // Phase 5: insert the single extent into the (now-empty) inline
+        // root and stage the inode.
         let new_extent = crate::extent::Extent {
             logical_block: 0,
             length: needed_blocks as u16,
@@ -2014,12 +2099,12 @@ impl Filesystem {
                 Self::patch_inode_block_area(&mut raw, bytes)?;
             }
         }
-
-        // Phase 6: update size + blocks + csum and persist the inode.
         let new_size = data.len() as u64;
         let new_sectors = needed_blocks as u64 * sectors_per_block;
-        self.finalize_inode_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
-        self.dev.flush()?;
+        self.finalize_inode_raw_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
+        self.buffer_write_inode(&mut buf, ino, &raw)?;
+
+        self.commit_block_buffer(buf)?;
         Ok(new_size)
     }
 
@@ -2166,8 +2251,23 @@ impl Filesystem {
         new_size: u64,
         new_sectors: u64,
     ) -> Result<()> {
+        self.finalize_inode_raw_after_write(ino, raw, orig, new_size, new_sectors)?;
+        self.write_inode_raw(ino, raw)
+    }
+
+    /// Buffer-friendly variant of `finalize_inode_after_write`: patches
+    /// size, blocks, ctime, mtime, and checksum on `raw` IN PLACE without
+    /// writing to disk. Caller stages the result via `buffer_write_inode`
+    /// so the inode update is atomic with the surrounding multi-block tx.
+    fn finalize_inode_raw_after_write(
+        &self,
+        ino: u32,
+        raw: &mut [u8],
+        orig: &Inode,
+        new_size: u64,
+        new_sectors: u64,
+    ) -> Result<()> {
         Self::patch_inode_size_and_blocks(raw, new_size, new_sectors)?;
-        // Bump mtime + ctime = now (atime left alone; matches POSIX).
         let now = now_unix_seconds();
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
@@ -2179,7 +2279,7 @@ impl Filesystem {
                 }
             }
         }
-        self.write_inode_raw(ino, raw)
+        Ok(())
     }
 
     /// Mark `len` bits starting at block `start` as USED in the containing
@@ -2930,38 +3030,58 @@ impl Filesystem {
             _ => crate::dir::DirEntryType::Unknown,
         };
 
-        // 1. Insert the new entry in the destination parent BEFORE removing
-        //    the source, so a mid-operation failure leaves the source
-        //    findable (at the cost of a possible duplicate if we crash
-        //    between insert and remove — acceptable pre-journaling).
-        self.add_dir_entry(
+        // Multi-block transaction: insert dst entry + remove src entry +
+        // (cross-parent dir) update .. + adjust parent nlinks. Atomic so
+        // a crash either fully renames or leaves the original.
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+
+        let dst_extends = match self.buffer_add_dir_entry_inplace(
+            &mut buf,
             dst_parent_ino,
             &dst_parent_inode,
             dst_name.as_bytes(),
             src_ino,
             dir_type,
-        )?;
+        ) {
+            Ok(()) => false,
+            Err(Error::OutOfBounds) => true,
+            Err(e) => return Err(e),
+        };
 
-        // 2. Remove from the source parent.
-        self.remove_dir_entry(src_parent_ino, &src_parent_inode, src_name.as_bytes())?;
-
-        // 3. Cross-parent dir move: fix `..` + adjust parent nlinks.
-        if src_is_dir && src_parent_ino != dst_parent_ino {
-            self.update_dotdot(src_ino, &src_inode, dst_parent_ino)?;
-
-            // Source parent loses one subdir -> -1 nlink.
-            let (sp_inode, mut sp_raw) = self.read_inode_verified(src_parent_ino)?;
-            self.patch_inode_nlink(src_parent_ino, &mut sp_raw, &sp_inode, -1)?;
-            self.write_inode_raw(src_parent_ino, &sp_raw)?;
-
-            // Dest parent gains one -> +1.
-            let (dp_inode, mut dp_raw) = self.read_inode_verified(dst_parent_ino)?;
-            self.patch_inode_nlink(dst_parent_ino, &mut dp_raw, &dp_inode, 1)?;
-            self.write_inode_raw(dst_parent_ino, &dp_raw)?;
+        if dst_extends {
+            // Dest parent full → fall back to the un-journaled extend.
+            // Commit any partial state first to avoid mixing journaled
+            // and un-journaled writes that race.
+            self.commit_block_buffer(buf)?;
+            self.extend_dir_and_add_entry(dst_parent_ino, dst_name.as_bytes(), src_ino, dir_type)?;
+            // Now the source removal + .. + nlink adjustments in a
+            // fresh buffer.
+            buf = BlockBuffer::new(self.sb.block_size());
         }
 
-        self.dev.flush()?;
-        Ok(())
+        self.buffer_remove_dir_entry(
+            &mut buf,
+            src_parent_ino,
+            &src_parent_inode,
+            src_name.as_bytes(),
+        )?;
+
+        if src_is_dir && src_parent_ino != dst_parent_ino {
+            self.buffer_update_dotdot(&mut buf, src_ino, &src_inode, dst_parent_ino)?;
+
+            // Source parent loses one subdir → -1 nlink.
+            let (sp_inode, mut sp_raw) = self.read_inode_verified(src_parent_ino)?;
+            self.patch_inode_nlink(src_parent_ino, &mut sp_raw, &sp_inode, -1)?;
+            self.buffer_write_inode(&mut buf, src_parent_ino, &sp_raw)?;
+
+            // Dest parent gains one → +1. Re-read in case extend
+            // rewrote it above.
+            let (dp_inode, mut dp_raw) = self.read_inode_verified(dst_parent_ino)?;
+            self.patch_inode_nlink(dst_parent_ino, &mut dp_raw, &dp_inode, 1)?;
+            self.buffer_write_inode(&mut buf, dst_parent_ino, &dp_raw)?;
+        }
+
+        self.commit_block_buffer(buf)
     }
 
     /// Insert `name → target_ino` into `parent_inode`'s linear directory
