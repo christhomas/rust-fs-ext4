@@ -66,6 +66,13 @@ pub struct Superblock {
     pub default_hash_version: u8,
     pub checksum_seed: u32, // s_checksum_seed (used when INCOMPAT_CSUM_SEED)
     pub journal_inode: u32,
+    /// `s_last_orphan` (0xE8). Head of the orphan-inode list — inodes
+    /// whose link count reached zero while still open. The kernel
+    /// inserts unlink-while-open targets here so that, on the next
+    /// mount, recovery can reclaim them. Each inode's `i_dtime` field
+    /// is overloaded to point at the next orphan in the chain; the
+    /// chain terminates with a zero `dtime`.
+    pub last_orphan: u32,
     /// `s_mtime` (0x2C). Timestamp the FS was last mounted.
     pub mtime: u32,
     /// `s_wtime` (0x30). Timestamp the FS was last written to.
@@ -206,6 +213,7 @@ impl Superblock {
 
         let checksum_seed = u32::from_le_bytes(raw[0x270..0x274].try_into().unwrap());
         let journal_inode = u32::from_le_bytes(raw[0xE0..0xE4].try_into().unwrap());
+        let last_orphan = u32::from_le_bytes(raw[0xE8..0xEC].try_into().unwrap());
 
         // Reject impossible geometry early so downstream arithmetic never
         // divides by zero. All three are required for the filesystem to
@@ -259,6 +267,7 @@ impl Superblock {
             default_hash_version,
             checksum_seed,
             journal_inode,
+            last_orphan,
             mtime,
             wtime,
             mnt_count,

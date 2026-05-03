@@ -197,6 +197,42 @@ impl Filesystem {
         crate::journal_apply::replay_if_dirty(self)
     }
 
+    /// Phase 6.1 — walk the orphan inode chain rooted at `s_last_orphan`
+    /// and return its members in chain order.
+    ///
+    /// Each orphan inode is a unlink-while-open candidate: its data
+    /// blocks should be reclaimed by recovery. The chain is encoded by
+    /// overloading `i_dtime` as "next orphan inode number"; the chain
+    /// terminates when `dtime == 0`. We cap at `inodes_count` to avoid
+    /// runaway loops on cycle-corrupted images.
+    ///
+    /// Read-only (no recovery yet — that's Phase 6.2). Returns `Ok([])`
+    /// when there are no orphans.
+    pub fn orphan_list(&self) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        let mut cur = self.sb.last_orphan;
+        let cap = self.sb.inodes_count;
+        let mut steps = 0u32;
+        while cur != 0 {
+            if steps > cap {
+                return Err(Error::Corrupt(
+                    "orphan_list: chain longer than inodes_count (cycle?)",
+                ));
+            }
+            out.push(cur);
+            // Read the inode's i_dtime (offset 0x14..0x18) to find the
+            // next link. Don't go through read_inode_verified because an
+            // orphan inode's checksum may be stale by design.
+            let raw = self.read_inode_raw(cur)?;
+            if raw.len() < 0x18 {
+                return Err(Error::Corrupt("orphan_list: inode too short"));
+            }
+            cur = u32::from_le_bytes(raw[0x14..0x18].try_into().unwrap());
+            steps += 1;
+        }
+        Ok(out)
+    }
+
     /// Read a whole block by its logical block number.
     pub fn read_block(&self, block_num: u64) -> Result<Vec<u8>> {
         let block_size = self.sb.block_size() as usize;

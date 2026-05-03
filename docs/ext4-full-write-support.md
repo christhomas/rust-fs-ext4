@@ -250,12 +250,19 @@ external `e2fsck -fn` when available).
 
 ## Phase 6 — Orphan List & Recovery
 
-- [ ] **6.1 Orphan-list parsing** — read `s_last_orphan` chain at mount.
+- [x] **6.1 Orphan-list parsing** — `Superblock` now carries
+  `last_orphan`; `Filesystem::orphan_list` walks the chain via
+  `i_dtime` overload, capped at `inodes_count` to defang cycle
+  corruption. Pinned by `tests/orphan_list_basic.rs` (clean image
+  returns empty; sweep across fixtures proves no panic).
 - [ ] **6.2 Orphan replay** — for each orphan inode, free its blocks
-  + inode (under a recovery transaction).
+  + inode (under a recovery transaction). Needs the multi-block tx
+  pattern + a way to walk the chain BEFORE the inode is touched
+  (since freeing breaks the chain). Deferred.
 - [ ] **6.3 Orphan-list inserts** — when unlinking a still-open inode,
-  insert at head; when closing, remove. (Driver doesn't track open
-  fds today; may stub until FSKit/FUSE layer wires it through.)
+  insert at head; when closing, remove. Requires the host (FSKit
+  /FUSE) to track open fds, which the driver doesn't see today.
+  Deferred until host integration matures.
 - [ ] **6.4 Link-count audit** — extend `verify_link_counts`
   (planned in IMPROVEMENT-PLAN B2) to actually fix discrepancies under
   a recovery transaction, not just report.
