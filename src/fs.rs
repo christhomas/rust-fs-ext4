@@ -1144,15 +1144,8 @@ impl Filesystem {
         }
         self.dev.write_at(block_nr * bs_u64, &block)?;
 
-        // Apply the allocator plan: bitmap bit, BGD, SB.
-        self.set_block_run_used(block_nr, 1)?;
-        self.patch_bgd_counters(
-            plan.bgd.group_idx as usize,
-            plan.bgd.free_blocks_delta,
-            plan.bgd.free_inodes_delta,
-            plan.bgd.used_dirs_delta,
-        )?;
-        self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        // Apply the allocator plan: bitmap bit, BGD, SB (single helper).
+        self.commit_block_alloc(&plan)?;
 
         // Splice block_nr into the inode: i_file_acl_lo at 0x68..0x6C, hi
         // at 0x74..0x76 (matches `Inode::file_acl` decode in inode.rs).
@@ -2180,6 +2173,25 @@ impl Filesystem {
     /// Mark `len` bits starting at block `start` as USED in the containing
     /// block group's bitmap. Mirrors `free_block_run` but sets rather than
     /// clears. Assumes the run lies entirely within one group (same caveat).
+    /// Phase 1.2: Apply a `BlockAllocationPlan` end-to-end on the un-
+    /// journaled path — bitmap mark + BGD counter patch + SB counter
+    /// patch in one call. Used by ops that haven't been migrated to the
+    /// BlockBuffer pattern yet (apply_create's data write, etc.); the
+    /// journaled path uses `buffer_mark_block_run_used` +
+    /// `buffer_patch_bgd_counters` + `buffer_patch_sb_counters`
+    /// against a `BlockBuffer` instead.
+    fn commit_block_alloc(&self, plan: &crate::alloc::BlockAllocationPlan) -> Result<()> {
+        self.set_block_run_used(plan.first_block, plan.count as u64)?;
+        self.patch_bgd_counters(
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        Ok(())
+    }
+
     fn set_block_run_used(&self, start: u64, len: u64) -> Result<()> {
         let bpg = self.sb.blocks_per_group as u64;
         let first_data = self.sb.first_data_block as u64;

@@ -60,11 +60,13 @@ in agreement. Today some paths drift.
   `apply_rmdir`) routed through it, eliminating the prior single-group
   assumption. SB updated once per high-level op. Pinned by
   `tests/alloc_counter_consistency.rs`.
-- [ ] **1.2 Allocator commit helper** — extract a `commit_block_alloc(plan)` /
-  `commit_block_free(plan)` pair next to `plan_block_allocation` so every
-  caller goes through the same bitmap+BGD+SB sequence. Same for inode
-  alloc/free. (Partially done for the free side via 1.1; alloc side still
-  has the manual three-call dance — fold into a helper.)
+- [x] **1.2 Allocator commit helper** — `Filesystem::commit_block_alloc`
+  consolidates bitmap mark + BGD patch + SB patch into one call for
+  the un-journaled disk-write path. Buffer-side equivalents
+  (`buffer_mark_block_run_used` + `buffer_patch_bgd_counters` +
+  `buffer_patch_sb_counters`) cover the journaled path.
+  `commit_block_free` style not added — covered by
+  `free_block_run_and_bgd` (1.1).
 - [ ] **1.3 Audit every `dev.write_at` outside the helpers** — grep for
   raw writes in `fs.rs`, ensure each one is paired with the appropriate
   csum patch (`patch_inode_checksum`, `patch_extent_tail`,
@@ -130,6 +132,9 @@ an inode, reads them back, removes them, asserts block is freed.
 
 ## Phase 4 — Extent Tree Depth ≥ 2
 
+Detailed design lives in `docs/extent-tree-depth2-design.md`. Summary
+of the work items:
+
 - [ ] **4.1 Generalize `read_leaf_entries` → `read_node_entries`** —
   `src/extent_mut.rs:83`. Return a `NodeContents::Leaf(Vec<Extent>)` or
   `NodeContents::Index(Vec<ExtentIdx>)` enum.
@@ -138,15 +143,17 @@ an inode, reads them back, removes them, asserts block is freed.
 - [ ] **4.3 `plan_promote_index`** — when the inline root's index
   children overflow, allocate two index blocks, redistribute, root
   becomes depth+1.
-- [ ] **4.4 Recursive descent in `plan_insert_extent`** — climb the
-  tree to the correct leaf, perform split, bubble new index entries
-  upward, promote root if needed.
+- [ ] **4.4 Recursive descent in `plan_insert_extent_deep`** — climb
+  the tree to the correct leaf, perform split, bubble new index
+  entries upward, promote root if needed.
 - [ ] **4.5 `plan_merge_adjacent` across leaves** — when truncate or
   punch-hole leaves an empty leaf, free it and remove the parent's
   index entry; collapse depth if root becomes single-entry.
 - [ ] **4.6 Index-block checksum** — `et_checksum` in the tail of every
   non-root extent block. Reuse `patch_extent_tail`; verify it works for
   index nodes too.
+
+Estimated effort: one full session (~400 LoC algorithm + ~250 LoC tests).
 
 Acceptance: synthetic test builds a file with 1,000 fragmented extents
 (spanning 3 levels), reads every byte, truncates, asserts allocator
