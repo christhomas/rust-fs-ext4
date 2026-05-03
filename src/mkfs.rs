@@ -162,21 +162,19 @@ pub fn format_filesystem_with_flavor(
         ));
     }
 
-    // ext3 also reserves inode 8 for the journal. ext4 traditionally puts
-    // the journal at inode 8 too but our ext4 path doesn't ship one in
-    // Phase A (matches the existing "no journal" mkfs.rs preamble).
-    let extra_used_inodes: u32 = if matches!(flavor, FsFlavor::Ext3) {
-        1
-    } else {
-        0
-    };
+    // e2fsprogs convention: inodes 1..s_first_ino-1 are all "reserved-used"
+    // in the bitmap regardless of whether the FS actually populates them.
+    // build_superblock pins s_first_ino = 11, so inodes 1..=10 are all
+    // marked used. ext3's journal at inode 8 falls inside that range, so
+    // no flavor-specific bookkeeping is needed for free_inodes.
+    const RESERVED_INODES: u32 = 10;
     let used_blocks: u64 = if matches!(flavor, FsFlavor::Ext3) {
         journal_data_end // blocks 0..journal_data_end
     } else {
         root_dir_block + 1
     };
     let free_blocks: u64 = blocks_count - used_blocks;
-    let free_inodes: u32 = inodes_per_group - 2 - extra_used_inodes;
+    let free_inodes: u32 = inodes_per_group - RESERVED_INODES;
 
     let uuid = uuid.unwrap_or_else(generate_uuid);
 
@@ -228,17 +226,10 @@ pub fn format_filesystem_with_flavor(
         /* used_dirs */ 1, // root dir lives in group 0
         desc_size,
     );
-    // BGD CRC slot lives at 0x1E..0x20 in the 64-byte layout. Skipped for
-    // ext2 (no metadata_csum) — the kernel only validates the slot when
-    // the FS opts into csums via the RO_COMPAT bit.
-    if csum_enabled {
-        let mut tmp = bgd.clone();
-        tmp[0x1E] = 0;
-        tmp[0x1F] = 0;
-        let bgd_csum_full = csum.crc_with_prefix(0u32, &tmp);
-        let bgd_csum16 = (bgd_csum_full & 0xFFFF) as u16;
-        bgd[0x1E..0x20].copy_from_slice(&bgd_csum16.to_le_bytes());
-    }
+    // (BGD CRC is patched LATER, once the bitmap csums have been written
+    // into 0x18/0x1A/0x38/0x3A — otherwise fsck.ext4 -fnv reports
+    // "Group 0 inode/block bitmap does not match checksum" because the
+    // BGD it CRCs over carries stale bitmap-csum slots.)
 
     // ----- Block bitmap (group 0) ------------------------------------------
     // Bits 0..used_blocks are used (for ext3 this includes the journal
@@ -264,12 +255,20 @@ pub fn format_filesystem_with_flavor(
     }
 
     // ----- Inode bitmap (group 0) ------------------------------------------
-    // ext4 inode numbers are 1-based; bit i = inode (i+1).
+    // ext4 inode numbers are 1-based; bit i = inode (i+1). e2fsprogs marks
+    // every reserved inode (1..s_first_ino) as used so fsck.ext4 -fnv
+    // doesn't report "Inode bitmap differences: +(3--10)" — fix that
+    // by setting bits 0..RESERVED_INODES (inodes 1..=10). Then tail-pad
+    // bits past inodes_per_group up to the bitmap block boundary so the
+    // bitmap checksum matches what e2fsck recomputes (which assumes all
+    // out-of-range bits are 1 — "Padding at end of inode bitmap is not set").
     let mut inode_bitmap = vec![0u8; block_size as usize];
-    inode_bitmap[0] |= 0b0000_0011; // inodes 1 and 2
-    if matches!(flavor, FsFlavor::Ext3) {
-        // Inode 8 = journal inode (ext3/ext4 convention). bit 7 of byte 0.
-        inode_bitmap[0] |= 1 << ((EXT3_JOURNAL_INODE - 1) % 8);
+    for i in 0..RESERVED_INODES {
+        inode_bitmap[(i / 8) as usize] |= 1 << (i % 8);
+    }
+    let bitmap_bits = block_size * 8;
+    for i in inodes_per_group..bitmap_bits {
+        inode_bitmap[(i / 8) as usize] |= 1 << (i % 8);
     }
 
     // ----- Inode table (group 0) — only inode 2 has content ----------------
@@ -388,6 +387,37 @@ pub fn format_filesystem_with_flavor(
         c = linux_crc32c(c, &0u32.to_le_bytes()); // generation = 0
         c = linux_crc32c(c, &root_dir[..root_dir.len() - 12]);
         root_dir[end - 4..end].copy_from_slice(&c.to_le_bytes());
+    }
+
+    // ----- BGD bitmap-csums + final BGD csum -------------------------------
+    // Per Linux `fs/ext4/bitmap.c::ext4_{block,inode}_bitmap_csum_set`:
+    //   bb_csum = crc32c(seed, bitmap[0..blocks_per_group / 8])
+    //   ib_csum = crc32c(seed, bitmap[0..inodes_per_group / 8])
+    // Stored split into 16-bit lo (BGD 0x18 / 0x1A) + 16-bit hi
+    // (BGD 0x38 / 0x3A; 64-byte-desc only). e2fsck recomputes both and
+    // refuses the volume if the slots don't match. Skipped when csums
+    // are off (ext2) so the slots stay zero, matching e2fsprogs.
+    if csum_enabled {
+        let bb_sz = (blocks_per_group as usize) / 8;
+        let ib_sz = (inodes_per_group as usize) / 8;
+        let bb_csum = csum.crc(&block_bitmap[..bb_sz.min(block_bitmap.len())]);
+        let ib_csum = csum.crc(&inode_bitmap[..ib_sz.min(inode_bitmap.len())]);
+        bgd[0x18..0x1A].copy_from_slice(&((bb_csum & 0xFFFF) as u16).to_le_bytes());
+        bgd[0x1A..0x1C].copy_from_slice(&((ib_csum & 0xFFFF) as u16).to_le_bytes());
+        if desc_size >= 64 {
+            bgd[0x38..0x3A].copy_from_slice(&((bb_csum >> 16) as u16).to_le_bytes());
+            bgd[0x3A..0x3C].copy_from_slice(&((ib_csum >> 16) as u16).to_le_bytes());
+        }
+
+        // BGD CRC slot lives at 0x1E..0x20. Computed over the full
+        // descriptor with the slot itself zeroed, prefixed by the LE
+        // group number (0 for group 0). Folded down to its low 16 bits.
+        let mut tmp = bgd.clone();
+        tmp[0x1E] = 0;
+        tmp[0x1F] = 0;
+        let bgd_csum_full = csum.crc_with_prefix(0u32, &tmp);
+        let bgd_csum16 = (bgd_csum_full & 0xFFFF) as u16;
+        bgd[0x1E..0x20].copy_from_slice(&bgd_csum16.to_le_bytes());
     }
 
     // ----- Write everything out --------------------------------------------
