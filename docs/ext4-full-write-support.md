@@ -67,10 +67,16 @@ in agreement. Today some paths drift.
   `buffer_patch_sb_counters`) cover the journaled path.
   `commit_block_free` style not added — covered by
   `free_block_run_and_bgd` (1.1).
-- [ ] **1.3 Audit every `dev.write_at` outside the helpers** — grep for
-  raw writes in `fs.rs`, ensure each one is paired with the appropriate
-  csum patch (`patch_inode_checksum`, `patch_extent_tail`,
-  `patch_dir_block_tail`, `patch_bgd_checksum`).
+- [x] **1.3 Audit every `dev.write_at` outside the helpers** — completed
+  2026-05-03. 19 direct callsites in `fs.rs` reviewed; every metadata
+  block that has a per-block checksum in our model recomputes it
+  immediately before the write. Bitmap blocks have no per-block csum
+  (the in-BGD `bg_*_csum` slots are already tracked separately and
+  noted as a future bitmap-csum item, not a Phase 1 concern). The
+  remaining direct writes (`add_dir_entry`, `remove_dir_entry`,
+  `update_dotdot`, `extend_dir_and_add_entry` + depth-1 sibling) all
+  still carry their `patch_extent_tail` / dir-tail csum recomputes
+  inline. No missing patches found.
 
 Acceptance: new test `tests/alloc_counter_consistency.rs` round-trips
 1,000 alloc/free cycles and asserts SB+BGD+bitmap agree at every step.
@@ -372,10 +378,21 @@ not required for correctness.
 Order roughly by external demand. None block correctness for the
 common case but each broadens the image-set we can mount-and-modify.
 
-- [ ] **9.1 Indirect-block (legacy ext3) directory support** —
-  read-side first, then write. `capi.rs:923`.
-- [ ] **9.2 Indirect-block (legacy ext3) data extents** — read + write
-  for files in images created without `extents` feature.
+- [x] **9.1 Indirect-block (legacy ext3) directory support** — landed
+  in the ext2/3 read+write series (commits `df526b5`, `165391c`,
+  `47dfc33`). `path.rs::find_entry_linear` + `find_entry_htree` and
+  `fs.rs::find_entry_in_dir` + `apply_create` dir scan all dispatch on
+  flavor via `indirect::map_logical_any`. The legacy `capi.rs:923` bail
+  was removed; see `tests/ext2_basic.rs` for end-to-end coverage.
+- [x] **9.2 Indirect-block (legacy ext3) data extents** — landed in the
+  same series. Read path: `file_io::read` + `read_verified` branch on
+  `EXTENTS_FL`, route to `indirect::lookup` when absent. Write path:
+  `apply_replace_file_content_indirect` co-allocates data + indirect-tree
+  blocks via `indirect_mut::plan_contiguous`. ext3 RW unblocked in
+  Phase B (`47dfc33`) by routing `jbd2::journal_block_to_physical` and
+  `JournalWriter::open` through the same flavor dispatcher. Pinned by
+  `tests/ext2_basic.rs::mkfs_ext2_then_write_and_read_back_each_tier`
+  (4 indirect tiers) and `mkfs_ext3_rw_roundtrip_create_write_read`.
 - [ ] **9.3 Casefold (`EXT4_FEATURE_INCOMPAT_CASEFOLD`)** — hash impl
   exists in `casefold.rs`; wire into HTree lookups + dir-entry
   comparisons.

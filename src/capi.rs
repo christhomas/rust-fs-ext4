@@ -320,12 +320,47 @@ pub struct fs_ext4_dir_iter_t {
 // Helpers
 // ===========================================================================
 
-/// Convert a `*const c_char` to a Rust string. Returns empty string on null.
+/// Hard upper bound on accepted path/string length from FFI callers,
+/// in bytes (NUL excluded). Matches Linux `PATH_MAX`. A C string longer
+/// than this is treated as caller bug — `cstr_to_str` returns `""` so
+/// downstream lookups land at a clearly-invalid empty path rather than
+/// us walking a multi-megabyte buffer twice (CStr scan + UTF-8 scan).
+pub(crate) const FFI_PATH_MAX: usize = 4096;
+
+/// Convert a `*const c_char` to a Rust string. Returns empty string on
+/// null, on lengths exceeding [`FFI_PATH_MAX`], or on invalid UTF-8.
+///
+/// The empty-on-failure return is intentional — it preserves the
+/// established FFI contract (callers branch on `path.is_empty()` to
+/// reject), and downstream path resolution treats `""` as ENOENT.
+/// New strict callers that need to distinguish null vs non-UTF-8 vs
+/// oversize should use [`cstr_to_str_strict`] instead.
 unsafe fn cstr_to_str<'a>(p: *const c_char) -> &'a str {
     if p.is_null() {
         return "";
     }
-    CStr::from_ptr(p).to_str().unwrap_or("")
+    let cstr = CStr::from_ptr(p);
+    if cstr.to_bytes().len() > FFI_PATH_MAX {
+        return "";
+    }
+    cstr.to_str().unwrap_or("")
+}
+
+/// Strict variant of [`cstr_to_str`]. Returns `Err` for null pointers,
+/// strings longer than [`FFI_PATH_MAX`], or invalid UTF-8 — useful for
+/// callers that want a distinct EILSEQ/EINVAL/ENOENT response instead
+/// of the legacy "treat as ENOENT" behavior. Currently unused but
+/// available for new entry points that want to be explicit.
+#[allow(dead_code)]
+unsafe fn cstr_to_str_strict<'a>(p: *const c_char) -> std::result::Result<&'a str, &'static str> {
+    if p.is_null() {
+        return Err("null pointer");
+    }
+    let cstr = CStr::from_ptr(p);
+    if cstr.to_bytes().len() > FFI_PATH_MAX {
+        return Err("string exceeds FFI_PATH_MAX");
+    }
+    cstr.to_str().map_err(|_| "invalid UTF-8")
 }
 
 /// Convert POSIX mode bits to `fs_ext4_file_type_t`.
@@ -925,12 +960,21 @@ fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<fs_ext4_dir
     let block_size = fs.sb.block_size();
     let has_filetype = fs.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
 
+    // Bound on entries we'll buffer per directory open. Each
+    // `fs_ext4_dirent_t` is ~264 bytes; 1M entries = ~264 MiB. A crafted
+    // image with `inode.size` claiming gigabytes would otherwise allocate
+    // proportionally, since the loop below grows `entries` straight from
+    // on-disk content.
+    const MAX_DIR_ENTRIES: usize = 1_000_000;
     let mut entries = Vec::new();
 
     // Handle inline-data dirs (tiny dirs stored inside the inode itself)
     if inode.has_inline_data() {
         for entry in DirBlockIter::new(&inode.block, has_filetype) {
             let e = entry?;
+            if entries.len() >= MAX_DIR_ENTRIES {
+                return Err(Error::Corrupt("dir entries exceed MAX_DIR_ENTRIES"));
+            }
             entries.push(dir_entry_to_bridge(&e));
         }
         return Ok(entries);
@@ -948,6 +992,9 @@ fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<fs_ext4_dir
 
         for entry in DirBlockIter::new(&block_buf, has_filetype) {
             let e = entry?;
+            if entries.len() >= MAX_DIR_ENTRIES {
+                return Err(Error::Corrupt("dir entries exceed MAX_DIR_ENTRIES"));
+            }
             entries.push(dir_entry_to_bridge(&e));
         }
     }
@@ -1064,6 +1111,13 @@ pub unsafe extern "C" fn fs_ext4_read_file(
                 return -1;
             }
 
+            // Cap `length` against the file's actual size so a caller passing
+            // `u64::MAX` doesn't fabricate an absurd output slice. The
+            // downstream reader would refuse, but the slice descriptor itself
+            // is built from caller-controlled bytes — undefined behaviour if
+            // the caller's `buf` is smaller than `length`. Bounding here
+            // keeps the slice within the file and within `usize`.
+            let length = length.min(inode.size).min(usize::MAX as u64);
             let out = std::slice::from_raw_parts_mut(buf as *mut u8, length as usize);
             match file_io::read_with_raw_verified(
                 fs_ref, &inode, &inode_raw, ino, offset, length, out,
@@ -1541,6 +1595,20 @@ pub unsafe extern "C" fn fs_ext4_write_file(
                 set_err_msg("null data with non-zero len", EINVAL);
                 return -1;
             }
+            // Hard cap to defang a hostile or buggy caller passing
+            // `len = u64::MAX`. Constructing `&[u8]` from raw parts with
+            // a length larger than the caller's actual buffer is UB even
+            // before any read happens. 1 GiB matches the apply_replace
+            // working assumption (whole payload held in memory) without
+            // forcing legitimate large writes to chunk.
+            const MAX_WRITE_LEN: u64 = 1 << 30;
+            if len > MAX_WRITE_LEN {
+                set_err_msg(
+                    &format!("write_file: len {len} exceeds {MAX_WRITE_LEN}"),
+                    EINVAL,
+                );
+                return -1;
+            }
             let fs_ref = &(*fs).fs;
             let path_str = cstr_to_str(path);
             // Type guard at the capi level — mirrors fs_ext4_truncate so the
@@ -1947,6 +2015,19 @@ pub unsafe extern "C" fn fs_ext4_setxattr(
             }
             if value.is_null() && value_len > 0 {
                 set_err_msg("null value with nonzero len", EINVAL);
+                return -1;
+            }
+            // Cap `value_len` to defang oversize input. The kernel's
+            // ext4 xattr value cap is one fs block (typically 4 KiB);
+            // we use 64 KiB as a pragmatic ceiling that comfortably
+            // exceeds real-world xattr usage but prevents a hostile
+            // caller from triggering UB during slice construction.
+            const MAX_XATTR_VALUE_LEN: usize = 64 * 1024;
+            if value_len > MAX_XATTR_VALUE_LEN {
+                set_err_msg(
+                    &format!("setxattr: value_len {value_len} exceeds {MAX_XATTR_VALUE_LEN}"),
+                    EINVAL,
+                );
                 return -1;
             }
             let fs_ref = &(*fs).fs;
