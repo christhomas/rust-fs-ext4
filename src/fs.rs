@@ -677,6 +677,160 @@ impl Filesystem {
         self.commit_block_buffer(buf)
     }
 
+    /// Phase 2.3 — `fallocate(FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)`.
+    /// Frees the data blocks underlying `[offset, offset+len)`, splitting
+    /// straddling extents as needed. Reads of the punched range return
+    /// zeros (sparse hole) thereafter; `i_size` is unchanged.
+    ///
+    /// v1 limits:
+    /// - Depth-0 inline-root extent trees only. Surviving entries must
+    ///   fit in 4 slots (the inline-root capacity); anything larger
+    ///   returns `Corrupt(...)`. A real punch on a heavily-fragmented
+    ///   file may need depth ≥ 1, which is a Phase 4 follow-up.
+    /// - Indirect-block (ext2/3) inodes return EINVAL — punch is an
+    ///   ext4-specific kernel API.
+    pub fn apply_fallocate_punch_hole(&self, ino: u32, offset: u64, len: u64) -> Result<()> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        if len == 0 {
+            return Ok(());
+        }
+        let bs = self.sb.block_size() as u64;
+        let bs_u32 = self.sb.block_size();
+        let punch_first = offset / bs;
+        let punch_last_excl = offset
+            .checked_add(len)
+            .ok_or(Error::InvalidArgument("punch_hole: offset+len overflow"))?
+            .div_ceil(bs);
+
+        let (inode, mut raw) = self.read_inode_verified(ino)?;
+        if !inode.is_file() {
+            return Err(Error::InvalidArgument("punch_hole: not a regular file"));
+        }
+        if !inode.has_extents() {
+            return Err(Error::InvalidArgument(
+                "punch_hole: legacy (non-extents) inodes not supported",
+            ));
+        }
+
+        let extents = crate::extent::collect_all(&inode.block, self.dev.as_ref(), bs_u32)?;
+        let mut new_entries: Vec<crate::extent::Extent> = Vec::new();
+        let mut freed_blocks: u64 = 0;
+        let mut buf = BlockBuffer::new(bs_u32);
+
+        for e in &extents {
+            let el = e.logical_block as u64;
+            let er = el + e.length as u64;
+
+            if er <= punch_first || el >= punch_last_excl {
+                // Fully outside the punch range — keep verbatim.
+                new_entries.push(*e);
+                continue;
+            }
+            if el >= punch_first && er <= punch_last_excl {
+                // Fully inside punch — free entirely.
+                freed_blocks += self.buffer_free_block_run_and_bgd(
+                    &mut buf,
+                    e.physical_block,
+                    e.length as u64,
+                )?;
+                continue;
+            }
+            // Partial overlap. Compute the freed sub-range; emit head /
+            // tail retains around it.
+            let free_lo = el.max(punch_first);
+            let free_hi = er.min(punch_last_excl);
+            let free_offset_in_e = free_lo - el;
+            let free_len = (free_hi - free_lo) as u32;
+            let free_phys = e.physical_block + free_offset_in_e;
+            freed_blocks +=
+                self.buffer_free_block_run_and_bgd(&mut buf, free_phys, free_len as u64)?;
+
+            if el < punch_first {
+                new_entries.push(crate::extent::Extent {
+                    logical_block: el as u32,
+                    length: (punch_first - el) as u16,
+                    physical_block: e.physical_block,
+                    uninitialized: e.uninitialized,
+                });
+            }
+            if er > punch_last_excl {
+                new_entries.push(crate::extent::Extent {
+                    logical_block: punch_last_excl as u32,
+                    length: (er - punch_last_excl) as u16,
+                    physical_block: e.physical_block + (punch_last_excl - el),
+                    uninitialized: e.uninitialized,
+                });
+            }
+        }
+
+        if new_entries.len() > 4 {
+            return Err(Error::Corrupt(
+                "punch_hole: surviving entries exceed inline-root capacity (4); needs depth>=1",
+            ));
+        }
+
+        // Rebuild the inline root with the surviving entries.
+        let gen = u32::from_le_bytes(inode.block[8..12].try_into().unwrap());
+        let mut root = vec![0u8; 60];
+        root[0..2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
+        root[2..4].copy_from_slice(&(new_entries.len() as u16).to_le_bytes());
+        root[4..6].copy_from_slice(&4u16.to_le_bytes());
+        // depth = 0 (zero already)
+        root[8..12].copy_from_slice(&gen.to_le_bytes());
+        for (i, e) in new_entries.iter().enumerate() {
+            let off = 12 + i * 12;
+            root[off..off + 4].copy_from_slice(&e.logical_block.to_le_bytes());
+            let ee_len = if e.uninitialized {
+                e.length + crate::extent::EXT_INIT_MAX_LEN
+            } else {
+                e.length
+            };
+            root[off + 4..off + 6].copy_from_slice(&ee_len.to_le_bytes());
+            let phys_hi = ((e.physical_block >> 32) & 0xFFFF) as u16;
+            let phys_lo = (e.physical_block & 0xFFFF_FFFF) as u32;
+            root[off + 6..off + 8].copy_from_slice(&phys_hi.to_le_bytes());
+            root[off + 8..off + 12].copy_from_slice(&phys_lo.to_le_bytes());
+        }
+        Self::patch_inode_block_area(&mut raw, &root)?;
+
+        // i_blocks decreases; i_size unchanged (KEEP_SIZE semantics
+        // built in — punch always preserves size).
+        let sectors_per_block = bs / 512;
+        let new_i_blocks = inode
+            .blocks
+            .saturating_sub(freed_blocks * sectors_per_block);
+        Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_i_blocks)?;
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes());
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.buffer_write_inode(&mut buf, ino, &raw)?;
+
+        if freed_blocks > 0 {
+            self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 0)?;
+        }
+
+        self.commit_block_buffer(buf)
+    }
+
+    /// Phase 2.4 — `fallocate(FALLOC_FL_ZERO_RANGE)`. Logically zero the
+    /// byte range `[offset, offset+len)` without writing actual data.
+    /// Implemented as punch-hole + KEEP_SIZE preallocate of the same
+    /// range, so reads return zeros (uninitialized-extent semantics) and
+    /// future writes don't need an allocation.
+    ///
+    /// Two separate transactions today (punch then alloc); a future
+    /// optimization could fold them into one.
+    pub fn apply_fallocate_zero_range(&self, ino: u32, offset: u64, len: u64) -> Result<()> {
+        if len == 0 {
+            return Ok(());
+        }
+        self.apply_fallocate_punch_hole(ino, offset, len)?;
+        self.apply_fallocate_keep_size(ino, offset, len)
+    }
+
     /// Change the permission bits on `path`. Only the low 12 bits of `mode`
     /// (`S_ISUID|S_ISGID|S_ISVTX` plus rwx/rwx/rwx) are applied; the file-type
     /// bits (`S_IFMT`) are preserved from the existing inode.

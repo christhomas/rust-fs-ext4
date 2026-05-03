@@ -94,10 +94,17 @@ Acceptance: new test `tests/alloc_counter_consistency.rs` round-trips
   `FS_EXT4_FALLOC_FL_KEEP_SIZE = 0x01`. Pinned by
   `tests/fallocate_keep_size.rs` (4 tests). v1 limits documented:
   no partial overlaps, single contiguous alloc, depth-0 root only.
-- [ ] **2.3 fallocate punch-hole (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)** —
-  FFI returns ENOSYS (78). Needs cross-extent splitting.
-- [ ] **2.4 fallocate zero-range (FALLOC_FL_ZERO_RANGE)** — FFI returns
-  ENOSYS. Composes from punch-hole + KEEP_SIZE.
+- [x] **2.3 fallocate punch-hole (FALLOC_FL_PUNCH_HOLE | FALLOC_FL_KEEP_SIZE)** —
+  `apply_fallocate_punch_hole` walks the inode's extents, frees the
+  intersected portions (with extent-split for partial overlaps), and
+  rebuilds the inline root atomically via BlockBuffer. Pinned by
+  `tests/fallocate_punch_zero.rs` including a middle-of-extent split.
+  Limit: surviving entries must fit in the inline root (4 slots);
+  overflow returns Corrupt (Phase 4 dependency).
+- [x] **2.4 fallocate zero-range (FALLOC_FL_ZERO_RANGE)** —
+  `apply_fallocate_zero_range` composes punch-hole + KEEP_SIZE
+  preallocate. Reads of the range return zeros via the
+  uninitialized-extent path. Two transactions today; foldable later.
 
 Acceptance: sparse 1 MiB file from 4 KiB original reads as
 `[orig 4KiB][zeros up to 1MiB]`; `du` reports unchanged block count.
