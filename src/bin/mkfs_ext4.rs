@@ -10,9 +10,9 @@
 //! Cross-platform: pure Rust, no OS-specific syscalls beyond `open` /
 //! `seek` / `write` (all via std::fs). Builds and runs identically on
 //! Linux, macOS, Windows. The same `format_filesystem()` entry point is
-//! also called by the DiskJockey FSKit extension's `startFormat`, so
-//! "format an SD card from the GUI" and "format a disk image from this
-//! CLI" exercise the exact same code path.
+//! exposed via the C ABI as `fs_ext4_mkfs`, so any FFI host (a GUI
+//! formatter, a packaging script, an FSKit extension's `startFormat`,
+//! etc.) exercises the exact same code path as this CLI.
 //!
 //! Convention follows the standard CLI: the device/file MUST already exist at
 //! the target size. Use `truncate -s 64M out.img` (Linux/macOS) or
@@ -37,8 +37,8 @@ Options:
   -n                Dry-run: parse args + open device but do not write.
   -q                Quiet (suppress non-error output).
   --create-size <SIZE>
-                    DiskJockey extension (not in the standard CLI): if device doesn't
-                    exist, create it as a regular file of the given size first.
+                    Non-standard extension (not in the conventional CLI): if device
+                    doesn't exist, create it as a regular file of the given size first.
                     SIZE accepts K/M/G/T suffixes (1024-based). Refuses to apply
                     to existing block devices — only valid for image files. Use
                     when scripting test pipelines so you don't have to chain

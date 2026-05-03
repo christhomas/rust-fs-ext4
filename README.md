@@ -8,8 +8,10 @@ link `libfs_ext4.a` and `#include "fs_ext4.h"`. MIT-licensed. Zero
 kernel calls; zero non-MIT/BSD/Apache dependencies; the only
 runtime crates are `crc32c` and `bitflags`.
 
-Used in production by [DiskJockey](https://github.com/christhomas/diskjockey)
-but carries no coupling back — any FFI host can consume it.
+Designed for FFI: the C ABI is stable and the static library has no
+host-specific assumptions, so the same `libfs_ext4.a` works equally
+well in a macOS FSKit extension, a Linux FUSE binary, a Windows tool,
+or any embedded environment with a `BlockDevice` shim.
 
 ## Status
 
