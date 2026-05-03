@@ -10,9 +10,9 @@
 //!
 //! Stays in tests/ rather than examples/ so `cargo test` runs it as part
 //! of the standard suite. The test does NOT require any external tool —
-//! it's a pure crate-internal round trip. The matching CI workflow
-//! against real `fsck.ext4` from e2fsprogs lives in the parent repo's
-//! GitHub Actions config.
+//! it's a pure crate-internal round trip. A matching CI workflow
+//! against an external Linux consistency-checker lives in the parent
+//! repo's GitHub Actions config when one is wired up.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;

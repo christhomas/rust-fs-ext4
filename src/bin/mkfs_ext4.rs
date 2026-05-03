@@ -1,6 +1,6 @@
 //! mkfs.ext4 — standalone CLI for creating fresh ext4 filesystems.
 //!
-//! Linux-CLI-compatible subset of e2fsprogs' `mkfs.ext4`. Same flag names
+//! Linux-CLI-compatible subset of the standard `mkfs.ext4`. Same flag names
 //! and the same positional `device` argument so existing scripts /
 //! Makefiles / CI pipelines work against this binary unchanged.
 //!
@@ -11,12 +11,12 @@
 //! "format an SD card from the GUI" and "format a disk image from this
 //! CLI" exercise the exact same code path.
 //!
-//! Convention follows e2fsprogs: the device/file MUST already exist at
+//! Convention follows the standard CLI: the device/file MUST already exist at
 //! the target size. Use `truncate -s 64M out.img` (Linux/macOS) or
 //! `fsutil file createnew out.img 67108864` (Windows) to pre-create an
 //! image, then `mkfs.ext4 out.img` formats it.
 //!
-//! Exit codes: 0 success, 1 any failure (matches e2fsprogs convention).
+//! Exit codes: 0 success, 1 any failure (matches the standard CLI convention).
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::mkfs::format_filesystem;
@@ -34,13 +34,13 @@ Options:
   -n                Dry-run: parse args + open device but do not write.
   -q                Quiet (suppress non-error output).
   --create-size <SIZE>
-                    DiskJockey extension (not in e2fsprogs): if device doesn't
+                    DiskJockey extension (not in the standard CLI): if device doesn't
                     exist, create it as a regular file of the given size first.
                     SIZE accepts K/M/G/T suffixes (1024-based). Refuses to apply
                     to existing block devices — only valid for image files. Use
                     when scripting test pipelines so you don't have to chain
                     truncate + mkfs.ext4. Without this flag the tool follows
-                    e2fsprogs convention exactly (file must pre-exist).
+                    the standard CLI convention exactly (file must pre-exist).
   -V, --version     Print version and exit.
   -h, --help        Print this help and exit.
 
@@ -51,7 +51,7 @@ Positional:
                       truncate -s 64M out.img    (Linux/macOS)
                       fsutil file createnew out.img 67108864    (Windows)
 
-Unsupported flags from e2fsprogs are accepted with a warning if they take an
+Unsupported flags from the standard CLI are accepted with a warning if they take an
 argument we can ignore safely (-m, -N, -i), and rejected as errors otherwise.
 The full feature set will land incrementally as the underlying crate grows.
 ";
@@ -241,7 +241,7 @@ fn parse_args() -> Result<Opts, String> {
                 })?;
                 opts.create_size = Some(parse_size(&v)?);
             }
-            // Accepted-but-ignored e2fsprogs flags. Each takes one argument.
+            // Accepted-but-ignored standard-CLI flags. Each takes one argument.
             // Warn on first encounter so users don't think the value was
             // honored, but don't fail — keeps existing scripts portable.
             "-m" | "-N" | "-i" | "-c" | "-E" | "-O" | "-T" => {
@@ -299,7 +299,7 @@ fn parse_size(s: &str) -> Result<u64, String> {
 }
 
 /// Parse a UUID from its standard text form. Accepts both with-dashes
-/// (8-4-4-4-12) and bare-32-hex variants — same as e2fsprogs.
+/// (8-4-4-4-12) and bare-32-hex variants — matches the standard CLI.
 fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
     let cleaned: String = s.chars().filter(|c| *c != '-').collect();
     if cleaned.len() != 32 {

@@ -250,8 +250,8 @@ journaled: `add_dir_entry`, `extend_dir_and_add_entry`,
   crash-safety story; useful for fault-injection tests.
 
 Acceptance: power-fail simulator interrupts each op at every block
-write; replay yields a consistent fs (verified by reading + by
-external `e2fsck -fn` when available).
+write; replay yields a consistent fs (verified by reading + by an
+external consistency checker when one is on `$PATH`).
 
 ---
 
@@ -365,9 +365,10 @@ Every phase ships a regression test under `tests/`. Naming:
 synthetic image set in `test-disks/`. Acceptance for a phase is
 "all phase tests green AND prior-phase tests still green".
 
-When `e2fsck` is available on `$PATH`, post-mutation tests invoke
-`e2fsck -fn` and assert no warnings (skip otherwise — never make it
-a hard dep, since it's a non-shippable tool for our binary).
+When an external consistency-checker is available on `$PATH`, post-
+mutation tests can invoke it in read-only mode and assert no warnings
+(skip otherwise — never make it a hard dep, since such tools are not
+redistributable inside our binary).
 
 ## Execution Order
 
