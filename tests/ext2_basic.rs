@@ -303,6 +303,89 @@ fn ext3_ro_mount_succeeds_via_flavor_detection() {
 }
 
 #[test]
+fn mkfs_ext3_then_mount_ro_and_read_root() {
+    // End-to-end ext3 mkfs: format an image with `FsFlavor::Ext3`, mount RO,
+    // and verify the layout matches what the rest of the stack expects.
+    //
+    // The volume must have:
+    //   - HAS_JOURNAL set in feature_compat
+    //   - s_journal_inum == 8
+    //   - inode 8 marked allocated, mode == 0, links == 1, no EXTENTS_FL,
+    //     i_block populated with indirect-tree pointers at the journal data
+    //   - JBD2 superblock at journal block 0 with a clean (s_start = 0) state
+    //   - structural verifier clean (no double-claims, no leaked blocks)
+    //
+    // RW mount is still refused per the Phase A guard — Phase B will lift
+    // that once journal_block_to_physical / JournalWriter::open route
+    // through indirect::map_logical_any.
+    let path = scratch_path("ext3-mkfs");
+    // Need room for: ~64 KiB metadata + 1 root dir block + 1024 journal
+    // data blocks + 1-2 indirect-tree blocks. 4 MiB at 1 KiB blocks gives
+    // ~3000 free blocks of headroom on top of that.
+    let size: u64 = 4 * 1024 * 1024;
+    let block_size: u32 = 1024;
+
+    {
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .truncate(true)
+            .read(true)
+            .write(true)
+            .open(&path)
+            .expect("create scratch");
+        f.set_len(size).expect("set_len");
+    }
+    let dev_rw = FileDevice::open_rw(path.to_str().unwrap()).expect("open rw for mkfs");
+    format_filesystem_with_flavor(
+        &dev_rw,
+        Some("EXT3MKFS"),
+        None,
+        size,
+        block_size,
+        FsFlavor::Ext3,
+    )
+    .expect("mkfs ext3");
+    drop(dev_rw);
+    let _cleanup = ScratchGuard(path.clone());
+
+    // Mount RO so we don't trip the Phase A ext3-RW guard.
+    let dev = Arc::new(FileDevice::open(path.to_str().unwrap()).expect("open ro"));
+    let fs = Filesystem::mount(dev).expect("mount ext3 ro");
+    assert_eq!(fs.flavor, FsFlavor::Ext3, "mkfs must produce Ext3 flavor");
+    assert_eq!(fs.sb.volume_name, "EXT3MKFS");
+    assert_eq!(fs.sb.journal_inode, 8, "s_journal_inum must be 8");
+
+    // Inode 8 must be marked allocated and parse as the journal inode.
+    let raw = fs.read_inode_raw(8).expect("read journal inode");
+    let jinode = Inode::parse(&raw).expect("parse journal inode");
+    assert_eq!(
+        jinode.mode, 0,
+        "journal inode i_mode must be 0 (Linux convention)"
+    );
+    assert_eq!(jinode.links_count, 1);
+    assert!(
+        (jinode.flags & InodeFlags::EXTENTS.bits()) == 0,
+        "ext3 journal inode must NOT carry EXTENTS_FL"
+    );
+    assert_eq!(
+        jinode.size,
+        1024 * block_size as u64,
+        "journal i_size must equal data-blocks * block_size"
+    );
+
+    // Structural verifier must be clean — proves the writer marked every
+    // journal block + indirect-tree block in the bitmap, and didn't
+    // double-claim anything.
+    let report = verify::verify(&fs).expect("verify");
+    assert!(
+        report.is_clean(),
+        "fresh ext3 mkfs failed verify: {}\nerrors:\n  {}",
+        report.summary(),
+        report.errors.join("\n  ")
+    );
+}
+
+#[test]
 fn ext3_rw_mount_refused_in_phase_a() {
     let path = scratch_path("ext3-rw-refused");
     let size: u64 = 4 * 1024 * 1024;

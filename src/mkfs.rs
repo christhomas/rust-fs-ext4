@@ -613,9 +613,10 @@ fn build_superblock(
     // s_last_mounted (64 bytes at 0x88) stays zero.
     // Algorithm bits / prealloc / reserved (0xC8..0xD8) zero.
 
-    // 0xD8..0xDC s_journal_inum — set to inode 8 for ext3 (HAS_JOURNAL),
-    // zero for everything else.
-    sb[0xD8..0xDC].copy_from_slice(&journal_inum.to_le_bytes());
+    // s_journal_inum at 0xE0..0xE4 — set to inode 8 for ext3 (HAS_JOURNAL),
+    // zero for everything else. (The 0xD8 region holds algorithm bits +
+    // prealloc counters, NOT the journal inode pointer.)
+    sb[0xE0..0xE4].copy_from_slice(&journal_inum.to_le_bytes());
     // 0xDC..0xE0 s_journal_dev  — 0.
     // 0xE0..0xE4 s_last_orphan  — 0.
     // 0xE4..0xF4 s_hash_seed[4] — pick a stable nonzero seed. (Only matters
