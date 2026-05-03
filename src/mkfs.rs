@@ -21,28 +21,19 @@ use crate::block_io::BlockDevice;
 use crate::checksum::{linux_crc32c, Checksummer};
 use crate::dir::{self, DirEntryType};
 use crate::error::{Error, Result};
-use crate::features::{Incompat, RoCompat};
+use crate::features::{Compat, FsFlavor, Incompat, RoCompat};
 
 const EXT4_MAGIC: u16 = 0xEF53;
 const EXT4_VALID_FS: u16 = 0x0001;
 const EXT4_ROOT_INO: u32 = 2;
 const EXT4_GOOD_OLD_INODE_SIZE: u16 = 128;
-const INODE_SIZE: u16 = 256;
-const DESC_SIZE: u16 = 64; // 64BIT incompat → BGD = 64 bytes
 const I_EXTRA_ISIZE: u16 = 32; // covers checksum_hi, ctime/mtime/atime extra, crtime
 const ROOT_MODE: u16 = 0o40755; // S_IFDIR | 0755
 const EXTENT_MAGIC: u16 = 0xF30A;
 
-/// Format `dev` as an ext4 filesystem. The device must be at least large
-/// enough to hold the metadata + one root directory block (≈ 200 KiB at
-/// 4 KiB blocks with the default geometry).
-///
-/// Arguments:
-/// - `label`     — volume name (truncated to 16 bytes; UTF-8 stored verbatim).
-/// - `uuid`      — 128-bit volume UUID; if `None`, a random one is generated.
-/// - `size_bytes`— total device size to format (must be ≤ device's reported size).
-/// - `block_size`— filesystem block size in bytes; must be a power of two,
-///   1024..=65536. Typical: 4096.
+/// Format `dev` as an ext4 filesystem (extents, 64-bit BGDs, metadata_csum,
+/// no journal). Thin wrapper over [`format_filesystem_with_flavor`] for
+/// callers that don't care about the dialect.
 pub fn format_filesystem(
     dev: &dyn BlockDevice,
     label: Option<&str>,
@@ -50,6 +41,54 @@ pub fn format_filesystem(
     size_bytes: u64,
     block_size: u32,
 ) -> Result<()> {
+    format_filesystem_with_flavor(dev, label, uuid, size_bytes, block_size, FsFlavor::Ext4)
+}
+
+/// Format `dev` as a filesystem of the requested dialect. The device must be
+/// at least large enough to hold the metadata + one root directory block
+/// (≈ 200 KiB at 4 KiB blocks with the default geometry).
+///
+/// `flavor` selects the on-disk feature set:
+/// - [`FsFlavor::Ext4`] — extents, 64-bit BGDs, metadata_csum (current default).
+/// - [`FsFlavor::Ext2`] — legacy direct/indirect block pointers, 32-byte BGDs,
+///   128-byte inodes, no journal, no metadata_csum. Mounts under both this
+///   crate and the kernel's single ext4 driver running in ext2-compat mode.
+/// - [`FsFlavor::Ext3`] — not yet supported by this formatter (Phase B).
+///   Returns `Error::InvalidArgument`. Read+write of pre-existing ext3
+///   volumes IS supported via the mount path.
+///
+/// Arguments:
+/// - `label`     — volume name (truncated to 16 bytes; UTF-8 stored verbatim).
+/// - `uuid`      — 128-bit volume UUID; if `None`, a random one is generated.
+/// - `size_bytes`— total device size to format (must be ≤ device's reported size).
+/// - `block_size`— filesystem block size in bytes; must be a power of two,
+///   1024..=65536. Typical: 4096.
+pub fn format_filesystem_with_flavor(
+    dev: &dyn BlockDevice,
+    label: Option<&str>,
+    uuid: Option<[u8; 16]>,
+    size_bytes: u64,
+    block_size: u32,
+    flavor: FsFlavor,
+) -> Result<()> {
+    if matches!(flavor, FsFlavor::Ext3) {
+        // ext3 mkfs requires a journal inode + jbd2 log layout — Phase B work.
+        // Ext3 volumes formatted by other tools still mount via this crate.
+        return Err(Error::InvalidArgument(
+            "mkfs: ext3 formatting not yet implemented (use ext2 or ext4)",
+        ));
+    }
+    // Per-flavor on-disk choices.
+    let inode_size: u16 = match flavor {
+        FsFlavor::Ext2 => 128, // ext2 default; no extra section
+        FsFlavor::Ext3 | FsFlavor::Ext4 => 256,
+    };
+    let desc_size: u16 = match flavor {
+        FsFlavor::Ext2 => 32, // legacy 32-byte BGDs (no INCOMPAT_64BIT)
+        FsFlavor::Ext3 | FsFlavor::Ext4 => 64,
+    };
+    let csum_enabled = matches!(flavor, FsFlavor::Ext4);
+    let dir_csum_tail: usize = if csum_enabled { 12 } else { 0 };
     if !block_size.is_power_of_two() || !(1024..=65536).contains(&block_size) {
         return Err(Error::InvalidArgument("mkfs: block_size out of range"));
     }
@@ -86,7 +125,7 @@ pub fn format_filesystem(
 
     let inodes_per_group: u32 = 8192;
     let inode_table_blocks: u32 =
-        (inodes_per_group as u64 * INODE_SIZE as u64).div_ceil(block_size as u64) as u32;
+        (inodes_per_group as u64 * inode_size as u64).div_ceil(block_size as u64) as u32;
 
     // first_data_block is 1 for 1 KiB blocks, 0 otherwise — mirrors ext4 formatter.
     let first_data_block: u32 = if block_size == 1024 { 1 } else { 0 };
@@ -127,20 +166,26 @@ pub fn format_filesystem(
         inodes_per_group,
         &uuid,
         label.unwrap_or(""),
+        flavor,
+        inode_size,
+        desc_size,
     );
-    // Superblock CRC32C: seed = ~0, covers bytes [0..0x3FC].
-    let sb_csum = linux_crc32c(!0, &sb[..0x3FC]);
-    sb[0x3FC..0x400].copy_from_slice(&sb_csum.to_le_bytes());
+    // Superblock CRC32C: seed = ~0, covers bytes [0..0x3FC]. Only patched
+    // when the volume advertises METADATA_CSUM — ext2/3 leave the slot zero.
+    if csum_enabled {
+        let sb_csum = linux_crc32c(!0, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&sb_csum.to_le_bytes());
+    }
 
     // Mount-time checksummer, used for BGD + inode + dir-block CRCs.
     let csum_seed = linux_crc32c(!0, &uuid);
     let csum = Checksummer {
         seed: csum_seed,
-        enabled: true,
+        enabled: csum_enabled,
     };
 
     // ----- Block group descriptor (group 0 only) ---------------------------
-    let mut bgd = vec![0u8; DESC_SIZE as usize];
+    let mut bgd = vec![0u8; desc_size as usize];
     write_bgd_group0(
         &mut bgd,
         blk_bitmap,
@@ -149,9 +194,12 @@ pub fn format_filesystem(
         free_blocks as u32,
         free_inodes,
         /* used_dirs */ 1, // root dir lives in group 0
+        desc_size,
     );
-    // BGD CRC: crc16 of (seed → group_no_le_u32 → bgd_with_csum_zeroed).
-    {
+    // BGD CRC slot lives at 0x1E..0x20 in the 64-byte layout. Skipped for
+    // ext2 (no metadata_csum) — the kernel only validates the slot when
+    // the FS opts into csums via the RO_COMPAT bit.
+    if csum_enabled {
         let mut tmp = bgd.clone();
         tmp[0x1E] = 0;
         tmp[0x1F] = 0;
@@ -187,16 +235,19 @@ pub fn format_filesystem(
 
     // ----- Inode table (group 0) — only inode 2 has content ----------------
     let mut inode_table = vec![0u8; inode_table_blocks as usize * block_size as usize];
-    // Inode 2 lives at byte offset (2-1) * INODE_SIZE.
-    let root_inode_off = (EXT4_ROOT_INO as usize - 1) * INODE_SIZE as usize;
+    // Inode 2 lives at byte offset (2-1) * inode_size.
+    let root_inode_off = (EXT4_ROOT_INO as usize - 1) * inode_size as usize;
     write_root_inode(
-        &mut inode_table[root_inode_off..root_inode_off + INODE_SIZE as usize],
+        &mut inode_table[root_inode_off..root_inode_off + inode_size as usize],
         root_dir_block,
         block_size,
+        flavor,
+        inode_size,
     );
-    // Patch inode 2 CRC32C (seed → ino → generation → inode_with_csum_zeroed).
-    {
-        let slot = &mut inode_table[root_inode_off..root_inode_off + INODE_SIZE as usize];
+    // Inode CRC: only when metadata_csum is on (the lo/hi fields live past
+    // byte 0x7C / 0x82 which are only present in 256-byte inodes anyway).
+    if csum_enabled {
+        let slot = &mut inode_table[root_inode_off..root_inode_off + inode_size as usize];
         if let Some((lo, hi)) = csum.compute_inode_checksum(EXT4_ROOT_INO, 0, slot) {
             slot[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
             slot[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
@@ -204,14 +255,14 @@ pub fn format_filesystem(
     }
 
     // ----- Root directory data block ---------------------------------------
-    // Two entries (`.`, `..`) plus the metadata-csum tail. We seed a single
-    // long entry covering [0..block-12], then add `.` and `..` via the
-    // existing dir helper so the rec_len bookkeeping matches what the
-    // mounted FS expects.
+    // Two entries (`.`, `..`). On metadata_csum volumes the last 12 bytes
+    // are reserved for the `ext4_dir_entry_tail` csum slot; ext2/3 reclaim
+    // those bytes and the final `..` entry's `rec_len` extends to end-of-
+    // block instead.
     let mut root_dir = vec![0u8; block_size as usize];
-    let usable = block_size as usize - 12; // last 12 bytes reserved for csum tail
-                                           // Bootstrap: one big tombstone entry that fills the usable region. The
-                                           // dir helper splits this on each add.
+    let usable = block_size as usize - dir_csum_tail;
+    // Bootstrap: one big tombstone entry that fills the usable region. The
+    // dir helper splits this on each add.
     root_dir[0..4].copy_from_slice(&0u32.to_le_bytes()); // inode = 0 (tombstone)
     root_dir[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
     // name_len + file_type already zero.
@@ -222,7 +273,7 @@ pub fn format_filesystem(
         b".",
         DirEntryType::Directory,
         true,
-        12,
+        dir_csum_tail,
     )?;
     dir::add_entry_to_block(
         &mut root_dir,
@@ -230,39 +281,42 @@ pub fn format_filesystem(
         b"..",
         DirEntryType::Directory,
         true,
-        12,
+        dir_csum_tail,
     )?;
 
-    // Csum tail: inode=0, rec_len=12, name_len=0, file_type=0xDE, csum=u32.
-    {
+    // Csum tail + CRC32C — only on metadata_csum volumes.
+    if csum_enabled {
         let end = root_dir.len();
         root_dir[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes()); // inode
         root_dir[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
         root_dir[end - 6] = 0; // name_len
         root_dir[end - 5] = 0xDE; // file_type marker
         root_dir[end - 4..end].copy_from_slice(&0u32.to_le_bytes()); // csum slot
-    }
-    // CRC covers block[..len-12]; chained seed → ino → generation → body.
-    {
+
         let mut c = linux_crc32c(csum.seed, &EXT4_ROOT_INO.to_le_bytes());
         c = linux_crc32c(c, &0u32.to_le_bytes()); // generation = 0
         c = linux_crc32c(c, &root_dir[..root_dir.len() - 12]);
-        let end = root_dir.len();
         root_dir[end - 4..end].copy_from_slice(&c.to_le_bytes());
     }
 
     // ----- Write everything out --------------------------------------------
-    // Block 0: zeros + primary SB. We write the whole block to clear any
-    // stale image bytes (mounting an existing image without a wipe was
-    // sabotaging early experiments).
-    let mut block0 = vec![0u8; block_size as usize];
-    block0[1024..2048].copy_from_slice(&sb);
-    dev.write_at(0, &block0)?;
+    // Header zone: zero out block 0 (boot sector) and the SB block. For
+    // block_size >= 2048 the SB shares block 0; for 1 KiB blocks the SB
+    // occupies its own block 1 — the `.max(2048)` ensures we wipe both
+    // bootloader region and SB block in either case so we don't carry over
+    // stale image bytes (which sabotaged early mount experiments).
+    let header_zero_len = (block_size as usize).max(2048);
+    let zeros = vec![0u8; header_zero_len];
+    dev.write_at(0, &zeros)?;
+    // Primary superblock always lives at byte offset 1024 regardless of
+    // block_size — for 4 KiB blocks that's mid-block-0; for 1 KiB blocks
+    // it's the entirety of block 1.
+    dev.write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb)?;
     dev.flush()?;
 
     // BGT block (zeroed, then group 0's descriptor copied in at offset 0).
     let mut bgt_block_buf = vec![0u8; block_size as usize];
-    bgt_block_buf[..DESC_SIZE as usize].copy_from_slice(&bgd);
+    bgt_block_buf[..desc_size as usize].copy_from_slice(&bgd);
     dev.write_at(bgt_block * block_size as u64, &bgt_block_buf)?;
 
     dev.write_at(blk_bitmap * block_size as u64, &block_bitmap)?;
@@ -318,6 +372,9 @@ fn build_superblock(
     inodes_per_group: u32,
     uuid: &[u8; 16],
     label: &str,
+    flavor: FsFlavor,
+    inode_size: u16,
+    desc_size: u16,
 ) -> Vec<u8> {
     // Single-group v1: total inodes = inodes_per_group.
     let inodes_count: u32 = inodes_per_group;
@@ -362,13 +419,29 @@ fn build_superblock(
 
     // Dynamic-rev fields.
     sb[0x54..0x58].copy_from_slice(&11u32.to_le_bytes()); // first_ino (>= 11 reserved-end)
-    sb[0x58..0x5A].copy_from_slice(&INODE_SIZE.to_le_bytes());
+    sb[0x58..0x5A].copy_from_slice(&inode_size.to_le_bytes());
     sb[0x5A..0x5C].copy_from_slice(&0u16.to_le_bytes()); // block_group_nr (this SB's group = 0)
 
-    let feat_compat = 0u32; // No HAS_JOURNAL, DIR_INDEX, etc. — keep v1 minimal.
-    let feat_incompat =
-        Incompat::FILETYPE.bits() | Incompat::EXTENTS.bits() | Incompat::BIT64.bits();
-    let feat_ro_compat = RoCompat::METADATA_CSUM.bits();
+    // Per-flavor feature bits. Ext2 advertises FILETYPE only (so directory
+    // entries carry a file_type byte); ext4 layers on EXTENTS + 64BIT for
+    // wide block addressing and METADATA_CSUM for the on-disk CRCs the
+    // checksum_type=crc32c byte selects below.
+    let (feat_compat, feat_incompat, feat_ro_compat): (u32, u32, u32) = match flavor {
+        FsFlavor::Ext2 => (0u32, Incompat::FILETYPE.bits(), 0u32),
+        FsFlavor::Ext3 => (
+            // ext3 will gain HAS_JOURNAL when the formatter learns to lay
+            // down a journal inode (Phase B). Until then this branch is
+            // unreachable — the entry point rejects Ext3.
+            Compat::HAS_JOURNAL.bits(),
+            Incompat::FILETYPE.bits(),
+            0u32,
+        ),
+        FsFlavor::Ext4 => (
+            0u32,
+            Incompat::FILETYPE.bits() | Incompat::EXTENTS.bits() | Incompat::BIT64.bits(),
+            RoCompat::METADATA_CSUM.bits(),
+        ),
+    };
     sb[0x5C..0x60].copy_from_slice(&feat_compat.to_le_bytes());
     sb[0x60..0x64].copy_from_slice(&feat_incompat.to_le_bytes());
     sb[0x64..0x68].copy_from_slice(&feat_ro_compat.to_le_bytes());
@@ -397,7 +470,14 @@ fn build_superblock(
     sb[0xFC] = 1; // s_def_hash_version = HALF_MD4
                   // 0xFD reserved_char_pad
                   // 0xFE..0x100 s_desc_size
-    sb[0xFE..0x100].copy_from_slice(&DESC_SIZE.to_le_bytes());
+                  // s_desc_size: only meaningful when INCOMPAT_64BIT is set (i.e. ext4).
+                  // Spec says leave 0 for legacy 32-byte BGDs; the reader treats 0 as 32.
+    let on_disk_desc_size: u16 = if matches!(flavor, FsFlavor::Ext4) {
+        desc_size
+    } else {
+        0
+    };
+    sb[0xFE..0x100].copy_from_slice(&on_disk_desc_size.to_le_bytes());
 
     // 0x100..0x104 s_default_mount_opts = 0
     // 0x104..0x108 s_first_meta_bg     = 0 (no META_BG)
@@ -409,10 +489,13 @@ fn build_superblock(
     // s_r_blocks_count_hi 0x154 = 0.
     sb[0x158..0x15C].copy_from_slice(&free_hi.to_le_bytes()); // free_blocks_count_hi
 
-    // s_min_extra_isize / s_want_extra_isize (0x15C / 0x15E): 32 — matches
-    // I_EXTRA_ISIZE so ext4 audit tool doesn't complain about short inodes.
-    sb[0x15C..0x15E].copy_from_slice(&I_EXTRA_ISIZE.to_le_bytes());
-    sb[0x15E..0x160].copy_from_slice(&I_EXTRA_ISIZE.to_le_bytes());
+    // s_min_extra_isize / s_want_extra_isize (0x15C / 0x15E): only meaningful
+    // when on-disk inodes carry the post-128 extra section (ext4 with
+    // 256-byte inodes). Ext2's 128-byte inodes leave both fields zero.
+    if inode_size >= 160 {
+        sb[0x15C..0x15E].copy_from_slice(&I_EXTRA_ISIZE.to_le_bytes());
+        sb[0x15E..0x160].copy_from_slice(&I_EXTRA_ISIZE.to_le_bytes());
+    }
 
     // s_flags 0x160..0x164: bit 0 = signed dirhash (matches ext4 formatter default).
     sb[0x160..0x164].copy_from_slice(&0x1u32.to_le_bytes());
@@ -425,8 +508,11 @@ fn build_superblock(
 
     // s_log_groups_per_flex (0x174) — 0 means flex_bg disabled.
 
-    // s_checksum_type at 0x175 = 1 (crc32c) when METADATA_CSUM is on.
-    sb[0x175] = 1;
+    // s_checksum_type at 0x175 = 1 (crc32c) when METADATA_CSUM is on. Ext2
+    // leaves it 0 (no algorithm) since no on-disk checksums are written.
+    if matches!(flavor, FsFlavor::Ext4) {
+        sb[0x175] = 1;
+    }
 
     // s_encryption_level (0x176) reserved-pad (0x177) zero.
 
@@ -440,6 +526,7 @@ fn build_superblock(
     sb
 }
 
+#[allow(clippy::too_many_arguments)]
 fn write_bgd_group0(
     out: &mut [u8],
     block_bitmap_block: u64,
@@ -448,8 +535,9 @@ fn write_bgd_group0(
     free_blocks: u32,
     free_inodes: u32,
     used_dirs: u32,
+    desc_size: u16,
 ) {
-    // Lo halves at the start, hi halves at +0x20 (64-bit BGD layout).
+    // Lo halves: present in both 32-byte and 64-byte BGD layouts.
     out[0x00..0x04].copy_from_slice(&(block_bitmap_block as u32).to_le_bytes());
     out[0x04..0x08].copy_from_slice(&(inode_bitmap_block as u32).to_le_bytes());
     out[0x08..0x0C].copy_from_slice(&(inode_table_block as u32).to_le_bytes());
@@ -458,70 +546,93 @@ fn write_bgd_group0(
     out[0x10..0x12].copy_from_slice(&(used_dirs as u16).to_le_bytes());
     out[0x12..0x14].copy_from_slice(&0u16.to_le_bytes()); // bg_flags = 0 (initialised)
                                                           // 0x14..0x18 exclude_bitmap reserved.
-                                                          // 0x18..0x1A block_bitmap_csum_lo, 0x1A..0x1C inode_bitmap_csum_lo — leave 0; the
-                                                          // kernel only complains when BGD's checksum is wrong.
+                                                          // 0x18..0x1A block_bitmap_csum_lo, 0x1A..0x1C inode_bitmap_csum_lo — leave 0;
+                                                          // only validated on metadata_csum volumes.
     out[0x1C..0x1E].copy_from_slice(&0u16.to_le_bytes()); // itable_unused_lo
                                                           // 0x1E..0x20 checksum — patched after struct is complete.
 
-    // 64-bit hi halves.
-    out[0x20..0x24].copy_from_slice(&((block_bitmap_block >> 32) as u32).to_le_bytes());
-    out[0x24..0x28].copy_from_slice(&((inode_bitmap_block >> 32) as u32).to_le_bytes());
-    out[0x28..0x2C].copy_from_slice(&((inode_table_block >> 32) as u32).to_le_bytes());
-    out[0x2C..0x2E].copy_from_slice(&0u16.to_le_bytes()); // free_blocks_hi
-    out[0x2E..0x30].copy_from_slice(&0u16.to_le_bytes()); // free_inodes_hi
-    out[0x30..0x32].copy_from_slice(&0u16.to_le_bytes()); // used_dirs_hi
-    out[0x32..0x34].copy_from_slice(&0u16.to_le_bytes()); // itable_unused_hi
-                                                          // 0x34..0x38 reserved
-    out[0x38..0x3A].copy_from_slice(&0u16.to_le_bytes()); // bb_csum_hi
-    out[0x3A..0x3C].copy_from_slice(&0u16.to_le_bytes()); // ib_csum_hi
-                                                          // 0x3C..0x40 reserved
+    // 64-bit hi halves only present in the 64-byte BGD layout.
+    if desc_size >= 64 {
+        out[0x20..0x24].copy_from_slice(&((block_bitmap_block >> 32) as u32).to_le_bytes());
+        out[0x24..0x28].copy_from_slice(&((inode_bitmap_block >> 32) as u32).to_le_bytes());
+        out[0x28..0x2C].copy_from_slice(&((inode_table_block >> 32) as u32).to_le_bytes());
+        out[0x2C..0x2E].copy_from_slice(&0u16.to_le_bytes()); // free_blocks_hi
+        out[0x2E..0x30].copy_from_slice(&0u16.to_le_bytes()); // free_inodes_hi
+        out[0x30..0x32].copy_from_slice(&0u16.to_le_bytes()); // used_dirs_hi
+        out[0x32..0x34].copy_from_slice(&0u16.to_le_bytes()); // itable_unused_hi
+                                                              // 0x34..0x38 reserved
+        out[0x38..0x3A].copy_from_slice(&0u16.to_le_bytes()); // bb_csum_hi
+        out[0x3A..0x3C].copy_from_slice(&0u16.to_le_bytes()); // ib_csum_hi
+                                                              // 0x3C..0x40 reserved
+    }
 }
 
-/// Write a 256-byte root directory inode (ino 2) using a one-extent layout
-/// pointing at `root_dir_block`. Caller patches the CRC slots afterwards.
-fn write_root_inode(slot: &mut [u8], root_dir_block: u64, block_size: u32) {
+/// Write the root directory inode (ino 2). Layout depends on `flavor`:
+/// ext4 uses an extent header pointing at `root_dir_block`; ext2/3 use the
+/// legacy direct/indirect scheme with `i_block[0] = root_dir_block`.
+/// Caller patches the CRC slots afterwards on metadata_csum volumes.
+fn write_root_inode(
+    slot: &mut [u8],
+    root_dir_block: u64,
+    block_size: u32,
+    flavor: FsFlavor,
+    inode_size: u16,
+) {
     // i_mode
     slot[0x00..0x02].copy_from_slice(&ROOT_MODE.to_le_bytes());
-    // i_uid_lo, i_size_lo
-    slot[0x04..0x08].copy_from_slice(&(block_size).to_le_bytes()); // size = one block
-                                                                   // i_atime, i_ctime, i_mtime — leave zero; on-disk values can be 0 and
-                                                                   // the FS still mounts (ext4 formatter sets these to wall time, but it's not
-                                                                   // required by the kernel).
-                                                                   // i_links_count = 2 (`.` and `..`)
+    // i_uid_lo, i_size_lo. Size = one directory data block.
+    slot[0x04..0x08].copy_from_slice(&(block_size).to_le_bytes());
+    // i_atime, i_ctime, i_mtime — left zero; mkfs convention but not required.
+    // i_links_count = 2 (`.` and `..`)
     slot[0x1A..0x1C].copy_from_slice(&2u16.to_le_bytes());
     // i_blocks_lo: 512-byte units. One 4 KiB block = 8 sectors.
     let i_blocks = block_size / 512;
     slot[0x1C..0x20].copy_from_slice(&i_blocks.to_le_bytes());
-    // i_flags: EXT4_EXTENTS_FL
-    slot[0x20..0x24].copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
 
-    // i_block[60]: extent header + one extent.
-    // Header: magic, entries=1, max=4, depth=0, generation=0
-    slot[0x28..0x2A].copy_from_slice(&EXTENT_MAGIC.to_le_bytes());
-    slot[0x2A..0x2C].copy_from_slice(&1u16.to_le_bytes()); // entries
-    slot[0x2C..0x2E].copy_from_slice(&4u16.to_le_bytes()); // max
-    slot[0x2E..0x30].copy_from_slice(&0u16.to_le_bytes()); // depth
-    slot[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // generation
-                                                           // First extent at 0x34..0x40:
-                                                           //   ee_block (logical=0), ee_len=1, ee_start_hi, ee_start_lo
-    slot[0x34..0x38].copy_from_slice(&0u32.to_le_bytes()); // ee_block
-    slot[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes()); // ee_len
-    slot[0x3A..0x3C].copy_from_slice(&((root_dir_block >> 32) as u16).to_le_bytes()); // ee_start_hi
-    slot[0x3C..0x40].copy_from_slice(&(root_dir_block as u32).to_le_bytes()); // ee_start_lo
-                                                                              // Remaining 0x40..0x64 in i_block region stays zero (padding).
+    if flavor.uses_extents() {
+        // i_flags: EXT4_EXTENTS_FL
+        slot[0x20..0x24].copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
+
+        // i_block[60]: extent header + one extent.
+        // Header: magic, entries=1, max=4, depth=0, generation=0
+        slot[0x28..0x2A].copy_from_slice(&EXTENT_MAGIC.to_le_bytes());
+        slot[0x2A..0x2C].copy_from_slice(&1u16.to_le_bytes()); // entries
+        slot[0x2C..0x2E].copy_from_slice(&4u16.to_le_bytes()); // max
+        slot[0x2E..0x30].copy_from_slice(&0u16.to_le_bytes()); // depth
+        slot[0x30..0x34].copy_from_slice(&0u32.to_le_bytes()); // generation
+                                                               // First extent at 0x34..0x40:
+                                                               //   ee_block (logical=0), ee_len=1, ee_start_hi, ee_start_lo
+        slot[0x34..0x38].copy_from_slice(&0u32.to_le_bytes()); // ee_block
+        slot[0x38..0x3A].copy_from_slice(&1u16.to_le_bytes()); // ee_len
+        slot[0x3A..0x3C].copy_from_slice(&((root_dir_block >> 32) as u16).to_le_bytes()); // ee_start_hi
+        slot[0x3C..0x40].copy_from_slice(&(root_dir_block as u32).to_le_bytes());
+    // ee_start_lo
+    // Remaining 0x40..0x64 in i_block region stays zero (padding).
+    } else {
+        // ext2/3: i_flags clear, i_block[0] = direct pointer to the root dir
+        // data block. ext2/3 cap addresses at 32 bits, so the high half of
+        // `root_dir_block` is asserted zero by the geometry the caller picked
+        // (single-group fixtures fit comfortably in u32).
+        debug_assert!(
+            root_dir_block <= u32::MAX as u64,
+            "ext2 i_block pointer overflow"
+        );
+        slot[0x20..0x24].copy_from_slice(&0u32.to_le_bytes()); // i_flags = 0
+        slot[0x28..0x2C].copy_from_slice(&(root_dir_block as u32).to_le_bytes());
+        // i_block[1..15] stays zero — no further direct/indirect pointers
+        // since the directory fits in one block.
+    }
 
     slot[0x64..0x68].copy_from_slice(&0u32.to_le_bytes()); // i_generation
                                                            // i_file_acl_lo (0x68), i_size_hi (0x6C), obso_faddr (0x70) — zero.
                                                            // i_blocks_hi (0x74), i_file_acl_hi (0x76), i_uid_hi (0x78), i_gid_hi (0x7A)
-                                                           // — zero.
-                                                           // i_checksum_lo at 0x7C, i_reserved at 0x7E — caller patches checksum.
+                                                           // — zero. i_checksum_lo at 0x7C — caller patches when csum is on.
 
-    // Extra section (only present because INODE_SIZE >= 160).
-    if slot.len() > 0x80 {
+    // Extra section (only present when on-disk inode size >= 160 bytes).
+    // Ext2's 128-byte inodes skip this entirely.
+    if inode_size >= 160 && slot.len() > 0x80 {
         slot[0x80..0x82].copy_from_slice(&I_EXTRA_ISIZE.to_le_bytes());
-        // i_checksum_hi (0x82..0x84) patched by caller.
+        // i_checksum_hi (0x82..0x84) patched by caller on csum volumes.
         // 0x84..0x98 *_extra timestamps + crtime — zero.
     }
-    // Mode and other fields default to zero where unspecified.
-    // i_mode unspecified bits (read from earlier writes) — already correct.
 }

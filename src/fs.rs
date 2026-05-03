@@ -48,6 +48,16 @@ pub struct Filesystem {
     pub sb: Superblock,
     pub groups: Vec<BlockGroupDescriptor>,
     pub csum: Checksummer,
+    /// Dialect detected at mount time from the superblock's feature flags.
+    /// Drives runtime dispatch where ext2 / ext3 / ext4 differ — most
+    /// notably the inode block-mapping scheme (extent vs indirect) used
+    /// when allocating new inodes.
+    pub flavor: features::FsFlavor,
+    /// Live-write journal writer, present iff the FS has a journal AND
+    /// the device is writable. `None` for read-only mounts and for ext2-
+    /// style images. Locked per-op so mutating capi calls serialize on
+    /// the JBD2 sequence cursor.
+    pub journal: Option<std::sync::Mutex<crate::journal_writer::JournalWriter>>,
 }
 
 impl Filesystem {
@@ -80,16 +90,19 @@ impl Filesystem {
     fn mount_inner(dev: Arc<dyn BlockDevice>, defer_replay: bool) -> Result<Self> {
         let sb = Superblock::read(dev.as_ref())?;
         features::check_mountable(sb.feature_incompat, sb.feature_ro_compat)?;
+        let flavor = features::FsFlavor::detect(sb.feature_compat, sb.feature_incompat);
         let csum = Checksummer::from_superblock(&sb);
         if csum.enabled && !csum.verify_superblock(&sb.raw) {
             return Err(Error::BadChecksum { what: "superblock" });
         }
         let groups = bgd::read_all(dev.as_ref(), &sb, &csum)?;
-        let fs = Self {
+        let mut fs = Self {
             dev,
             sb,
             groups,
             csum,
+            flavor,
+            journal: None,
         };
 
         // Replay a dirty journal if the device is writable. Silently skips
@@ -103,6 +116,15 @@ impl Filesystem {
             // The error surfaces up so the caller can decide whether to
             // retry or proceed; we fail loud rather than silent.
             crate::journal_apply::replay_if_dirty(&fs)?;
+        }
+
+        // Open the live-write journal writer once replay is done. Any
+        // pending transactions are now applied; the writer can take over
+        // the JBD2 cursor from a clean state.
+        if fs.dev.is_writable() {
+            if let Some(jw) = crate::journal_writer::JournalWriter::open(&fs)? {
+                fs.journal = Some(std::sync::Mutex::new(jw));
+            }
         }
         Ok(fs)
     }
@@ -242,6 +264,7 @@ impl Filesystem {
         )?;
 
         let mut freed_sectors: u64 = 0;
+        let mut freed_blocks: u64 = 0;
         let bs = self.sb.block_size() as u64;
 
         for m in &muts {
@@ -251,8 +274,9 @@ impl Filesystem {
                     Self::patch_inode_block_area(&mut raw, bytes)?;
                 }
                 crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } => {
-                    // Mark the run's bits free in the containing group's bitmap.
-                    self.free_block_run(*start, *len as u64)?;
+                    // Free run + credit the containing group's BGD in one
+                    // step; SB is patched once below.
+                    freed_blocks += self.free_block_run_and_bgd(*start, *len as u64)?;
                     // Each fs block is `bs / 512` 512-byte sectors for the
                     // `i_blocks` counter.
                     freed_sectors += (*len as u64) * (bs / 512);
@@ -268,6 +292,12 @@ impl Filesystem {
         // Patch size + blocks_count in the inode image.
         let new_blocks = inode.blocks.saturating_sub(freed_sectors);
         Self::patch_inode_size_and_blocks(&mut raw, new_size, new_blocks)?;
+
+        // Single SB credit covers all freed runs. Skipped when nothing was
+        // freed (e.g. shrink that only adjusts size within the tail extent).
+        if freed_blocks > 0 {
+            self.patch_sb_counters(freed_blocks as i64, 0)?;
+        }
 
         // Write the inode back. Recompute + splice the inode checksum first
         // so CSUM-enabled mounts see a valid inode on the next read.
@@ -311,20 +341,8 @@ impl Filesystem {
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
 
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(ino, inode.generation, &raw)
-            {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
-        self.write_inode_raw(ino, &raw)?;
-        self.dev.flush()?;
-        Ok(())
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.commit_inode_write(ino, &raw)
     }
 
     /// Change the permission bits on `path`. Only the low 12 bits of `mode`
@@ -352,20 +370,38 @@ impl Filesystem {
         let now = now_unix_seconds();
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
 
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(ino, inode.generation, &raw)
-            {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.commit_inode_write(ino, &raw)
+    }
+
+    /// Write a single mutated inode back, routing through the journal
+    /// writer when one is available so the change is crash-safe. Falls
+    /// back to a direct write + flush on unjournaled mounts.
+    ///
+    /// Used by every operation whose only mutation is one inode block:
+    /// chmod, chown, utimens, and the in-place xattr ops once they're
+    /// migrated to the journaled path.
+    fn commit_inode_write(&self, ino: u32, new_inode_raw: &[u8]) -> Result<()> {
+        if let Some(jw_mu) = &self.journal {
+            let mut jw = jw_mu.lock().map_err(|_| {
+                Error::Corrupt("journal writer mutex poisoned (prior write panicked)")
+            })?;
+            // Build the full inode-table block image with `new_inode_raw`
+            // spliced over the target inode's slot. The journal needs
+            // whole-block writes; one inode is a fraction of that.
+            let (block, offset) = bgd::locate_inode(&self.sb, &self.groups, ino)?;
+            let mut buf = self.read_block(block)?;
+            let off = offset as usize;
+            buf[off..off + new_inode_raw.len()].copy_from_slice(new_inode_raw);
+            let mut tx = jw.begin();
+            tx.add_write(block, buf)?;
+            jw.commit(self.dev.as_ref(), &tx)?;
+            Ok(())
+        } else {
+            self.write_inode_raw(ino, new_inode_raw)?;
+            self.dev.flush()?;
+            Ok(())
         }
-        self.write_inode_raw(ino, &raw)?;
-        self.dev.flush()?;
-        Ok(())
     }
 
     /// Change the owner of `path` to (`uid`, `gid`). Both values are full
@@ -399,20 +435,8 @@ impl Filesystem {
         let now = now_unix_seconds();
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
 
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(ino, inode.generation, &raw)
-            {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
-        self.write_inode_raw(ino, &raw)?;
-        self.dev.flush()?;
-        Ok(())
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.commit_inode_write(ino, &raw)
     }
 
     /// Remove the extended attribute named `name` from the inode at `path`.
@@ -422,16 +446,15 @@ impl Filesystem {
     /// between `128 + i_extra_isize` and the end of the on-disk inode)
     /// is decoded, the matching entry is dropped, and the region is
     /// re-encoded in place. External xattr blocks (pointed at by
-    /// `i_file_acl`) are not mutated — if the entry lives there the call
-    /// returns `Error::InvalidArgument("external xattr block removal
-    /// not yet implemented")`.
+    /// Search the in-inode region first, then the external xattr block. If
+    /// the external block becomes empty after removal, free it and zero
+    /// `i_file_acl` (matches kernel behavior — empty xattr blocks are
+    /// reaped on the spot rather than left dangling).
     ///
     /// Returns:
-    /// - `Ok(())` if the entry was removed (region rewritten, inode csum
-    ///   patched, inode written back).
-    /// - `Error::NotFound` if the entry isn't present anywhere.
-    /// - `Error::InvalidArgument` on namespace-prefix issues or an
-    ///   external-block-only entry.
+    /// - `Ok(())` on success.
+    /// - `Error::NotFound` if the entry isn't present in either region.
+    /// - `Error::InvalidArgument` on namespace-prefix issues.
     pub fn apply_removexattr(&self, path: &str, name: &str) -> Result<()> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
@@ -453,41 +476,47 @@ impl Filesystem {
             let region = &mut raw[region_start..region_end];
             match crate::xattr::plan_remove_in_inode_region(region, name)? {
                 crate::xattr::RemoveOutcome::Removed => {
-                    // Patch inode csum + write back.
-                    if self.csum.enabled {
-                        if let Some((lo, hi)) =
-                            self.csum
-                                .compute_inode_checksum(ino, inode.generation, &raw)
-                        {
-                            raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                            if raw.len() >= 0x84 {
-                                raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                            }
-                        }
-                    }
-                    self.write_inode_raw(ino, &raw)?;
-                    self.dev.flush()?;
-                    return Ok(());
+                    self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+                    return self.commit_inode_write(ino, &raw);
                 }
                 crate::xattr::RemoveOutcome::NotFound => { /* check external */ }
             }
         }
 
-        // Not in-inode. If an external xattr block exists and has the
-        // entry, we currently don't support rewriting it — surface
-        // InvalidArgument rather than silently NotFound-ing.
+        // External block path: read, plan-remove, write back (or free it
+        // when it becomes empty).
         if inode.file_acl != 0 {
-            let xs = crate::xattr::read_all(
-                self.dev.as_ref(),
-                &inode,
-                &raw,
-                self.sb.inode_size,
-                self.sb.block_size(),
-            )?;
-            if xs.iter().any(|e| e.name == name) {
-                return Err(Error::InvalidArgument(
-                    "external xattr block removal not yet implemented",
-                ));
+            let bs = self.sb.block_size();
+            let bs_u64 = bs as u64;
+            let block_nr = inode.file_acl;
+            let mut block = vec![0u8; bs as usize];
+            self.dev.read_at(block_nr * bs_u64, &mut block)?;
+            match crate::xattr::plan_remove_from_external_block(&mut block, name, 1)? {
+                crate::xattr::BlockRemoveOutcome::Removed => {
+                    if self.csum.enabled {
+                        self.csum.patch_xattr_block(block_nr, &mut block);
+                    }
+                    self.dev.write_at(block_nr * bs_u64, &block)?;
+                    self.bump_inode_ctime(ino, inode.generation, &mut raw)?;
+                    self.dev.flush()?;
+                    return Ok(());
+                }
+                crate::xattr::BlockRemoveOutcome::RemovedNowEmpty => {
+                    // Free the block + clear i_file_acl + decrement i_blocks.
+                    self.free_block_run_and_bgd(block_nr, 1)?;
+                    self.patch_sb_counters(1, 0)?;
+                    raw[0x68..0x6C].copy_from_slice(&0u32.to_le_bytes());
+                    if raw.len() >= 0x76 {
+                        raw[0x74..0x76].copy_from_slice(&0u16.to_le_bytes());
+                    }
+                    let sectors_per_block = bs_u64 / 512;
+                    let new_blocks = inode.blocks.saturating_sub(sectors_per_block);
+                    Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_blocks)?;
+                    self.bump_inode_ctime(ino, inode.generation, &mut raw)?;
+                    self.dev.flush()?;
+                    return Ok(());
+                }
+                crate::xattr::BlockRemoveOutcome::NotFound => { /* fall through */ }
             }
         }
         Err(Error::NotFound)
@@ -497,11 +526,14 @@ impl Filesystem {
     /// on the inode at `path`. `name` must carry a known namespace prefix
     /// (e.g. `"user.com.apple.FinderInfo"`).
     ///
-    /// v1 scope: **in-inode xattrs only.** If the in-inode region is too
-    /// small to hold the (new) entry, returns
-    /// `Error::NoSpaceLeftOnDevice` (ENOSPC). External xattr blocks are
-    /// not mutated; values that would need to spill there fail rather
-    /// than silently writing elsewhere.
+    /// Try-order, matching the kernel:
+    /// 1. **In-inode region** — between `128 + i_extra_isize` and the end
+    ///    of the on-disk inode. Cheapest; no extra block.
+    /// 2. **External xattr block** — when in-inode is full, fall back to a
+    ///    dedicated block referenced by `i_file_acl`. Allocates a fresh
+    ///    block when none exists, otherwise rewrites the existing one.
+    ///    Returns `Error::NoSpaceLeftOnDevice` if even a full block can't
+    ///    hold the new layout.
     pub fn apply_setxattr(&self, path: &str, name: &str, value: &[u8]) -> Result<()> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
@@ -518,28 +550,138 @@ impl Filesystem {
         };
         let region_start = 128 + i_extra_isize;
         let region_end = inode_size.min(raw.len());
-        if region_start + 8 > region_end {
-            // No space for even the magic + a terminator.
-            return Err(Error::NoSpaceLeftOnDevice);
+        let inline_capable = region_start + 8 <= region_end;
+
+        // Try in-inode first; on overflow fall through to the external block.
+        let inline_result = if inline_capable {
+            let region = &mut raw[region_start..region_end];
+            crate::xattr::plan_set_in_inode_region(region, name, value)
+        } else {
+            Err(Error::NoSpaceLeftOnDevice)
+        };
+
+        match inline_result {
+            Ok(_) => {
+                // In-inode rewrite already in `raw`. Refresh inode csum + commit.
+                self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+                self.commit_inode_write(ino, &raw)
+            }
+            Err(Error::NoSpaceLeftOnDevice) => {
+                self.apply_setxattr_external_block(ino, &inode, &mut raw, name, value)
+            }
+            Err(e) => Err(e),
         }
+    }
 
-        let region = &mut raw[region_start..region_end];
-        crate::xattr::plan_set_in_inode_region(region, name, value)?;
-
+    /// Recompute the inode checksum (when enabled) and splice both halves
+    /// back into the inode image. No-op when csum disabled.
+    fn finalize_inode_raw(&self, ino: u32, generation: u32, raw: &mut [u8]) -> Result<()> {
         if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(ino, inode.generation, &raw)
-            {
+            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, raw) {
                 raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
                 if raw.len() >= 0x84 {
                     raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
                 }
             }
         }
-        self.write_inode_raw(ino, &raw)?;
+        Ok(())
+    }
+
+    /// Helper: route a setxattr that overflowed the in-inode region to the
+    /// external xattr block. Either rewrites the existing block (when
+    /// `i_file_acl != 0`) or allocates a fresh one.
+    fn apply_setxattr_external_block(
+        &self,
+        ino: u32,
+        inode: &crate::inode::Inode,
+        raw: &mut [u8],
+        name: &str,
+        value: &[u8],
+    ) -> Result<()> {
+        let bs = self.sb.block_size();
+        let bs_u64 = bs as u64;
+
+        // Path A: existing external block — read, rewrite, re-checksum, write.
+        if inode.file_acl != 0 {
+            let block_nr = inode.file_acl;
+            let mut block = vec![0u8; bs as usize];
+            self.dev.read_at(block_nr * bs_u64, &mut block)?;
+            crate::xattr::plan_set_in_external_block(&mut block, name, value, 1)?;
+            if self.csum.enabled {
+                self.csum.patch_xattr_block(block_nr, &mut block);
+            }
+            self.dev.write_at(block_nr * bs_u64, &block)?;
+            // i_file_acl unchanged — no need to rewrite the inode body, but
+            // POSIX wants ctime bumped on any attribute write.
+            self.bump_inode_ctime(ino, inode.generation, raw)?;
+            self.dev.flush()?;
+            return Ok(());
+        }
+
+        // Path B: no external block yet — allocate, build, write, then
+        // point i_file_acl + i_blocks at it.
+        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; bs as usize];
+            self.dev.read_at(block * bs_u64, &mut buf)?;
+            Ok(buf)
+        };
+        let inode_group = (ino - 1) / self.sb.inodes_per_group;
+        let plan = crate::alloc::plan_block_allocation(
+            &self.sb,
+            &self.groups,
+            1,
+            inode_group,
+            &mut bitmap_reader,
+        )?;
+        let block_nr = plan.first_block;
+
+        let mut block = vec![0u8; bs as usize];
+        crate::xattr::plan_set_in_external_block(&mut block, name, value, 1)?;
+        if self.csum.enabled {
+            self.csum.patch_xattr_block(block_nr, &mut block);
+        }
+        self.dev.write_at(block_nr * bs_u64, &block)?;
+
+        // Apply the allocator plan: bitmap bit, BGD, SB.
+        self.set_block_run_used(block_nr, 1)?;
+        self.patch_bgd_counters(
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+
+        // Splice block_nr into the inode: i_file_acl_lo at 0x68..0x6C, hi
+        // at 0x74..0x76 (matches `Inode::file_acl` decode in inode.rs).
+        let acl_lo = (block_nr & 0xFFFF_FFFF) as u32;
+        let acl_hi = ((block_nr >> 32) & 0xFFFF) as u16;
+        raw[0x68..0x6C].copy_from_slice(&acl_lo.to_le_bytes());
+        if raw.len() >= 0x76 {
+            raw[0x74..0x76].copy_from_slice(&acl_hi.to_le_bytes());
+        }
+        // Bump i_blocks by sectors_per_block (the xattr block now belongs
+        // to this inode for du purposes).
+        let sectors_per_block = bs_u64 / 512;
+        let new_blocks = inode.blocks.saturating_add(sectors_per_block);
+        Self::patch_inode_size_and_blocks(raw, inode.size, new_blocks)?;
+        // ctime bump + checksum + write inode.
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+        self.finalize_inode_raw(ino, inode.generation, raw)?;
+        self.write_inode_raw(ino, raw)?;
         self.dev.flush()?;
         Ok(())
+    }
+
+    /// Bump `i_ctime` to now and re-checksum + write the inode. Used on
+    /// attribute writes that touch external storage but don't otherwise
+    /// modify the inode body.
+    fn bump_inode_ctime(&self, ino: u32, generation: u32, raw: &mut [u8]) -> Result<()> {
+        let now = now_unix_seconds();
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+        self.finalize_inode_raw(ino, generation, raw)?;
+        self.commit_inode_write(ino, raw)
     }
 
     /// Set the access + modification times on `path`. Mirrors POSIX
@@ -602,20 +744,8 @@ impl Filesystem {
             }
         }
 
-        if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(ino, inode.generation, &raw)
-            {
-                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if raw.len() >= 0x84 {
-                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
-        self.write_inode_raw(ino, &raw)?;
-        self.dev.flush()?;
-        Ok(())
+        self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+        self.commit_inode_write(ino, &raw)
     }
 
     /// Unlink a regular file / symlink / special file at `path`.
@@ -753,7 +883,10 @@ impl Filesystem {
             )?;
             for m in &muts {
                 if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                    self.free_block_run(*start, *len as u64)?;
+                    // Per-extent BGD update — handles cross-group fragmented
+                    // files correctly (the prior single-group assumption
+                    // silently miscounted).
+                    self.free_block_run_and_bgd(*start, *len as u64)?;
                     freed_sectors += *len as u64 * sectors_per_block;
                 }
             }
@@ -762,19 +895,9 @@ impl Filesystem {
         // Clear the inode bitmap bit + bump free counter.
         self.free_inode_slot(target_ino)?;
 
-        // Update SB counters: free_inodes_count++, free_blocks_count += (freed_sectors / sectors_per_block).
+        // Update SB counters: free_inodes_count++, free_blocks_count += freed.
         let freed_blocks = freed_sectors.checked_div(sectors_per_block).unwrap_or(0);
         self.patch_sb_counters(freed_blocks as i64, 1)?;
-        // Also credit the freed data blocks to the group's bg_free_blocks_count.
-        if freed_blocks > 0 && target_inode.has_extents() {
-            // The extents all live in the inode's group for our simple
-            // single-group files (test images). A fragmented file spanning
-            // groups would need the allocator to tell us per-group deltas.
-            let gi = ((target_ino - 1) / self.sb.inodes_per_group) as usize;
-            if gi < self.groups.len() {
-                self.patch_bgd_counters(gi, freed_blocks as i32, 0, 0)?;
-            }
-        }
 
         // Zero the inode body. Kernel sets dtime = now, mode = 0, and
         // leaves the generation intact (helps tools like ext4 audit tool detect the
@@ -1243,18 +1366,24 @@ impl Filesystem {
         // i_links_count at 0x1A..0x1C = 1
         raw[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
 
-        // i_flags at 0x20..0x24 = EXTENTS
-        let flags = crate::inode::InodeFlags::EXTENTS.bits();
-        raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+        // i_flags + i_block layout depend on the FS dialect:
+        // - ext4 (FsFlavor::Ext4): EXTENTS_FL set, i_block holds an empty
+        //   extent leaf header (magic + entries=0 + max=4 + depth=0).
+        // - ext2 / ext3: no flag, i_block stays all-zero (no direct or
+        //   indirect pointers — file is empty so there's nothing to map).
+        if self.flavor.uses_extents() {
+            let flags = crate::inode::InodeFlags::EXTENTS.bits();
+            raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
 
-        // i_block at 0x28..0x64 (60 bytes): empty extent leaf header.
-        //   magic (u16)=0xF30A, entries=0, max=4, depth=0, generation=0
-        let eh_off = 0x28;
-        raw[eh_off..eh_off + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
-        raw[eh_off + 2..eh_off + 4].copy_from_slice(&0u16.to_le_bytes()); // entries
-        raw[eh_off + 4..eh_off + 6].copy_from_slice(&4u16.to_le_bytes()); // max
-        raw[eh_off + 6..eh_off + 8].copy_from_slice(&0u16.to_le_bytes()); // depth
-                                                                          // eh_generation at eh_off+8..eh_off+12 stays zero
+            let eh_off = 0x28;
+            raw[eh_off..eh_off + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
+            raw[eh_off + 2..eh_off + 4].copy_from_slice(&0u16.to_le_bytes()); // entries
+            raw[eh_off + 4..eh_off + 6].copy_from_slice(&4u16.to_le_bytes()); // max
+            raw[eh_off + 6..eh_off + 8].copy_from_slice(&0u16.to_le_bytes()); // depth
+                                                                              // eh_generation at eh_off+8..eh_off+12 stays zero
+        }
+        // (ext2/3 path: i_flags 0x20..0x24 and i_block 0x28..0x64 stay zero
+        //  from the initial vec![0u8; inode_size].)
 
         // Timestamps: atime 0x08, ctime 0x0C, mtime 0x10, dtime 0x14
         let now = now_unix_seconds();
@@ -1273,7 +1402,8 @@ impl Filesystem {
         raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
 
         // i_extra_isize at 0x80..0x82 — 32 is the modern default (room for
-        // crtime, nsec halves, checksum_hi).
+        // crtime, nsec halves, checksum_hi). ext2 inodes are 128 bytes so
+        // the extra section doesn't exist; the size guard handles both.
         if inode_size >= 0x82 + 2 {
             raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
         }
@@ -1313,9 +1443,13 @@ impl Filesystem {
             ));
         }
         if !inode.has_extents() {
-            return Err(Error::InvalidArgument(
-                "write_file target is non-EXTENTS (legacy inode)",
-            ));
+            // ext2 / ext3 (or ext4 inode without EXTENTS_FL): legacy
+            // direct/indirect block-pointer scheme. Same overall shape as
+            // the extent path below — free old → allocate → write data →
+            // patch inode — but the i_block tree comes from `indirect_mut`
+            // and any indirect-tree blocks are co-allocated with the data
+            // run (one bitmap call covers both).
+            return self.apply_replace_file_content_indirect(ino, inode, raw, data);
         }
 
         let bs = self.sb.block_size();
@@ -1323,15 +1457,16 @@ impl Filesystem {
         let group_idx_of_inode = ((ino - 1) / self.sb.inodes_per_group) as usize;
 
         // Phase 1: free any existing data blocks. Reuses the extent-shrink
-        // planner which handles partial tail extents cleanly.
+        // planner which handles partial tail extents cleanly. Each freed
+        // run credits its own group's BGD via `free_block_run_and_bgd`,
+        // so cross-group fragmented files are accounted for correctly.
         let mut freed_fs_blocks: u64 = 0;
         if inode.size > 0 {
             let (_sc, muts) =
                 crate::file_mut::plan_truncate_shrink(inode.size, 0, &inode.block, bs)?;
             for m in &muts {
                 if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                    self.free_block_run(*start, *len as u64)?;
-                    freed_fs_blocks += *len as u64;
+                    freed_fs_blocks += self.free_block_run_and_bgd(*start, *len as u64)?;
                 }
             }
         }
@@ -1342,13 +1477,12 @@ impl Filesystem {
         root[4..6].copy_from_slice(&4u16.to_le_bytes()); // max entries
         Self::patch_inode_block_area(&mut raw, &root)?;
 
-        // Empty write: update size + accounting, credit freed blocks back
-        // to SB and the source group's BGD, exit.
+        // Empty write: BGDs already credited per-run above; only SB needs
+        // a single update.
         if data.is_empty() {
             self.finalize_inode_after_write(ino, &mut raw, &inode, 0, 0)?;
             if freed_fs_blocks > 0 {
                 self.patch_sb_counters(freed_fs_blocks as i64, 0)?;
-                self.patch_bgd_counters(group_idx_of_inode, freed_fs_blocks as i32, 0, 0)?;
             }
             self.dev.flush()?;
             return Ok(0);
@@ -1373,13 +1507,8 @@ impl Filesystem {
             &mut bitmap_reader,
         )?;
 
-        // Phase 3: write bitmap + BGD + SB deltas.
-        //
-        // Accounting: the allocator plan already carries
-        // `free_blocks_delta = -needed` for the destination group. We layer
-        // on top: (a) destination bitmap marked used, (b) if the old content
-        // was in a different group, credit its freed blocks separately, and
-        // (c) net SB delta `freed - needed`.
+        // Phase 3: mark allocated bitmap + patch destination BGD; SB nets
+        // the alloc delta against the freed total computed above.
         self.set_block_run_used(plan.first_block, needed_blocks as u64)?;
         self.patch_bgd_counters(
             plan.bgd.group_idx as usize,
@@ -1387,12 +1516,6 @@ impl Filesystem {
             plan.bgd.free_inodes_delta,
             plan.bgd.used_dirs_delta,
         )?;
-        if freed_fs_blocks > 0 {
-            // If dest == source, this adds `+freed` to the BGD, netting
-            // `freed - needed` against the allocator's -needed. If dest !=
-            // source, it bumps the source's free_blocks back up.
-            self.patch_bgd_counters(group_idx_of_inode, freed_fs_blocks as i32, 0, 0)?;
-        }
         let net_block_delta = freed_fs_blocks as i64 - needed_blocks as i64;
         self.patch_sb_counters(net_block_delta, 0)?;
 
@@ -1423,6 +1546,138 @@ impl Filesystem {
         // Phase 6: update size + blocks + csum and persist the inode.
         let new_size = data.len() as u64;
         let new_sectors = needed_blocks as u64 * sectors_per_block;
+        self.finalize_inode_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
+        self.dev.flush()?;
+        Ok(new_size)
+    }
+
+    /// ext2/ext3 sibling of `apply_replace_file_content`'s extent path.
+    /// Frees the inode's existing direct/indirect tree, allocates one
+    /// contiguous run sized for both the data payload AND the indirect-tree
+    /// metadata blocks, builds the new tree via `indirect_mut::plan_contiguous`,
+    /// then persists everything (data → indirect blocks → inode).
+    ///
+    /// No journal interaction: ext2 has no journal at all, and the user's
+    /// `JournalWriter` returns `None` for those mounts so `self.journal` is
+    /// already None at this point. ext3 mounts (Phase B) will plumb writes
+    /// through the journal once the writer can address indirect-block
+    /// journal inodes.
+    fn apply_replace_file_content_indirect(
+        &self,
+        ino: u32,
+        inode: Inode,
+        mut raw: Vec<u8>,
+        data: &[u8],
+    ) -> Result<u64> {
+        let bs = self.sb.block_size();
+        let sectors_per_block = bs as u64 / 512;
+        let group_idx_of_inode = ((ino - 1) / self.sb.inodes_per_group) as usize;
+
+        // Phase 1: free existing data + indirect-tree blocks. `collect_for_free`
+        // walks the tree and returns coalesced data runs + individual indirect
+        // blocks, so cross-group fragmented files are accounted for correctly.
+        let mut freed_fs_blocks: u64 = 0;
+        if inode.size > 0 {
+            let block_count = inode.size.div_ceil(bs as u64) as u32;
+            let freed = crate::indirect_mut::collect_for_free(
+                &inode.block,
+                bs,
+                block_count,
+                self.dev.as_ref(),
+            )?;
+            for run in &freed.data_runs {
+                freed_fs_blocks += self.free_block_run_and_bgd(run.start, run.len as u64)?;
+            }
+            for &iblk in &freed.indirect_blocks {
+                freed_fs_blocks += self.free_block_run_and_bgd(iblk, 1)?;
+            }
+        }
+        // Reset i_block to all zeros — no extent magic for legacy inodes.
+        let zero_iblock = [0u8; 60];
+        Self::patch_inode_block_area(&mut raw, &zero_iblock)?;
+
+        if data.is_empty() {
+            self.finalize_inode_after_write(ino, &mut raw, &inode, 0, 0)?;
+            if freed_fs_blocks > 0 {
+                self.patch_sb_counters(freed_fs_blocks as i64, 0)?;
+            }
+            self.dev.flush()?;
+            return Ok(0);
+        }
+
+        // Phase 2: allocate one contiguous run sized for data + indirect tree.
+        // Indirect blocks live at the head of the run, data at the tail.
+        // `count_indirect_blocks` is exactly the number of allocator pulls
+        // `plan_contiguous` will make, so the budget is tight (verified by
+        // the `count_indirect_blocks_matches_plan_contiguous` unit test).
+        let needed_data_blocks: u32 = data.len().div_ceil(bs as usize) as u32;
+        let n_indirect: u32 = crate::indirect_mut::count_indirect_blocks(needed_data_blocks, bs)
+            .try_into()
+            .map_err(|_| Error::Corrupt("indirect_mut: indirect block count overflow"))?;
+        let total_run = needed_data_blocks
+            .checked_add(n_indirect)
+            .ok_or(Error::Corrupt("indirect_mut: total run count overflow"))?;
+
+        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
+            let mut buf = vec![0u8; bs as usize];
+            self.dev.read_at(block * bs as u64, &mut buf)?;
+            Ok(buf)
+        };
+        let plan = crate::alloc::plan_block_allocation(
+            &self.sb,
+            &self.groups,
+            total_run,
+            group_idx_of_inode as u32,
+            &mut bitmap_reader,
+        )?;
+        let first_indirect = plan.first_block;
+        let first_data = plan.first_block + n_indirect as u64;
+
+        // Phase 3: build the indirect tree. The closure hands out blocks
+        // sequentially from `first_indirect` — `plan_contiguous` doesn't
+        // care about address ordering, so any allocation order is fine.
+        let mut next_indirect = first_indirect;
+        let i_plan =
+            crate::indirect_mut::plan_contiguous(needed_data_blocks, first_data, bs, || {
+                let v = next_indirect;
+                next_indirect += 1;
+                Ok(v)
+            })?;
+
+        // Phase 4: bitmap + BGD + SB counters cover the whole run in one
+        // mark-used + one BGD-credit + one SB-update.
+        self.set_block_run_used(plan.first_block, total_run as u64)?;
+        self.patch_bgd_counters(
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        let net_block_delta = freed_fs_blocks as i64 - total_run as i64;
+        self.patch_sb_counters(net_block_delta, 0)?;
+
+        // Phase 5: write the data payload into the data-portion of the run.
+        for i in 0..needed_data_blocks as u64 {
+            let off_in_data = (i as usize) * bs as usize;
+            let chunk_end = ((i as usize + 1) * bs as usize).min(data.len());
+            let mut block = vec![0u8; bs as usize];
+            block[..chunk_end - off_in_data].copy_from_slice(&data[off_in_data..chunk_end]);
+            self.dev.write_at((first_data + i) * bs as u64, &block)?;
+        }
+
+        // Phase 6: write the indirect-tree blocks.
+        for (blk, buf) in &i_plan.block_writes {
+            self.dev.write_at(blk * bs as u64, buf)?;
+        }
+
+        // Phase 7: patch i_block region with the new tree root.
+        Self::patch_inode_block_area(&mut raw, &i_plan.i_block)?;
+
+        // Phase 8: finalize. ext2/3 i_blocks counts BOTH data AND indirect
+        // blocks (in 512-byte sectors) — extent metadata blocks count the
+        // same way for ext4 so the rule is consistent across flavors.
+        let new_size = data.len() as u64;
+        let new_sectors = (needed_data_blocks as u64 + n_indirect as u64) * sectors_per_block;
         self.finalize_inode_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
         self.dev.flush()?;
         Ok(new_size)
@@ -1697,6 +1952,25 @@ impl Filesystem {
         }
         self.dev.write_at(bitmap_block * bs, &buf)?;
         Ok(())
+    }
+
+    /// Free a physical-block run AND patch the containing group's
+    /// `bg_free_blocks_count`. Returns `len` so the caller can accumulate a
+    /// running total to feed `patch_sb_counters` once per high-level op.
+    ///
+    /// Per-call BGD updates correctly handle runs that span groups (each
+    /// call lands in exactly one group per [`free_block_run`]'s contract).
+    /// SB updates are deliberately deferred so freeing a 1000-extent file
+    /// produces 1 SB write instead of 1000.
+    fn free_block_run_and_bgd(&self, start: u64, len: u64) -> Result<u64> {
+        self.free_block_run(start, len)?;
+        let bpg = self.sb.blocks_per_group as u64;
+        let first_data = self.sb.first_data_block as u64;
+        let gi = ((start - first_data) / bpg) as usize;
+        if gi < self.groups.len() {
+            self.patch_bgd_counters(gi, len as i32, 0, 0)?;
+        }
+        Ok(len)
     }
 
     /// Mark a physical-block run `[start, start+len)` as USED in the
@@ -2711,21 +2985,16 @@ impl Filesystem {
         }
 
         // Free target's data blocks (collect physical extents via the read
-        // path; simpler than re-parsing here).
+        // path; simpler than re-parsing here). Each freed run credits its
+        // own group's BGD via `free_block_run_and_bgd`.
         let extents = crate::extent::collect_all(&target_inode.block, self.dev.as_ref(), bs)?;
         let mut freed_blocks: u64 = 0;
-        let mut target_group_idx: Option<usize> = None;
         for e in &extents {
-            self.free_block_run(e.physical_block, e.length as u64)?;
-            freed_blocks += e.length as u64;
-            let gi = ((e.physical_block - self.sb.first_data_block as u64)
-                / self.sb.blocks_per_group as u64) as usize;
-            target_group_idx.get_or_insert(gi);
+            freed_blocks += self.free_block_run_and_bgd(e.physical_block, e.length as u64)?;
         }
-        if let Some(gi) = target_group_idx {
-            self.patch_bgd_counters(gi, freed_blocks as i32, 0, 0)?;
+        if freed_blocks > 0 {
+            self.patch_sb_counters(freed_blocks as i64, 0)?;
         }
-        self.patch_sb_counters(freed_blocks as i64, 0)?;
 
         // Free the inode slot + adjust counters. A removed dir decrements
         // `bg_used_dirs_count`.

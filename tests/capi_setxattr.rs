@@ -189,10 +189,11 @@ fn setxattr_unknown_prefix_returns_einval() {
 }
 
 #[test]
-fn setxattr_huge_value_returns_enospc() {
-    // 512-byte value can't possibly fit in an in-inode region (which
-    // maxes out at 128-byte inode - 32 extra_isize = ~96 bytes of room).
-    let img = scratch("enospc");
+fn setxattr_spills_to_external_block_when_inline_full() {
+    // A 512-byte value cannot fit in the in-inode region (which maxes
+    // out around ~96 bytes); after Phase 3 it should spill into an
+    // external xattr block (allocated on demand) rather than ENOSPC.
+    let img = scratch("spill_external");
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/plain.txt").unwrap();
     let name_c = CString::new("user.huge").unwrap();
@@ -209,8 +210,55 @@ fn setxattr_huge_value_returns_enospc() {
             value.len(),
         )
     };
+    assert_eq!(
+        rc,
+        0,
+        "set spilling to external block should succeed (errno={})",
+        fs_ext4_last_errno()
+    );
+
+    // Read back via getxattr to confirm round-trip through the block.
+    let mut out = vec![0u8; value.len()];
+    let n = unsafe {
+        fs_ext4::capi::fs_ext4_getxattr(
+            fs_h,
+            path_c.as_ptr(),
+            name_c.as_ptr(),
+            out.as_mut_ptr() as *mut _,
+            out.len(),
+        )
+    };
+    assert_eq!(n, value.len() as i64, "readback length mismatch");
+    assert_eq!(out, value, "external xattr block round-trip corrupted");
+
+    unsafe { fs_ext4_umount(fs_h) };
+    let _ = fs::remove_file(&img);
+}
+
+#[test]
+fn setxattr_oversized_value_returns_enospc() {
+    // A value that exceeds the external-block capacity (~4060 bytes for a
+    // 4 KiB block, accounting for the 32-byte header + entry overhead)
+    // should still surface ENOSPC.
+    let img = scratch("oversized");
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let path_c = CString::new("/plain.txt").unwrap();
+    let name_c = CString::new("user.toobig").unwrap();
+    let value = vec![0xCDu8; 8192];
+
+    let fs_h = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs_h.is_null());
+    let rc = unsafe {
+        fs_ext4_setxattr(
+            fs_h,
+            path_c.as_ptr(),
+            name_c.as_ptr(),
+            value.as_ptr() as *const _,
+            value.len(),
+        )
+    };
     assert_eq!(rc, -1);
-    assert_eq!(fs_ext4_last_errno(), 28, "ENOSPC expected");
+    assert_eq!(fs_ext4_last_errno(), 28, "ENOSPC expected for oversized");
     unsafe { fs_ext4_umount(fs_h) };
     let _ = fs::remove_file(&img);
 }

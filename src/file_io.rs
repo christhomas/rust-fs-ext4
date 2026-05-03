@@ -6,6 +6,7 @@
 use crate::error::{Error, Result};
 use crate::extent;
 use crate::fs::Filesystem;
+use crate::indirect;
 use crate::inline_data;
 use crate::inode::{Inode, InodeFlags};
 
@@ -39,14 +40,6 @@ pub fn read(
         ));
     }
 
-    // Without EXTENTS, fall back would be the legacy indirect block scheme.
-    // We don't support that in Phase 1 — modern mkfs always uses extents.
-    if (inode.flags & InodeFlags::EXTENTS.bits()) == 0 {
-        return Err(Error::Corrupt(
-            "legacy indirect blocks not supported (use extents)",
-        ));
-    }
-
     // Clamp length to file size.
     if offset >= inode.size {
         return Ok(0);
@@ -57,15 +50,20 @@ pub fn read(
     }
 
     let block_size = fs.sb.block_size() as u64;
+    let bs32 = fs.sb.block_size();
     let mut written: u64 = 0;
     let mut cur_offset = offset;
     let end_offset = offset + max_read;
 
-    // Memoize the most recent extent lookup. Sequential reads that stay
-    // within one extent no longer re-walk the tree per block — for a
-    // 4 KiB-block file with one big contiguous extent, that's one
-    // tree walk total instead of one per block.
+    // Two block-mapping schemes share the same byte-walking loop:
+    //   * `EXT4_EXTENTS_FL` set → extent tree (modern ext4 default).
+    //   * Flag absent          → legacy direct/indirect block-pointer scheme
+    //     used by ext2, ext3, and ext4 inodes that opted out of extents.
+    // Both lookups are amortized: the extent path caches the last extent;
+    // the indirect path caches the last indirect block read.
+    let uses_extents = (inode.flags & InodeFlags::EXTENTS.bits()) != 0;
     let mut cached_extent: Option<extent::Extent> = None;
+    let mut indirect_cache = indirect::IndirectCache::new();
 
     // Walk byte-by-block until we've satisfied the request.
     while cur_offset < end_offset {
@@ -77,37 +75,45 @@ pub fn read(
 
         let dst = &mut out[written as usize..written as usize + copy_len];
 
-        let ext_opt = match cached_extent {
-            Some(e) if e.contains(logical_block) => Some(e),
-            _ => {
-                let fresh = extent::lookup(
-                    &inode.block,
-                    fs.dev.as_ref(),
-                    fs.sb.block_size(),
-                    logical_block,
-                )?;
-                cached_extent = fresh;
-                fresh
-            }
-        };
+        if uses_extents {
+            let ext_opt = match cached_extent {
+                Some(e) if e.contains(logical_block) => Some(e),
+                _ => {
+                    let fresh = extent::lookup(&inode.block, fs.dev.as_ref(), bs32, logical_block)?;
+                    cached_extent = fresh;
+                    fresh
+                }
+            };
 
-        match ext_opt {
-            None => {
-                // Sparse hole — fill with zeros.
-                dst.fill(0);
+            match ext_opt {
+                None => dst.fill(0),
+                Some(ext) if ext.uninitialized => dst.fill(0),
+                Some(ext) => {
+                    let physical_block = ext.map(logical_block);
+                    let phys_byte_offset = physical_block
+                        .checked_mul(block_size)
+                        .and_then(|b| b.checked_add(off_in_block as u64))
+                        .ok_or(Error::CorruptExtentTree("physical block offset overflow"))?;
+                    fs.dev.read_at(phys_byte_offset, dst)?;
+                }
             }
-            Some(ext) if ext.uninitialized => {
-                // Pre-allocated but unwritten — also reads as zeros.
-                dst.fill(0);
-            }
-            Some(ext) => {
-                // Map logical to physical and read.
-                let physical_block = ext.map(logical_block);
-                let phys_byte_offset = physical_block
-                    .checked_mul(block_size)
-                    .and_then(|b| b.checked_add(off_in_block as u64))
-                    .ok_or(Error::CorruptExtentTree("physical block offset overflow"))?;
-                fs.dev.read_at(phys_byte_offset, dst)?;
+        } else {
+            let phys_opt = indirect::lookup(
+                &inode.block,
+                fs.dev.as_ref(),
+                bs32,
+                logical_block,
+                &mut indirect_cache,
+            )?;
+            match phys_opt {
+                None => dst.fill(0),
+                Some(physical_block) => {
+                    let phys_byte_offset = physical_block
+                        .checked_mul(block_size)
+                        .and_then(|b| b.checked_add(off_in_block as u64))
+                        .ok_or(Error::Corrupt("indirect: physical block offset overflow"))?;
+                    fs.dev.read_at(phys_byte_offset, dst)?;
+                }
             }
         }
 
@@ -195,11 +201,6 @@ pub fn read_verified(
             "inline-data file: caller must use file_io::read_inline with raw inode bytes",
         ));
     }
-    if (inode.flags & InodeFlags::EXTENTS.bits()) == 0 {
-        return Err(Error::Corrupt(
-            "legacy indirect blocks not supported (use extents)",
-        ));
-    }
     if offset >= inode.size {
         return Ok(0);
     }
@@ -215,10 +216,12 @@ pub fn read_verified(
         generation: inode.generation,
         csum: &fs.csum,
     };
+    let uses_extents = (inode.flags & InodeFlags::EXTENTS.bits()) != 0;
     let mut written: u64 = 0;
     let mut cur_offset = offset;
     let end_offset = offset + max_read;
     let mut cached_extent: Option<extent::Extent> = None;
+    let mut indirect_cache = indirect::IndirectCache::new();
 
     while cur_offset < end_offset {
         let logical_block = cur_offset / block_size;
@@ -228,31 +231,56 @@ pub fn read_verified(
         let copy_len = bytes_available_in_block.min(bytes_remaining);
         let dst = &mut out[written as usize..written as usize + copy_len];
 
-        let ext_opt = match cached_extent {
-            Some(e) if e.contains(logical_block) => Some(e),
-            _ => {
-                let fresh = extent::lookup_verified(
-                    &inode.block,
-                    fs.dev.as_ref(),
-                    bs32,
-                    logical_block,
-                    Some(&ctx),
-                )?;
-                cached_extent = fresh;
-                fresh
-            }
-        };
+        if uses_extents {
+            let ext_opt = match cached_extent {
+                Some(e) if e.contains(logical_block) => Some(e),
+                _ => {
+                    let fresh = extent::lookup_verified(
+                        &inode.block,
+                        fs.dev.as_ref(),
+                        bs32,
+                        logical_block,
+                        Some(&ctx),
+                    )?;
+                    cached_extent = fresh;
+                    fresh
+                }
+            };
 
-        match ext_opt {
-            None => dst.fill(0),
-            Some(ext) if ext.uninitialized => dst.fill(0),
-            Some(ext) => {
-                let physical_block = ext.map(logical_block);
-                let phys_byte_offset = physical_block
-                    .checked_mul(block_size)
-                    .and_then(|b| b.checked_add(off_in_block as u64))
-                    .ok_or(Error::CorruptExtentTree("physical block offset overflow"))?;
-                fs.dev.read_at(phys_byte_offset, dst)?;
+            match ext_opt {
+                None => dst.fill(0),
+                Some(ext) if ext.uninitialized => dst.fill(0),
+                Some(ext) => {
+                    let physical_block = ext.map(logical_block);
+                    let phys_byte_offset = physical_block
+                        .checked_mul(block_size)
+                        .and_then(|b| b.checked_add(off_in_block as u64))
+                        .ok_or(Error::CorruptExtentTree("physical block offset overflow"))?;
+                    fs.dev.read_at(phys_byte_offset, dst)?;
+                }
+            }
+        } else {
+            // ext2/ext3 (or ext4 inode without EXTENTS_FL): no extent-block
+            // CRCs to verify — there are no off-inode metadata blocks unique
+            // to the indirect scheme that carry checksums. Fall back to the
+            // unverified indirect lookup; the inode itself was already
+            // checksum-verified by the caller.
+            let phys_opt = indirect::lookup(
+                &inode.block,
+                fs.dev.as_ref(),
+                bs32,
+                logical_block,
+                &mut indirect_cache,
+            )?;
+            match phys_opt {
+                None => dst.fill(0),
+                Some(physical_block) => {
+                    let phys_byte_offset = physical_block
+                        .checked_mul(block_size)
+                        .and_then(|b| b.checked_add(off_in_block as u64))
+                        .ok_or(Error::Corrupt("indirect: physical block offset overflow"))?;
+                    fs.dev.read_at(phys_byte_offset, dst)?;
+                }
             }
         }
         written += copy_len as u64;

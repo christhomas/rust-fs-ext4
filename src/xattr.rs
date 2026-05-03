@@ -460,6 +460,240 @@ fn encode_in_inode_entries(region: &mut [u8], entries: &[DecodedEntry]) {
     // Terminator u32 at entry_cursor is already zero from the sweep.
 }
 
+// ---------------------------------------------------------------------------
+// External xattr block: write-side
+// ---------------------------------------------------------------------------
+
+/// Outcome of [`plan_remove_from_external_block`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum BlockRemoveOutcome {
+    /// Entry removed; the block still has at least one entry remaining.
+    Removed,
+    /// Entry removed AND the block is now empty — caller should free the
+    /// block and zero `i_file_acl`.
+    RemovedNowEmpty,
+    /// The named entry wasn't in this block.
+    NotFound,
+}
+
+/// Decode every entry from an external xattr block (the 32-byte header is
+/// expected at offset 0). Skips the terminator. Used by both the read path
+/// and the write path.
+fn decode_external_block_entries(block: &[u8]) -> Result<Vec<DecodedEntry>> {
+    if block.len() < 32 {
+        return Err(Error::Corrupt("xattr block too small"));
+    }
+    let mut out = Vec::new();
+    let mut pos = 32usize;
+    while pos + 16 <= block.len() {
+        let header = u32::from_le_bytes(block[pos..pos + 4].try_into().unwrap());
+        if header == 0 {
+            break;
+        }
+        let name_len = block[pos] as usize;
+        let name_index = block[pos + 1];
+        let value_offs = u16::from_le_bytes(block[pos + 2..pos + 4].try_into().unwrap()) as usize;
+        let value_size = u32::from_le_bytes(block[pos + 8..pos + 12].try_into().unwrap()) as usize;
+        if pos + 16 + name_len > block.len() {
+            return Err(Error::Corrupt("xattr entry name overruns block"));
+        }
+        let name_bytes = block[pos + 16..pos + 16 + name_len].to_vec();
+        let value = if value_size == 0 {
+            Vec::new()
+        } else {
+            if value_offs + value_size > block.len() {
+                return Err(Error::Corrupt("xattr block value out of range"));
+            }
+            block[value_offs..value_offs + value_size].to_vec()
+        };
+        out.push(DecodedEntry {
+            name_index,
+            name_bytes,
+            value,
+        });
+        pos += (16 + name_len + 3) & !3;
+    }
+    Ok(out)
+}
+
+/// Re-emit a full external xattr block from a list of entries.
+///
+/// Lays out:
+/// - `[0x00..0x04]` magic = `EXT4_XATTR_MAGIC`
+/// - `[0x04..0x08]` `h_refcount` (caller-provided; default 1)
+/// - `[0x08..0x0C]` `h_blocks` = 1 (always single-block)
+/// - `[0x0C..0x10]` `h_hash` = 0 (kernel recomputes lazily; readers tolerate 0)
+/// - `[0x10..0x14]` `h_checksum` slot — left as 0 here; caller patches via
+///   `Checksummer::patch_xattr_block` after layout.
+/// - `[0x14..0x20]` reserved zeros
+/// - `[0x20..]`     entries growing forward, values growing backward from
+///   end of block. `e_value_offs` is BLOCK-relative
+///   (different from in-inode where it's region-relative).
+fn encode_external_block(block: &mut [u8], entries: &[DecodedEntry], refcount: u32) {
+    for b in block.iter_mut() {
+        *b = 0;
+    }
+    block[0x00..0x04].copy_from_slice(&EXT4_XATTR_MAGIC.to_le_bytes());
+    block[0x04..0x08].copy_from_slice(&refcount.to_le_bytes());
+    block[0x08..0x0C].copy_from_slice(&1u32.to_le_bytes());
+    // h_hash + h_checksum + reserved: stay zero until checksum patch.
+
+    // Stable sort: kernel orders by (name_index, name).
+    let mut sorted: Vec<&DecodedEntry> = entries.iter().collect();
+    sorted.sort_by(|a, b| {
+        a.name_index
+            .cmp(&b.name_index)
+            .then_with(|| a.name_bytes.cmp(&b.name_bytes))
+    });
+
+    let block_len = block.len();
+    let mut entry_cursor: usize = 0x20;
+    let mut value_cursor: usize = block_len;
+
+    for e in &sorted {
+        let name_len = e.name_bytes.len();
+        let entry_padded = (16 + name_len + 3) & !3;
+
+        let value_offs = if e.value.is_empty() {
+            0
+        } else {
+            let value_padded = (e.value.len() + 3) & !3;
+            value_cursor -= value_padded;
+            block[value_cursor..value_cursor + e.value.len()].copy_from_slice(&e.value);
+            value_cursor
+        };
+
+        block[entry_cursor] = name_len as u8;
+        block[entry_cursor + 1] = e.name_index;
+        block[entry_cursor + 2..entry_cursor + 4]
+            .copy_from_slice(&(value_offs as u16).to_le_bytes());
+        // e_value_inum at +4..+8 = 0 (no EA_INODE)
+        block[entry_cursor + 8..entry_cursor + 12]
+            .copy_from_slice(&(e.value.len() as u32).to_le_bytes());
+        // e_hash at +12..+16 = 0
+        block[entry_cursor + 16..entry_cursor + 16 + name_len].copy_from_slice(&e.name_bytes);
+        entry_cursor += entry_padded;
+    }
+    // Terminator already zero from the wipe.
+}
+
+/// Set (create-or-replace) an xattr in an external block buffer.
+///
+/// `block` is the full xattr block (caller has already read it from disk
+/// or freshly zeroed it for a brand-new allocation). `refcount` is what to
+/// stamp into `h_refcount` — pass 1 for a non-shared block. On success the
+/// bytes have been rewritten; the caller must (a) patch `h_checksum` via
+/// `Checksummer::patch_xattr_block` and (b) write the block back.
+///
+/// Errors:
+/// - `Error::InvalidArgument` if the name lacks a known prefix or has an
+///   empty suffix (except ACL namespaces 2 + 3).
+/// - `Error::NameTooLong` if the suffix > 255 bytes.
+/// - `Error::NoSpaceLeftOnDevice` if the new layout would not fit in the
+///   block (entries + values + terminator > block size).
+pub fn plan_set_in_external_block(
+    block: &mut [u8],
+    name: &str,
+    value: &[u8],
+    refcount: u32,
+) -> Result<SetOutcome> {
+    let Some((name_index, suffix)) = split_qualified_name(name) else {
+        return Err(Error::InvalidArgument(
+            "xattr name missing known namespace prefix",
+        ));
+    };
+    if suffix.is_empty() && !matches!(name_index, 2 | 3) {
+        return Err(Error::InvalidArgument("xattr name suffix is empty"));
+    }
+    if suffix.len() > 255 {
+        return Err(Error::NameTooLong);
+    }
+    if block.len() < 0x40 {
+        return Err(Error::NoSpaceLeftOnDevice);
+    }
+
+    let magic_present = u32::from_le_bytes(block[..4].try_into().unwrap()) == EXT4_XATTR_MAGIC;
+    let mut entries = if magic_present {
+        decode_external_block_entries(block)?
+    } else {
+        Vec::new()
+    };
+
+    let mut outcome = SetOutcome::Inserted;
+    let suffix_bytes = suffix.as_bytes();
+    for e in entries.iter_mut() {
+        if e.name_index == name_index && e.name_bytes == suffix_bytes {
+            e.value = value.to_vec();
+            outcome = SetOutcome::Replaced;
+            break;
+        }
+    }
+    if matches!(outcome, SetOutcome::Inserted) {
+        entries.push(DecodedEntry {
+            name_index,
+            name_bytes: suffix_bytes.to_vec(),
+            value: value.to_vec(),
+        });
+    }
+
+    let entries_capacity = block.len() - 0x20;
+    let needed_entries: usize = entries
+        .iter()
+        .map(|e| (16 + e.name_bytes.len() + 3) & !3)
+        .sum();
+    let needed_values: usize = entries
+        .iter()
+        .filter(|e| !e.value.is_empty())
+        .map(|e| (e.value.len() + 3) & !3)
+        .sum();
+    if needed_entries + 4 + needed_values > entries_capacity {
+        return Err(Error::NoSpaceLeftOnDevice);
+    }
+
+    encode_external_block(block, &entries, refcount);
+    Ok(outcome)
+}
+
+/// Remove an xattr from an external block buffer.
+///
+/// Returns [`BlockRemoveOutcome::RemovedNowEmpty`] when the last entry is
+/// gone — the caller should free the underlying block + zero `i_file_acl`
+/// rather than leaving an empty xattr block on disk. Otherwise rewrites
+/// the block in place; caller must re-checksum + write back.
+pub fn plan_remove_from_external_block(
+    block: &mut [u8],
+    name: &str,
+    refcount: u32,
+) -> Result<BlockRemoveOutcome> {
+    let Some((name_index, suffix)) = split_qualified_name(name) else {
+        return Err(Error::InvalidArgument(
+            "xattr name missing known namespace prefix",
+        ));
+    };
+    if block.len() < 0x20 {
+        return Ok(BlockRemoveOutcome::NotFound);
+    }
+    let magic = u32::from_le_bytes(block[..4].try_into().unwrap());
+    if magic != EXT4_XATTR_MAGIC {
+        return Ok(BlockRemoveOutcome::NotFound);
+    }
+
+    let entries = decode_external_block_entries(block)?;
+    let before = entries.len();
+    let kept: Vec<DecodedEntry> = entries
+        .into_iter()
+        .filter(|e| !(e.name_index == name_index && e.name_bytes == suffix.as_bytes()))
+        .collect();
+    if kept.len() == before {
+        return Ok(BlockRemoveOutcome::NotFound);
+    }
+    if kept.is_empty() {
+        return Ok(BlockRemoveOutcome::RemovedNowEmpty);
+    }
+    encode_external_block(block, &kept, refcount);
+    Ok(BlockRemoveOutcome::Removed)
+}
+
 /// Convenience: get a single xattr value by name. Returns `None` if not present.
 pub fn get(
     dev: &dyn BlockDevice,

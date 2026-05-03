@@ -214,6 +214,50 @@ impl Checksummer {
         true
     }
 
+    /// Verify an external xattr block's checksum.
+    ///
+    /// Per Linux `fs/ext4/xattr.c::ext4_xattr_block_csum`, the recipe is:
+    ///
+    /// ```text
+    ///   crc32c(seed, block_nr_le_u64)
+    ///   → crc32c(., block[0x00..0x10])      // magic, refcount, blocks, hash
+    ///   → crc32c(., [0u32])                  // h_checksum slot zeroed (4 bytes)
+    ///   → crc32c(., block[0x14..end])        // rest of block
+    /// ```
+    ///
+    /// The stored u32 lives at offset 0x10 of the block.
+    pub fn verify_xattr_block(&self, block_nr: u64, block: &[u8]) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        if block.len() < 0x20 {
+            return false;
+        }
+        let stored = u32::from_le_bytes(block[0x10..0x14].try_into().unwrap());
+        let computed = self.compute_xattr_block_csum(block_nr, block);
+        stored == computed
+    }
+
+    /// Patch the `h_checksum` field of an external xattr block in place.
+    /// Mirrors [`verify_xattr_block`]. No-op when checksums are disabled.
+    /// Returns `true` when the block was patched.
+    pub fn patch_xattr_block(&self, block_nr: u64, block: &mut [u8]) -> bool {
+        if !self.enabled || block.len() < 0x20 {
+            return false;
+        }
+        let csum = self.compute_xattr_block_csum(block_nr, block);
+        block[0x10..0x14].copy_from_slice(&csum.to_le_bytes());
+        true
+    }
+
+    fn compute_xattr_block_csum(&self, block_nr: u64, block: &[u8]) -> u32 {
+        let mut c = linux_crc32c(self.seed, &block_nr.to_le_bytes());
+        c = linux_crc32c(c, &block[0x00..0x10]);
+        c = linux_crc32c(c, &0u32.to_le_bytes());
+        c = linux_crc32c(c, &block[0x14..]);
+        c
+    }
+
     /// Compute the inode checksum as two u16 halves (lo=checksum_lo at 0x7C,
     /// hi=checksum_hi at 0x82). Returns `None` when checksums are disabled
     /// or the buffer is too short to patch. Callers use this after mutating
