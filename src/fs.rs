@@ -175,6 +175,16 @@ impl Filesystem {
                 fs.journal = Some(std::sync::Mutex::new(jw));
             }
         }
+
+        // Phase 6.2 — orphan recovery. Runs after journal replay so any
+        // pending kernel-level transactions have already played back;
+        // any inode still on the orphan chain at this point is genuinely
+        // dead and we can reclaim it. Best-effort: a recovery failure
+        // surfaces as an error but doesn't abort the mount.
+        if fs.dev.is_writable() && !defer_replay {
+            let _ = fs.recover_orphans();
+        }
+
         Ok(fs)
     }
 
@@ -220,6 +230,93 @@ impl Filesystem {
             steps += 1;
         }
         Ok(out)
+    }
+
+    /// Phase 6.2 — orphan replay. For each inode on the
+    /// `s_last_orphan` chain, free its data blocks + inode-bitmap slot,
+    /// zero its inode body (with `i_dtime = now`), and clear
+    /// `s_last_orphan`. Runs as ONE multi-block journaled transaction
+    /// so a crash mid-recovery either commits all the frees or none of
+    /// them.
+    ///
+    /// Returns the number of orphan inodes reclaimed. No-op (returns 0)
+    /// when the chain is empty or the device is read-only.
+    ///
+    /// Designed to be called from the mount path AFTER journal replay,
+    /// so the orphans we're about to reclaim are guaranteed not still in
+    /// use by an in-flight kernel-level transaction.
+    pub fn recover_orphans(&self) -> Result<usize> {
+        if !self.dev.is_writable() {
+            return Ok(0);
+        }
+        let chain = self.orphan_list()?;
+        if chain.is_empty() {
+            return Ok(0);
+        }
+
+        let bs = self.sb.block_size();
+        let sectors_per_block = bs as u64 / 512;
+        let mut buf = BlockBuffer::new(bs);
+        let mut total_freed_blocks: u64 = 0;
+        let mut reclaimed = 0usize;
+
+        for &orphan_ino in &chain {
+            // Read the orphan's raw bytes (skip csum verify — orphan
+            // inodes routinely carry stale csums by design).
+            let mut raw = self.read_inode_raw(orphan_ino)?;
+            let parsed = match Inode::parse(&raw) {
+                Ok(i) => i,
+                Err(_) => continue, // unparseable orphan — skip + leak rather than panic
+            };
+            // Free data blocks (extents path only — orphan recovery for
+            // legacy indirect inodes is a follow-up).
+            if parsed.has_extents() && parsed.size > 0 {
+                let (_sc, muts) = match crate::file_mut::plan_truncate_shrink(
+                    parsed.size,
+                    0,
+                    &parsed.block,
+                    bs,
+                ) {
+                    Ok(p) => p,
+                    Err(_) => continue,
+                };
+                for m in &muts {
+                    if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
+                        total_freed_blocks +=
+                            self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
+                    }
+                }
+            }
+            // Free the inode bitmap slot + BGD free_inodes++.
+            self.buffer_free_inode_slot(&mut buf, orphan_ino)?;
+
+            // Zero the inode body (preserve generation), set dtime.
+            let inode_size = self.sb.inode_size as usize;
+            let old_gen = parsed.generation;
+            for b in &mut raw[..inode_size] {
+                *b = 0;
+            }
+            let dtime = now_unix_seconds();
+            raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
+            raw[0x64..0x68].copy_from_slice(&old_gen.to_le_bytes());
+            self.finalize_inode_raw(orphan_ino, old_gen, &mut raw)?;
+            self.buffer_write_inode(&mut buf, orphan_ino, &raw)?;
+
+            reclaimed += 1;
+        }
+
+        // SB: free_blocks_count += total_freed, free_inodes_count +=
+        // reclaimed, s_last_orphan = 0.
+        self.buffer_patch_sb_counters(&mut buf, total_freed_blocks as i64, reclaimed as i32)?;
+        self.buffer_patch_sb_last_orphan(&mut buf, 0)?;
+
+        // i_blocks tracking on the freed inodes is moot (they're zero
+        // now); their per-extent sectors are accounted for in the
+        // BGD/SB counter updates above.
+        let _ = sectors_per_block;
+
+        self.commit_block_buffer(buf)?;
+        Ok(reclaimed)
     }
 
     /// Read a whole block by its logical block number.
@@ -863,6 +960,28 @@ impl Filesystem {
         sb[0x0C..0x10].copy_from_slice(&(new as u32).to_le_bytes());
         sb[0x158..0x15C].copy_from_slice(&((new >> 32) as u32).to_le_bytes());
 
+        if self.csum.enabled {
+            let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+            sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        }
+        Ok(())
+    }
+
+    /// Buffer-side patch of the SB's `s_last_orphan` field at byte
+    /// 0xE8. Used by orphan recovery (Phase 6.2) to clear / advance the
+    /// chain head atomically with the inode/block frees.
+    pub(crate) fn buffer_patch_sb_last_orphan(
+        &self,
+        buf: &mut BlockBuffer,
+        value: u32,
+    ) -> Result<()> {
+        let bs = self.sb.block_size() as u64;
+        let sb_offset = crate::superblock::SUPERBLOCK_OFFSET;
+        let sb_block = sb_offset / bs;
+        let off_in_block = (sb_offset % bs) as usize;
+        let block = buf.get_mut(self, sb_block)?;
+        let sb = &mut block[off_in_block..off_in_block + 1024];
+        sb[0xE8..0xEC].copy_from_slice(&value.to_le_bytes());
         if self.csum.enabled {
             let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
             sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());

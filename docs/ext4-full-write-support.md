@@ -288,10 +288,13 @@ external consistency checker when one is on `$PATH`).
   `i_dtime` overload, capped at `inodes_count` to defang cycle
   corruption. Pinned by `tests/orphan_list_basic.rs` (clean image
   returns empty; sweep across fixtures proves no panic).
-- [ ] **6.2 Orphan replay** — for each orphan inode, free its blocks
-  + inode (under a recovery transaction). Needs the multi-block tx
-  pattern + a way to walk the chain BEFORE the inode is touched
-  (since freeing breaks the chain). Deferred.
+- [x] **6.2 Orphan replay** — `Filesystem::recover_orphans` walks the
+  chain via `orphan_list` (chain captured up-front so freeing doesn't
+  break it), then frees each orphan's data blocks + inode-bitmap slot
+  + zeroes the inode body. SB counters + `s_last_orphan` cleared
+  atomically via the same BlockBuffer transaction. Hooked from
+  `mount_inner` after journal replay so recovery only fires on
+  writable mounts post-replay. Pinned by `tests/orphan_recovery.rs`.
 - [ ] **6.3 Orphan-list inserts** — when unlinking a still-open inode,
   insert at head; when closing, remove. Requires the host (FSKit
   /FUSE) to track open fds, which the driver doesn't see today.
