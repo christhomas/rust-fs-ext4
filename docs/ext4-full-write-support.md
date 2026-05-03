@@ -206,16 +206,27 @@ All four single-inode ops (chmod, chown, utimens, in-inode setxattr,
 truncate_grow) pinned by `tests/journal_writer_inode_ops.rs` which
 asserts each one advances `jsb.sequence` in production, AND that the
 journal self-checkpoints back to clean.
-- [ ] **5.2.8 `apply_create`** (inode + parent dir + bitmaps + BGD + SB)
-- [ ] **5.2.9 `apply_unlink`**
-- [ ] **5.2.10 `apply_rename`** (two dir blocks + inode)
+- [ ] **5.2.8 `apply_create`** — needs buffer-aware refactor of the
+  `add_dir_entry` / `extend_dir_and_add_entry` helpers first.
+- [x] **5.2.9 `apply_unlink`** — multi-block journaled. Buffers the
+  parent-dir-block edit, target-data-block frees, target-inode-bitmap
+  clear, BGD/SB counter updates, and zeroed-inode write into one
+  transaction. Pinned by `tests/journal_writer_unlink_rmdir.rs` with
+  budget sweep 0..=40.
+- [ ] **5.2.10 `apply_rename`**
 - [ ] **5.2.11 `apply_link`**
 - [ ] **5.2.12 `apply_symlink`**
-- [ ] **5.2.13 `apply_mkdir`**
-- [ ] **5.2.14 `apply_rmdir`**
-- [ ] **5.2.15 `apply_replace_file_content`** — data=ordered
-  semantics: data blocks fsync'd before the metadata transaction
-  commits. Largest single op.
+- [ ] **5.2.13 `apply_mkdir`** — same blocker as `apply_create`.
+- [x] **5.2.14 `apply_rmdir`** — multi-block journaled. Buffers
+  target-data-block frees, inode-slot free + used_dirs decrement,
+  BGD/SB counters, parent-dir-entry removal, parent nlink decrement
+  into one transaction.
+- [ ] **5.2.15 `apply_replace_file_content`**
+
+Helpers needing a "buffer-twin" before the rest of 5.2 can ship
+journaled: `add_dir_entry`, `extend_dir_and_add_entry`,
+`extend_dir_and_add_entry_depth1`, `mark_inode_used` (already done),
+`set_block_run_used` (mostly done — see `buffer_mark_block_run_used`).
 
 ### 5.3 Journal modes
 

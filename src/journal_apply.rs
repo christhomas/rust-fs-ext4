@@ -93,17 +93,20 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
 /// one shot. Returns the number of blocks replayed (0 if clean or device
 /// is read-only — the latter is not an error; mount proceeds read-only).
 pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
+    // Read-only mounts skip replay regardless of journal state — the read
+    // path tolerates a non-clean journal (pending transactions are
+    // invisible, which is correct for a read-only view of a dirty image).
+    // Checking this BEFORE `read_superblock` matters for ext3: the journal
+    // inode's i_block holds legacy indirect pointers, and the deeper code
+    // currently bails on non-extent journals. RO mounts have no business
+    // touching the journal at all, so we exit early here.
+    if !fs.dev.is_writable() {
+        return Ok(0);
+    }
     let Some(jsb) = jbd2::read_superblock(fs)? else {
         return Ok(0); // no journal inode → nothing to replay
     };
     if jsb.is_clean() {
-        return Ok(0);
-    }
-    if !fs.dev.is_writable() {
-        // Caller is mounting read-only. Skip replay — read path already
-        // handles a non-clean journal by ignoring it (we read committed
-        // data from final locations; any pending transactions are invisible,
-        // which is acceptable for a read-only view of a dirty image).
         return Ok(0);
     }
     let plan = crate::journal::walk(fs, &jsb)?;

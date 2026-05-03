@@ -145,6 +145,24 @@ impl Filesystem {
             journal: None,
         };
 
+        // Phase A scope: ext3 RW mount is not yet supported. The journal
+        // inode uses legacy indirect-block addressing (no EXTENTS_FL), and
+        // the journal walker / writer (`jbd2::journal_block_to_physical`,
+        // `JournalWriter::open`) currently both bail on indirect-block
+        // journals. Refusing RW here gives the caller a clear error
+        // instead of a deeper "journal inode uses legacy indirect blocks"
+        // bail, and leaves RO mounts working (they skip the journal
+        // entirely — see `replay_if_dirty`).
+        //
+        // Phase B will lift this restriction once `journal_block_to_physical`
+        // and `JournalWriter::open` route through `indirect::map_logical_any`
+        // (the same dispatcher every other inode walker now uses).
+        if fs.dev.is_writable() && fs.flavor == features::FsFlavor::Ext3 {
+            return Err(Error::Corrupt(
+                "ext3 RW mount not supported in Phase A — open the device read-only",
+            ));
+        }
+
         // Replay a dirty journal if the device is writable. Silently skips
         // for read-only mounts — the read path tolerates a non-clean journal
         // (pending transactions are invisible, which is correct for a
@@ -160,8 +178,10 @@ impl Filesystem {
 
         // Open the live-write journal writer once replay is done. Any
         // pending transactions are now applied; the writer can take over
-        // the JBD2 cursor from a clean state.
-        if fs.dev.is_writable() {
+        // the JBD2 cursor from a clean state. Skipped for ext3 — the
+        // RW-mount refusal above means we never reach here for ext3, but
+        // the explicit guard makes the dispatch story self-evident.
+        if fs.dev.is_writable() && fs.flavor != features::FsFlavor::Ext3 {
             if let Some(jw) = crate::journal_writer::JournalWriter::open(&fs)? {
                 fs.journal = Some(std::sync::Mutex::new(jw));
             }
@@ -528,6 +548,51 @@ impl Filesystem {
             if byte < bm.len() {
                 bm[byte] |= mask;
             }
+        }
+        Ok(())
+    }
+
+    /// Buffer-side equivalent of `free_inode_slot`: clears the inode
+    /// bitmap bit AND patches the BGD's `bg_free_inodes_count` (+1) in
+    /// the buffer. Matches the kernel's pairing — the SB
+    /// `s_free_inodes_count` is the caller's responsibility (one bump
+    /// per high-level op, via `buffer_patch_sb_counters`).
+    pub(crate) fn buffer_free_inode_slot(&self, buf: &mut BlockBuffer, ino: u32) -> Result<()> {
+        let ipg = self.sb.inodes_per_group;
+        let gi = ((ino - 1) / ipg) as usize;
+        if gi >= self.groups.len() {
+            return Err(Error::InvalidInode(ino));
+        }
+        let bit = ((ino - 1) % ipg) as u64;
+        let bitmap_block = self.groups[gi].inode_bitmap;
+        {
+            let bm = buf.get_mut(self, bitmap_block)?;
+            let byte = (bit / 8) as usize;
+            let mask = 1u8 << (bit % 8);
+            if byte < bm.len() {
+                bm[byte] &= !mask;
+            }
+        }
+        self.buffer_patch_bgd_counters(buf, gi, 0, 1, 0)
+    }
+
+    /// Buffer-side equivalent of `mark_inode_used`: sets the inode
+    /// bitmap bit. BGD/SB counter patches are the caller's
+    /// responsibility (different ops want different deltas — e.g.
+    /// mkdir bumps `used_dirs_count`).
+    pub(crate) fn buffer_mark_inode_used(&self, buf: &mut BlockBuffer, ino: u32) -> Result<()> {
+        let ipg = self.sb.inodes_per_group;
+        let gi = ((ino - 1) / ipg) as usize;
+        if gi >= self.groups.len() {
+            return Err(Error::InvalidInode(ino));
+        }
+        let bit = ((ino - 1) % ipg) as u64;
+        let bitmap_block = self.groups[gi].inode_bitmap;
+        let bm = buf.get_mut(self, bitmap_block)?;
+        let byte = (bit / 8) as usize;
+        let mask = 1u8 << (bit % 8);
+        if byte < bm.len() {
+            bm[byte] |= mask;
         }
         Ok(())
     }
@@ -1065,6 +1130,9 @@ impl Filesystem {
             return Err(Error::NotADirectory);
         }
 
+        // All mutations land in this buffer and commit as one transaction.
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+
         // Remove the dir entry from the parent. Scans each block until
         // `remove_entry_from_block` reports success.
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
@@ -1072,21 +1140,19 @@ impl Filesystem {
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut removed = false;
         for logical in 0..parent_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
+            let Some(phys) = self.map_inode_logical(&parent_inode, logical)? else {
                 continue;
             };
-            let mut block = self.read_block(phys)?;
+            let block = buf.get_mut(self, phys)?;
             // `dir_entry_tail` occupies the last 12 bytes when metadata_csum
             // is on; don't scribble over it.
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
                 12
             } else {
                 0
             };
             if crate::dir::remove_entry_from_block(
-                &mut block,
+                block,
                 base_name.as_bytes(),
                 has_ft,
                 reserved_tail,
@@ -1102,7 +1168,6 @@ impl Filesystem {
                     c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                     block[end - 4..end].copy_from_slice(&c.to_le_bytes());
                 }
-                self.dev.write_at(phys * bs as u64, &block)?;
                 removed = true;
                 break;
             }
@@ -1111,35 +1176,18 @@ impl Filesystem {
             return Err(Error::NotFound);
         }
 
-        // Decrement link count. Non-zero after → just persist the new count
-        // and the dtime update isn't needed.
+        // Decrement link count. Non-zero after → just persist the new count.
         let new_links = target_inode.links_count.saturating_sub(1);
         target_raw[0x1A..0x1C].copy_from_slice(&new_links.to_le_bytes());
 
         if new_links > 0 {
-            if self.csum.enabled {
-                if let Some((lo, hi)) = self.csum.compute_inode_checksum(
-                    target_ino,
-                    target_inode.generation,
-                    &target_raw,
-                ) {
-                    target_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                    if target_raw.len() >= 0x84 {
-                        target_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                    }
-                }
-            }
-            self.write_inode_raw(target_ino, &target_raw)?;
-            self.dev.flush()?;
-            return Ok(());
+            self.finalize_inode_raw(target_ino, target_inode.generation, &mut target_raw)?;
+            self.buffer_write_inode(&mut buf, target_ino, &target_raw)?;
+            return self.commit_block_buffer(buf);
         }
 
-        // Last link gone — free data blocks + inode slot.
-        //
-        // Truncate-to-zero re-uses the existing extent-free machinery. We
-        // don't call `apply_truncate_shrink` directly because it recomputes
-        // the inode checksum (we're about to zero the inode anyway). Use
-        // the plan layer and apply the free-block-run mutations inline.
+        // Last link gone — free data blocks + inode slot, all into the same
+        // transaction so a crash either keeps everything or undoes everything.
         let mut freed_sectors: u64 = 0;
         let sectors_per_block = bs as u64 / 512;
         if target_inode.has_extents() && target_inode.size > 0 {
@@ -1151,50 +1199,34 @@ impl Filesystem {
             )?;
             for m in &muts {
                 if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                    // Per-extent BGD update — handles cross-group fragmented
-                    // files correctly (the prior single-group assumption
-                    // silently miscounted).
-                    self.free_block_run_and_bgd(*start, *len as u64)?;
+                    self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
                     freed_sectors += *len as u64 * sectors_per_block;
                 }
             }
         }
 
-        // Clear the inode bitmap bit + bump free counter.
-        self.free_inode_slot(target_ino)?;
+        // Inode bitmap + BGD free_inodes_count; SB counter for both
+        // freed_blocks AND +1 inode goes via one buffer_patch_sb_counters
+        // call below.
+        self.buffer_free_inode_slot(&mut buf, target_ino)?;
 
-        // Update SB counters: free_inodes_count++, free_blocks_count += freed.
         let freed_blocks = freed_sectors.checked_div(sectors_per_block).unwrap_or(0);
-        self.patch_sb_counters(freed_blocks as i64, 1)?;
+        self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 1)?;
 
         // Zero the inode body. Kernel sets dtime = now, mode = 0, and
-        // leaves the generation intact (helps tools like ext4 audit tool detect the
-        // dead slot). We match that: zero everything, set dtime, restore
-        // generation.
+        // leaves the generation intact (helps tooling detect the dead slot).
         let inode_size = self.sb.inode_size as usize;
         let old_gen = target_inode.generation;
         for b in &mut target_raw[..inode_size] {
             *b = 0;
         }
-        // dtime at offset 0x14..0x18
         let dtime = now_unix_seconds();
-        target_raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
-        // restore generation at 0x64..0x68
-        target_raw[0x64..0x68].copy_from_slice(&old_gen.to_le_bytes());
-        if self.csum.enabled {
-            if let Some((lo, hi)) =
-                self.csum
-                    .compute_inode_checksum(target_ino, old_gen, &target_raw)
-            {
-                target_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-                if target_raw.len() >= 0x84 {
-                    target_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-                }
-            }
-        }
-        self.write_inode_raw(target_ino, &target_raw)?;
-        self.dev.flush()?;
-        Ok(())
+        target_raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes()); // dtime
+        target_raw[0x64..0x68].copy_from_slice(&old_gen.to_le_bytes()); // generation
+        self.finalize_inode_raw(target_ino, old_gen, &mut target_raw)?;
+        self.buffer_write_inode(&mut buf, target_ino, &target_raw)?;
+
+        self.commit_block_buffer(buf)
     }
 
     /// Create a new regular file at `path` with permission bits `mode`
@@ -3248,42 +3280,43 @@ impl Filesystem {
             }
         }
 
-        // Free target's data blocks (collect physical extents via the read
-        // path; simpler than re-parsing here). Each freed run credits its
-        // own group's BGD via `free_block_run_and_bgd`.
+        // Multi-block transaction: free target data blocks + free inode +
+        // remove parent's dir entry + decrement parent nlink, all atomic.
+        let mut buf = BlockBuffer::new(bs);
+
+        // Free target's data blocks. Each freed run credits its own group's
+        // BGD; SB credit accumulates and lands once below.
         let extents = crate::extent::collect_all(&target_inode.block, self.dev.as_ref(), bs)?;
         let mut freed_blocks: u64 = 0;
         for e in &extents {
-            freed_blocks += self.free_block_run_and_bgd(e.physical_block, e.length as u64)?;
-        }
-        if freed_blocks > 0 {
-            self.patch_sb_counters(freed_blocks as i64, 0)?;
+            freed_blocks +=
+                self.buffer_free_block_run_and_bgd(&mut buf, e.physical_block, e.length as u64)?;
         }
 
-        // Free the inode slot + adjust counters. A removed dir decrements
-        // `bg_used_dirs_count`.
-        self.free_inode_slot(target_ino)?;
+        // Free the inode slot. A removed dir decrements `bg_used_dirs_count`
+        // — buffer_free_inode_slot already credits free_inodes by +1, so we
+        // separately patch used_dirs by -1 here.
+        self.buffer_free_inode_slot(&mut buf, target_ino)?;
         let target_gi = ((target_ino - 1) / self.sb.inodes_per_group) as usize;
-        self.patch_bgd_counters(target_gi, 0, 1, -1)?;
-        self.patch_sb_counters(0, 1)?;
+        self.buffer_patch_bgd_counters(&mut buf, target_gi, 0, 0, -1)?;
+        // SB: free_blocks_count += freed, free_inodes_count += 1.
+        self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 1)?;
 
         // Remove the entry from the parent directory.
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut removed = false;
         for logical in 0..parent_blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&parent_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
+            let Some(phys) = self.map_inode_logical(&parent_inode, logical)? else {
                 continue;
             };
-            let mut block = self.read_block(phys)?;
-            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&block) {
+            let block = buf.get_mut(self, phys)?;
+            let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
                 12
             } else {
                 0
             };
             if crate::dir::remove_entry_from_block(
-                &mut block,
+                block,
                 base_name.as_bytes(),
                 has_ft,
                 reserved_tail,
@@ -3296,7 +3329,6 @@ impl Filesystem {
                     c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
                     block[end - 4..end].copy_from_slice(&c.to_le_bytes());
                 }
-                self.dev.write_at(phys * bs as u64, &block)?;
                 removed = true;
                 break;
             }
@@ -3309,9 +3341,8 @@ impl Filesystem {
 
         // Parent loses the ".." reference from the removed child → nlink -1.
         self.patch_inode_nlink(parent_ino, &mut parent_raw, &parent_inode, -1)?;
-        self.write_inode_raw(parent_ino, &parent_raw)?;
+        self.buffer_write_inode(&mut buf, parent_ino, &parent_raw)?;
 
-        self.dev.flush()?;
-        Ok(())
+        self.commit_block_buffer(buf)
     }
 }

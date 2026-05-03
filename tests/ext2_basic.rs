@@ -15,6 +15,7 @@ use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::{Inode, InodeFlags};
 use fs_ext4::mkfs::format_filesystem_with_flavor;
+use std::io::{Seek, SeekFrom, Write};
 use std::sync::Arc;
 
 const ROOT_INODE: u32 = 2;
@@ -221,4 +222,93 @@ fn mkfs_ext2_then_write_and_read_back_each_tier() {
             "{name}: byte-for-byte content mismatch through ext2 indirect roundtrip"
         );
     }
+}
+
+/// `EXT4_FEATURE_COMPAT_HAS_JOURNAL` (bit 0x0004 in `feature_compat` at SB
+/// offset 0x5C). Setting this bit on an ext2-formatted image is enough for
+/// `FsFlavor::detect` to classify the volume as ext3, which is all these
+/// tests need to exercise the Phase A ext3 mount-policy path.
+const HAS_JOURNAL_BIT: u32 = 0x0004;
+
+/// Patch an existing ext2 image into an "ext3-shaped" image by flipping
+/// the HAS_JOURNAL bit in the on-disk superblock. We don't bother creating
+/// a real journal inode — the Phase A code paths under test never read it
+/// (RO mount skips the journal entirely; RW mount is refused before any
+/// journal access is attempted).
+fn flip_to_ext3_flavor(path: &std::path::Path) {
+    let mut f = std::fs::OpenOptions::new()
+        .read(true)
+        .write(true)
+        .open(path)
+        .expect("open image rw for patch");
+    // Superblock lives at byte offset 1024; feature_compat at SB offset 0x5C.
+    let off = 1024 + 0x5C;
+    f.seek(SeekFrom::Start(off)).expect("seek sb feat_compat");
+    let mut buf = [0u8; 4];
+    use std::io::Read;
+    f.read_exact(&mut buf).expect("read feat_compat");
+    let mut feat = u32::from_le_bytes(buf);
+    feat |= HAS_JOURNAL_BIT;
+    f.seek(SeekFrom::Start(off)).expect("seek sb feat_compat");
+    f.write_all(&feat.to_le_bytes()).expect("write feat_compat");
+    f.sync_all().expect("sync");
+}
+
+#[test]
+fn ext3_ro_mount_succeeds_via_flavor_detection() {
+    let path = scratch_path("ext3-ro");
+    let size: u64 = 4 * 1024 * 1024;
+    let block_size: u32 = 1024;
+    mkfs_ext2_image(&path, size, block_size);
+    let _cleanup = ScratchGuard(path.clone());
+    flip_to_ext3_flavor(&path);
+
+    // Read-only mount: `replay_if_dirty` short-circuits on the writability
+    // check before touching the journal inode (which would otherwise bail
+    // because we never created one). FsFlavor::detect should classify the
+    // volume as ext3 thanks to the HAS_JOURNAL bit we flipped on.
+    let dev = Arc::new(FileDevice::open(path.to_str().unwrap()).expect("open ro"));
+    let fs = Filesystem::mount(dev).expect("ext3 RO mount must succeed");
+    assert_eq!(
+        fs.flavor,
+        FsFlavor::Ext3,
+        "HAS_JOURNAL bit should yield Ext3 flavor"
+    );
+    assert!(!fs.dev.is_writable(), "test invariant: RO device");
+    assert!(
+        fs.journal.is_none(),
+        "RO mount must not open the journal writer"
+    );
+
+    // Sanity: reads still work via the indirect path.
+    let root_raw = fs.read_inode_raw(ROOT_INODE).expect("read root inode");
+    let root = Inode::parse(&root_raw).expect("parse root inode");
+    let dir_data = file_io::read_all(&fs, &root).expect("read root dir");
+    let entries = dir::parse_block(&dir_data, true).expect("parse dir entries");
+    assert!(entries.iter().any(|e| e.name == b"."));
+    assert!(entries.iter().any(|e| e.name == b".."));
+}
+
+#[test]
+fn ext3_rw_mount_refused_in_phase_a() {
+    let path = scratch_path("ext3-rw-refused");
+    let size: u64 = 4 * 1024 * 1024;
+    let block_size: u32 = 1024;
+    mkfs_ext2_image(&path, size, block_size);
+    let _cleanup = ScratchGuard(path.clone());
+    flip_to_ext3_flavor(&path);
+
+    // Read-write mount: must refuse with the Phase A ext3 guard, NOT bail
+    // deep in the journal walker. Either path returns an Err, but the
+    // top-level guard yields a stable, user-facing message.
+    let dev = Arc::new(FileDevice::open_rw(path.to_str().unwrap()).expect("open rw"));
+    let err = match Filesystem::mount(dev) {
+        Err(e) => e,
+        Ok(_) => panic!("ext3 RW mount must be refused in Phase A"),
+    };
+    let msg = format!("{err:?}");
+    assert!(
+        msg.contains("ext3 RW mount not supported"),
+        "expected Phase A ext3 refusal message, got: {msg}"
+    );
 }
