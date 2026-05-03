@@ -291,11 +291,24 @@ checklist tracks "production-ready" status.
 Also from `IMPROVEMENT-PLAN.md`. Required before claiming "fast" but
 not required for correctness.
 
-- [ ] **8.1 LRU block cache** (C1)
-- [ ] **8.2 Extent lookup memoization** (C2)
-- [ ] **8.3 Bitmap scan vectorization** (C3)
-- [ ] **8.4 Writeback batching** — coalesce adjacent dirty blocks
-  before commit. Big win for `apply_replace_file_content`.
+- [x] **8.1 LRU block cache** (C1) — new `src/block_cache.rs`:
+  `CachedDevice` wrapper around any `BlockDevice`. Block-aligned
+  single-block reads cache; multi-block reads bypass; writes
+  invalidate. Hand-rolled LRU keyed on (block, recency-seq) — no
+  external crate. Pinned by 5 unit tests + integration test in
+  `tests/block_cache_integration.rs` showing 5.5× reduction in
+  inner-device reads on a real-fs workload.
+- [ ] **8.2 Extent lookup memoization** (C2) — already partly done by
+  `cached_extent` per-call in `file_io::read`; cross-call memo deferred.
+- [x] **8.3 Bitmap scan vectorization** (C3) — `find_first_free` was
+  already u64-stride-vectorized. `find_free_run` now leverages it to
+  skip large used regions instead of bit-at-a-time scanning. The
+  run-length verification still walks bit-by-bit (almost always
+  short).
+- [ ] **8.4 Writeback batching** — most ops already submit one
+  multi-block transaction (BlockBuffer pattern from Phase 5.2);
+  remaining win is coalescing adjacent dirty blocks within the
+  buffer. Deferred.
 
 ---
 

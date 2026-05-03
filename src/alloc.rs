@@ -160,26 +160,35 @@ pub fn find_first_free(bitmap: &[u8], start: u32, max_bits: u32) -> Option<u32> 
 /// Find the first run of `count` consecutive free bits at or after `start`,
 /// within the first `max_bits` bits of the bitmap. Returns the starting bit
 /// index of the run, or `None` if no such run exists.
+///
+/// Phase 8.3 vectorization: the outer "find a starting candidate" step
+/// uses [`find_first_free`] (u64-stride skip over fully-used regions),
+/// then the run-length verification walks bit-at-a-time. On sparse
+/// bitmaps (typical post-mkfs) this is effectively memory-bandwidth
+/// bound; on densely-packed bitmaps it skips fully-used 64-bit words in
+/// one branch instead of 64.
 pub fn find_free_run(bitmap: &[u8], start: u32, max_bits: u32, count: u32) -> Option<u32> {
     if count == 0 {
         return None;
     }
     let mut i = start;
     while i + count <= max_bits {
-        if bit_is_set(bitmap, i) {
-            i += 1;
-            continue;
+        // Vectorized: jump straight to the next free bit at-or-after `i`,
+        // skipping all-ones words 64 bits at a time.
+        let run_start = find_first_free(bitmap, i, max_bits)?;
+        if run_start + count > max_bits {
+            return None;
         }
-        // Walk forward to see how long the free run is.
-        let run_start = i;
-        let mut j = i;
-        while j < i + count && j < max_bits && !bit_is_set(bitmap, j) {
+        // Verify `count` contiguous free bits — bit-at-a-time, since the
+        // blocker (if any) almost always sits within the first few bits.
+        let mut j = run_start + 1;
+        while j < run_start + count && !bit_is_set(bitmap, j) {
             j += 1;
         }
         if j - run_start >= count {
             return Some(run_start);
         }
-        // Skip past the blocker.
+        // Hit a used bit before reaching `count`; skip past it and retry.
         i = j + 1;
     }
     None

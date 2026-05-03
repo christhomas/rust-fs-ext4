@@ -24,6 +24,7 @@
 pub mod acl;
 pub mod alloc;
 pub mod bgd;
+pub mod block_cache;
 pub mod block_io;
 pub mod casefold;
 pub mod checksum;

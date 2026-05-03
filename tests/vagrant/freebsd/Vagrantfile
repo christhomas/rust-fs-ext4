@@ -1,0 +1,53 @@
+# Vagrantfile — FreeBSD VM for cross-validating fs-ext4 images against
+# the kernel's native (BSD-licensed) ext2/3 driver.
+#
+# Why FreeBSD: it ships an in-kernel ext2/3 driver (sys/fs/ext2fs/) that
+# is BSD-licensed and *independent* of both the Linux kernel and lwext4.
+# Mounting our images here gives us a third opinion on the test contract
+# — bugs all three implementations share are very likely spec-defined,
+# bugs unique to one are likely impl defects.
+#
+# Usage (from this directory):
+#
+#     vagrant up                    # boot the VM (~2 min first time)
+#     vagrant ssh -c "/vagrant/run-cross-validate.sh"
+#                                   # mount each image, sha256 every file,
+#                                   # diff against the host's manifest
+#     vagrant halt                  # power off when done
+#     vagrant destroy               # full teardown
+#
+# Provider notes:
+#   - macOS Apple Silicon: this box requires a UTM-compatible provider
+#     (see https://github.com/lcrilly/vagrant-utm) since VirtualBox
+#     dropped arm64 host support. Adjust `config.vm.provider` accordingly.
+#   - Linux/x86_64: the default `virtualbox` provider works as-is.
+
+Vagrant.configure("2") do |config|
+  # bento/freebsd-14 is community-maintained, BSD-licensed, and stays
+  # current with FreeBSD point releases. Pinning to a major release tag
+  # avoids surprise-mount-behavior bumps.
+  config.vm.box = "bento/freebsd-14"
+
+  # Map the test-disks dir into the VM so the validator script can read
+  # them directly. /vagrant is the standard shared-folder mountpoint;
+  # FreeBSD 14 supports nfs out of the box (rsync also works for hosts
+  # without an nfs server).
+  config.vm.synced_folder "../../../test-disks", "/test-disks",
+    type: "rsync",
+    rsync__exclude: [".git/"]
+
+  # Same for the tests/vagrant/freebsd directory — gives the VM access to
+  # run-cross-validate.sh without us baking it into the box.
+  config.vm.synced_folder ".", "/vagrant",
+    type: "rsync"
+
+  # Modest resources — the VM only needs to mount + read small images.
+  config.vm.provider "virtualbox" do |vb|
+    vb.cpus = 2
+    vb.memory = 1024
+  end
+
+  # Provisioning: nothing to install. FreeBSD's base system already
+  # includes mount_ext2fs(8) and sha256(1). The validator script
+  # (run-cross-validate.sh) does all the work.
+end

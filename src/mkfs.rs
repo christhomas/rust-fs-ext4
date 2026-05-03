@@ -71,24 +71,30 @@ pub fn format_filesystem_with_flavor(
     block_size: u32,
     flavor: FsFlavor,
 ) -> Result<()> {
-    if matches!(flavor, FsFlavor::Ext3) {
-        // ext3 mkfs requires a journal inode + jbd2 log layout — Phase B work.
-        // Ext3 volumes formatted by other tools still mount via this crate.
-        return Err(Error::InvalidArgument(
-            "mkfs: ext3 formatting not yet implemented (use ext2 or ext4)",
-        ));
-    }
-    // Per-flavor on-disk choices.
+    // Per-flavor on-disk choices. ext3 sits between ext2 (no extents, no
+    // metadata_csum, 32-byte BGDs) and ext4 (everything on) — same layout
+    // as ext2 plus a journal inode + JBD2 log area at the head of the
+    // data region.
     let inode_size: u16 = match flavor {
-        FsFlavor::Ext2 => 128, // ext2 default; no extra section
-        FsFlavor::Ext3 | FsFlavor::Ext4 => 256,
+        FsFlavor::Ext2 | FsFlavor::Ext3 => 128,
+        FsFlavor::Ext4 => 256,
     };
     let desc_size: u16 = match flavor {
-        FsFlavor::Ext2 => 32, // legacy 32-byte BGDs (no INCOMPAT_64BIT)
-        FsFlavor::Ext3 | FsFlavor::Ext4 => 64,
+        FsFlavor::Ext2 | FsFlavor::Ext3 => 32, // legacy 32-byte BGDs (no INCOMPAT_64BIT)
+        FsFlavor::Ext4 => 64,
     };
     let csum_enabled = matches!(flavor, FsFlavor::Ext4);
     let dir_csum_tail: usize = if csum_enabled { 12 } else { 0 };
+    // Journal sizing for ext3. JBD2's documented minimum is 1024 blocks;
+    // we pick exactly that for fixture friendliness — at 1 KiB block_size
+    // it's a 1 MiB journal that fits in our smallest-realistic test image.
+    // A real-world ext3 mkfs would scale this up to ~32 MiB or more.
+    let ext3_journal_blocks: u32 = if matches!(flavor, FsFlavor::Ext3) {
+        1024
+    } else {
+        0
+    };
+    const EXT3_JOURNAL_INODE: u32 = 8;
     if !block_size.is_power_of_two() || !(1024..=65536).contains(&block_size) {
         return Err(Error::InvalidArgument("mkfs: block_size out of range"));
     }
@@ -142,20 +148,45 @@ pub fn format_filesystem_with_flavor(
     let ino_bitmap: u64 = first_data_block as u64 + 3;
     let inode_table_start: u64 = first_data_block as u64 + 4;
     let root_dir_block: u64 = inode_table_start + inode_table_blocks as u64;
+    // ext3 journal data lives immediately after the root dir block. Layout
+    // gap-free so the journal inode's i_block tree maps to a single
+    // contiguous physical run — the writer (`indirect_mut::plan_contiguous`)
+    // is then a one-shot call.
+    let journal_data_start: u64 = root_dir_block + 1;
+    let journal_data_end: u64 = journal_data_start + ext3_journal_blocks as u64;
 
-    // Sanity: every metadata block must fit in the device.
-    if root_dir_block + 1 >= blocks_count {
-        return Err(Error::InvalidArgument("mkfs: device too small for layout"));
+    // Sanity: every metadata block + journal (if any) must fit in the device.
+    if journal_data_end >= blocks_count {
+        return Err(Error::InvalidArgument(
+            "mkfs: device too small for layout (journal won't fit)",
+        ));
     }
 
-    let used_blocks: u64 = root_dir_block + 1; // blocks 0..=root_dir_block
+    // ext3 also reserves inode 8 for the journal. ext4 traditionally puts
+    // the journal at inode 8 too but our ext4 path doesn't ship one in
+    // Phase A (matches the existing "no journal" mkfs.rs preamble).
+    let extra_used_inodes: u32 = if matches!(flavor, FsFlavor::Ext3) {
+        1
+    } else {
+        0
+    };
+    let used_blocks: u64 = if matches!(flavor, FsFlavor::Ext3) {
+        journal_data_end // blocks 0..journal_data_end
+    } else {
+        root_dir_block + 1
+    };
     let free_blocks: u64 = blocks_count - used_blocks;
-    let free_inodes: u32 = inodes_per_group - 2; // inodes 1 + 2 used
+    let free_inodes: u32 = inodes_per_group - 2 - extra_used_inodes;
 
     let uuid = uuid.unwrap_or_else(generate_uuid);
 
     // ----- Superblock -------------------------------------------------------
     // Build the 1024-byte primary superblock then patch its checksum.
+    let journal_inum_for_sb: u32 = if matches!(flavor, FsFlavor::Ext3) {
+        EXT3_JOURNAL_INODE
+    } else {
+        0
+    };
     let mut sb = build_superblock(
         blocks_count,
         free_blocks,
@@ -169,6 +200,7 @@ pub fn format_filesystem_with_flavor(
         flavor,
         inode_size,
         desc_size,
+        journal_inum_for_sb,
     );
     // Superblock CRC32C: seed = ~0, covers bytes [0..0x3FC]. Only patched
     // when the volume advertises METADATA_CSUM — ext2/3 leave the slot zero.
@@ -209,12 +241,15 @@ pub fn format_filesystem_with_flavor(
     }
 
     // ----- Block bitmap (group 0) ------------------------------------------
-    // Bits 0..=root_dir_block are used.
+    // Bits 0..used_blocks are used (for ext3 this includes the journal
+    // data run; for ext2/ext4 it stops at root_dir_block).
     let mut block_bitmap = vec![0u8; block_size as usize];
-    for b in 0..=root_dir_block {
+    for b in 0..used_blocks {
         let byte = (b / 8) as usize;
         let bit = (b % 8) as u8;
-        block_bitmap[byte] |= 1 << bit;
+        if byte < block_bitmap.len() {
+            block_bitmap[byte] |= 1 << bit;
+        }
     }
     // Tail-pad: blocks past `blocks_count` (within the group's bitmap window)
     // are flagged "used" so the allocator never tries them. blocks_per_group
@@ -232,6 +267,10 @@ pub fn format_filesystem_with_flavor(
     // ext4 inode numbers are 1-based; bit i = inode (i+1).
     let mut inode_bitmap = vec![0u8; block_size as usize];
     inode_bitmap[0] |= 0b0000_0011; // inodes 1 and 2
+    if matches!(flavor, FsFlavor::Ext3) {
+        // Inode 8 = journal inode (ext3/ext4 convention). bit 7 of byte 0.
+        inode_bitmap[0] |= 1 << ((EXT3_JOURNAL_INODE - 1) % 8);
+    }
 
     // ----- Inode table (group 0) — only inode 2 has content ----------------
     let mut inode_table = vec![0u8; inode_table_blocks as usize * block_size as usize];
@@ -251,6 +290,58 @@ pub fn format_filesystem_with_flavor(
         if let Some((lo, hi)) = csum.compute_inode_checksum(EXT4_ROOT_INO, 0, slot) {
             slot[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
             slot[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+        }
+    }
+
+    // ----- Journal inode (ext3 only): inode 8 -------------------------------
+    // Built from the same `indirect_mut::plan_contiguous` primitive every
+    // ext2/3 file write uses. The journal lives at a contiguous physical
+    // run of `ext3_journal_blocks` starting at `journal_data_start`, so
+    // the planner produces a single (`i_block`, indirect_block_writes)
+    // pair we splice in directly.
+    let mut journal_indirect_writes: Vec<(u64, Vec<u8>)> = Vec::new();
+    if matches!(flavor, FsFlavor::Ext3) {
+        let jino_off = (EXT3_JOURNAL_INODE as usize - 1) * inode_size as usize;
+        // Allocate any indirect-tree blocks immediately AFTER the journal
+        // data run so they don't collide with metadata/data the bitmap
+        // already reserved. For 1024-block journals at 1 KiB blocks the
+        // tree only needs 1 single-indirect block (12 direct + 256 in single
+        // tier covers 268; for 1024 we'll spill into double — count the
+        // exact need via `count_indirect_blocks`).
+        let n_indirect =
+            crate::indirect_mut::count_indirect_blocks(ext3_journal_blocks, block_size);
+        let journal_indirect_start: u64 = journal_data_end;
+        let mut next_indirect = journal_indirect_start;
+
+        // Track the indirect-tree blocks so we can mark them allocated in
+        // the bitmap a few lines below.
+        let plan = crate::indirect_mut::plan_contiguous(
+            ext3_journal_blocks,
+            journal_data_start,
+            block_size,
+            || {
+                let v = next_indirect;
+                next_indirect += 1;
+                Ok(v)
+            },
+        )?;
+        write_journal_inode(
+            &mut inode_table[jino_off..jino_off + inode_size as usize],
+            ext3_journal_blocks as u64 * block_size as u64,
+            (ext3_journal_blocks as u64 + n_indirect) * block_size as u64 / 512,
+            &plan.i_block,
+        );
+        journal_indirect_writes = plan.block_writes;
+
+        // Mark indirect-tree blocks as allocated in the block bitmap so
+        // they don't get reused. Data blocks were already marked above as
+        // part of `used_blocks`.
+        for ib in &plan.indirect_blocks_allocated {
+            let byte = (*ib / 8) as usize;
+            let bit = (*ib % 8) as u8;
+            if byte < block_bitmap.len() {
+                block_bitmap[byte] |= 1 << bit;
+            }
         }
     }
 
@@ -324,9 +415,73 @@ pub fn format_filesystem_with_flavor(
     dev.write_at(inode_table_start * block_size as u64, &inode_table)?;
     dev.write_at(root_dir_block * block_size as u64, &root_dir)?;
 
+    // ext3 journal: write the JBD2 superblock at the head of the journal
+    // data run, leave the rest as zeros (clean state — `s_start = 0` in
+    // the JSB matches "no pending transactions"), then persist the
+    // indirect-tree blocks the journal inode points at.
+    if matches!(flavor, FsFlavor::Ext3) {
+        let jsb_block = build_jbd2_superblock(block_size, ext3_journal_blocks, &uuid);
+        dev.write_at(journal_data_start * block_size as u64, &jsb_block)?;
+        for (blk, buf) in &journal_indirect_writes {
+            dev.write_at(blk * block_size as u64, buf)?;
+        }
+    }
+
     dev.flush()?;
     let _ = group_count; // single-group v1; future multi-group will use this
     Ok(())
+}
+
+/// Build a clean JBD2 v2 superblock for a fresh ext3 journal. Layout per
+/// `jbd2.rs` module docs (big-endian throughout, magic 0xc03b3998 + V2
+/// block_type = 4). All fields zero except the spec-required ones:
+/// `block_size`, `max_len`, `first = 1` (block 0 is the JSB itself),
+/// `sequence = 1` (replay starts here on first mount), `start = 0`
+/// (journal is clean — nothing to replay), per-volume `uuid`.
+fn build_jbd2_superblock(block_size: u32, max_len: u32, uuid: &[u8; 16]) -> Vec<u8> {
+    let mut buf = vec![0u8; block_size as usize];
+    // Header: magic + block_type + h_sequence (big-endian).
+    buf[0x00..0x04].copy_from_slice(&crate::jbd2::JBD2_MAGIC_NUMBER.to_be_bytes());
+    buf[0x04..0x08].copy_from_slice(&crate::jbd2::JBD2_SUPERBLOCK_V2.to_be_bytes());
+    buf[0x08..0x0C].copy_from_slice(&1u32.to_be_bytes()); // h_sequence
+                                                          // s_blocksize, s_maxlen, s_first, s_sequence, s_start, s_errno.
+    buf[0x0C..0x10].copy_from_slice(&block_size.to_be_bytes());
+    buf[0x10..0x14].copy_from_slice(&max_len.to_be_bytes());
+    buf[0x14..0x18].copy_from_slice(&1u32.to_be_bytes()); // s_first = 1
+    buf[0x18..0x1C].copy_from_slice(&1u32.to_be_bytes()); // s_sequence = 1
+    buf[0x1C..0x20].copy_from_slice(&0u32.to_be_bytes()); // s_start = 0 (clean)
+                                                          // s_errno = 0 (already zero from vec init)
+                                                          // V2 fields — leave feature bits all-zero (no compression / 64bit /
+                                                          // csum-v2 etc.). UUID at 0x30 + s_nr_users = 1 at 0x40.
+    buf[0x30..0x40].copy_from_slice(uuid);
+    buf[0x40..0x44].copy_from_slice(&1u32.to_be_bytes()); // s_nr_users = 1
+    buf
+}
+
+/// Write the journal-inode image (typically inode 8) for ext3. The
+/// journal inode is mode-less (`i_mode = 0`), `i_links_count = 1`, and
+/// `i_block` is filled by the caller from `indirect_mut::plan_contiguous`
+/// — the journal data lives at a contiguous physical run, so the same
+/// indirect-tree primitive every regular ext2/3 file uses works here.
+///
+/// `i_size` covers ONLY the journal data blocks (not the indirect-tree
+/// metadata blocks, which add to `i_blocks` but not `i_size`).
+fn write_journal_inode(slot: &mut [u8], size_bytes: u64, blocks_512: u64, i_block: &[u8; 60]) {
+    // i_mode = 0 — journal has no POSIX type. The kernel checks ino number,
+    // not mode, when locating it. Linux mkfs writes 0 here.
+    slot[0x00..0x02].copy_from_slice(&0u16.to_le_bytes());
+    // i_size_lo
+    slot[0x04..0x08].copy_from_slice(&((size_bytes & 0xFFFF_FFFF) as u32).to_le_bytes());
+    // i_links_count = 1 (the journal-inode-table reference itself).
+    slot[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
+    // i_blocks_lo: 512-byte sectors = data + indirect-tree blocks.
+    slot[0x1C..0x20].copy_from_slice(&((blocks_512 & 0xFFFF_FFFF) as u32).to_le_bytes());
+    // i_flags = 0 (no EXTENTS_FL — ext3 journal is always indirect).
+    slot[0x20..0x24].copy_from_slice(&0u32.to_le_bytes());
+    // i_block: the indirect-tree root we built externally.
+    slot[0x28..0x28 + 60].copy_from_slice(i_block);
+    // i_size_hi at 0x6C — only meaningful past the 4 GiB cap; our 1024-block
+    // journal at any block_size stays well under it.
 }
 
 /// 16 random bytes from `/dev/urandom`, falling back to a time-seeded LCG if
@@ -375,6 +530,7 @@ fn build_superblock(
     flavor: FsFlavor,
     inode_size: u16,
     desc_size: u16,
+    journal_inum: u32,
 ) -> Vec<u8> {
     // Single-group v1: total inodes = inodes_per_group.
     let inodes_count: u32 = inodes_per_group;
@@ -429,9 +585,10 @@ fn build_superblock(
     let (feat_compat, feat_incompat, feat_ro_compat): (u32, u32, u32) = match flavor {
         FsFlavor::Ext2 => (0u32, Incompat::FILETYPE.bits(), 0u32),
         FsFlavor::Ext3 => (
-            // ext3 will gain HAS_JOURNAL when the formatter learns to lay
-            // down a journal inode (Phase B). Until then this branch is
-            // unreachable — the entry point rejects Ext3.
+            // HAS_JOURNAL signals that `s_journal_inum` (set below) names a
+            // valid journal inode. Mounters that don't grok HAS_JOURNAL will
+            // (correctly) refuse the volume — historically that's how ext2-
+            // only drivers stayed safe in the face of a dirty ext3 journal.
             Compat::HAS_JOURNAL.bits(),
             Incompat::FILETYPE.bits(),
             0u32,
@@ -456,7 +613,9 @@ fn build_superblock(
     // s_last_mounted (64 bytes at 0x88) stays zero.
     // Algorithm bits / prealloc / reserved (0xC8..0xD8) zero.
 
-    // 0xD8..0xDC s_journal_inum — 0 because no journal.
+    // 0xD8..0xDC s_journal_inum — set to inode 8 for ext3 (HAS_JOURNAL),
+    // zero for everything else.
+    sb[0xD8..0xDC].copy_from_slice(&journal_inum.to_le_bytes());
     // 0xDC..0xE0 s_journal_dev  — 0.
     // 0xE0..0xE4 s_last_orphan  — 0.
     // 0xE4..0xF4 s_hash_seed[4] — pick a stable nonzero seed. (Only matters
