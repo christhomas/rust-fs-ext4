@@ -60,9 +60,14 @@ pub enum Anomaly {
         claims: u32,
         actual_parent: u32,
     },
-    /// A directory entry with inode number 0 was encountered in a
-    /// position that isn't a tombstone (rec_len > 8 + padded name).
-    BogusEntry { parent_ino: u32 },
+    /// A directory entry inside `parent_ino` claims its target
+    /// (`child_ino`) is a directory, but the target inode's mode bits
+    /// are not `S_IFDIR`. Read failures on the child are surfaced as
+    /// `DanglingEntry` from the inodes phase instead. Carrying both
+    /// inodes lets a repair pass either rewrite the dirent's
+    /// `file_type` byte (when the child is a valid non-dir) or
+    /// unlink the dirent.
+    BogusEntry { parent_ino: u32, child_ino: u32 },
 }
 
 /// Summary returned by [`audit`]. Empty `anomalies` means the subset
@@ -242,9 +247,14 @@ fn audit_inner(
             }
         };
         if !inode.is_dir() {
-            // Something referenced us as a dir but the inode says otherwise.
-            // Surface as a BogusEntry against the parent.
-            let a = Anomaly::BogusEntry { parent_ino };
+            // Parent claimed this child was a directory (file_type
+            // byte in the dirent) but the inode's mode bits disagree.
+            // Carry both inodes so a repair pass can either rewrite
+            // the dirent's file_type byte or unlink the dirent.
+            let a = Anomaly::BogusEntry {
+                parent_ino,
+                child_ino: dir_ino,
+            };
             on_finding(&a);
             report.anomalies_count += 1;
             emit_dir_progress(on_progress, report.directories_scanned, work.len());

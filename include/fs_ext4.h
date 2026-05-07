@@ -529,11 +529,11 @@ typedef void (*fs_ext4_fsck_progress_fn)(void *context,
  * Per-finding callback. `kind` is one of: "link_count_low",
  * "link_count_high", "dangling_entry", "wrong_dotdot", "bogus_entry".
  * `inode` is the most relevant inode (the affected inode for link-
- * count cases; the child for dangling, the directory for wrong_dotdot,
- * the parent for bogus_entry). `detail` is a short, free-form ASCII
- * blob like "stored=1 observed=2" — for diagnostic display only, not
- * meant to be parsed. Both `kind` and `detail` are valid only for the
- * duration of the call.
+ * count cases; the child for dangling_entry and bogus_entry; the
+ * directory for wrong_dotdot). `detail` is a short, free-form ASCII
+ * blob like "stored=1 observed=2" or "parent_ino=2" — for diagnostic
+ * display only, not meant to be parsed. Both `kind` and `detail` are
+ * valid only for the duration of the call.
  */
 typedef void (*fs_ext4_fsck_finding_fn)(void *context,
     const char *kind, uint32_t inode, const char *detail);
