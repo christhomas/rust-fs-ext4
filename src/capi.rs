@@ -2307,11 +2307,10 @@ fn anomaly_to_capi(a: &crate::fsck::Anomaly) -> (&'static str, u32, String) {
             dir_ino,
             format!("claims={claims} actual_parent={actual_parent}"),
         ),
-        Anomaly::BogusEntry { parent_ino } => (
-            "bogus_entry",
+        Anomaly::BogusEntry {
             parent_ino,
-            format!("parent_ino={parent_ino}"),
-        ),
+            child_ino,
+        } => ("bogus_entry", child_ino, format!("parent_ino={parent_ino}")),
     }
 }
 
