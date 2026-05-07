@@ -27,6 +27,13 @@ path = "src/bin/mkfs_ext4.rs"
 [dependencies]
 crc32c = "0.6"
 bitflags = "2"
+# Block-device trait surface shared with sister crates (qcow2 reader,
+# partition probe, future fs-* drivers). Local path dep until both crates
+# publish; flip to a published version on the first crates.io release.
+# Strictly additive — ext4's existing BlockDevice trait is unchanged; this
+# adds a bridge module so external `fs_core::BlockDevice` implementors
+# (a `Qcow2Reader`, a `SliceReader`, etc.) can be mounted by ext4.
+am-fs-core = { path = "../rust-fs-core" }
 
 [dev-dependencies]
 hex = "0.4"
