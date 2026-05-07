@@ -125,13 +125,18 @@ fn synthetic_dirty_journal_round_trip() {
         let phys = jbd2::journal_block_to_physical(&fs, &jinode, journal_logical)
             .expect("map journal block")
             .expect("mapped");
-        dev.write_at(phys * block_size, blk)
+        fs.dev
+            .write_at(phys * block_size, blk)
             .expect("write journal slot");
     }
 
     // Capture the target's pre-replay contents so we can assert the change.
+    // Read through `fs.dev` so the cache stays coherent — going to the
+    // raw `dev` would bypass the buffer cache `mount_inner` wrapped
+    // around the device.
     let mut before = vec![0u8; block_size as usize];
-    dev.read_at(target_fs_block * block_size, &mut before)
+    fs.dev
+        .read_at(target_fs_block * block_size, &mut before)
         .unwrap();
 
     // Rewrite the JBD2 superblock with jsb.start = 1 (log starts at journal
@@ -140,14 +145,16 @@ fn synthetic_dirty_journal_round_trip() {
         .expect("jsb phys")
         .expect("mapped");
     let mut jsb_bytes = vec![0u8; block_size as usize];
-    dev.read_at(jsb_phys * block_size, &mut jsb_bytes).unwrap();
+    fs.dev
+        .read_at(jsb_phys * block_size, &mut jsb_bytes)
+        .unwrap();
     // Sanity: magic must match.
     let magic = u32::from_be_bytes(jsb_bytes[0..4].try_into().unwrap());
     assert_eq!(magic, JBD2_MAGIC_NUMBER);
     // Patch s_start (offset 0x1C..0x20, big-endian) to 1.
     jsb_bytes[0x1C..0x20].copy_from_slice(&1u32.to_be_bytes());
-    dev.write_at(jsb_phys * block_size, &jsb_bytes).unwrap();
-    dev.flush().unwrap();
+    fs.dev.write_at(jsb_phys * block_size, &jsb_bytes).unwrap();
+    fs.dev.flush().unwrap();
 
     // Now re-mount so mount sees the dirty sb — actually we don't need to
     // remount: read_superblock fetches fresh every call.
@@ -157,7 +164,8 @@ fn synthetic_dirty_journal_round_trip() {
 
     // Verify the target fs block now holds our payload.
     let mut after = vec![0u8; block_size as usize];
-    dev.read_at(target_fs_block * block_size, &mut after)
+    fs.dev
+        .read_at(target_fs_block * block_size, &mut after)
         .unwrap();
     assert_eq!(after, payload, "replay did not write the expected payload");
     assert_ne!(

@@ -41,6 +41,26 @@ pub trait BlockDevice: Send + Sync {
     fn is_writable(&self) -> bool {
         false
     }
+
+    /// Buffer-cache hook: stash `bytes` for `block` so a subsequent
+    /// `read_at` returns those bytes instead of reading from physical
+    /// storage. Used by `commit_block_buffer` to make journaled
+    /// metadata visible to readers before the journal is checkpointed
+    /// back to the data area on disk.
+    ///
+    /// Pinned entries inserted via `populate_cache` MUST NOT be evicted
+    /// — they're the only place those bytes exist until `unpin_all`
+    /// runs (typically after journal replay). Devices without a cache
+    /// (raw `FileDevice`, etc.) implement this as a no-op and the
+    /// caller's bytes simply have no in-memory shadow; that's safe
+    /// because un-cached devices imply no separate journal log either.
+    fn populate_cache(&self, _block: u64, _bytes: Vec<u8>) {}
+
+    /// Buffer-cache hook: tell the device the journal has been
+    /// checkpointed, so any blocks pinned via `populate_cache` are now
+    /// consistent with disk and can be evicted under normal LRU
+    /// pressure. No-op for un-cached devices.
+    fn unpin_all(&self) {}
 }
 
 /// File-backed device — used for disk images and `/dev/diskN`.

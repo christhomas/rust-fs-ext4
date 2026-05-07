@@ -66,6 +66,7 @@ fn main() {
         on_progress: Some(on_progress),
         on_finding: Some(on_finding),
         context: std::ptr::null_mut(),
+        repair: 0,
     };
 
     let mut report: fs_ext4_fsck_report_t = unsafe { std::mem::zeroed() };

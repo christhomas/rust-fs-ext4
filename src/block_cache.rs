@@ -1,24 +1,36 @@
-//! Phase 8.1 — LRU block cache.
+//! Buffer cache wrapping a `BlockDevice`.
 //!
-//! `CachedDevice` wraps another `BlockDevice` with a small LRU keyed on
-//! the device's logical block number. Read-heavy workloads (extent tree
-//! traversal, repeated bitmap reads, directory walks) often hit the same
-//! few blocks dozens of times per op; caching at the BlockDevice layer
-//! amortizes that without touching higher-level code.
+//! `CachedDevice` is the single source of truth for block contents
+//! within a mount session. Mirrors Linux's buffer-cache role for
+//! journaled filesystems: reads are served from the cache, writes
+//! update the cache, and the cache holds journaled-but-not-yet-
+//! checkpointed bytes so that subsequent reads see them before the
+//! data area on disk catches up.
 //!
-//! Design choices:
-//! - **Opt-in** via `CachedDevice::new(inner, block_size, capacity)`.
-//!   Existing callers that go through `FileDevice` directly are
-//!   unaffected — back-compat preserved.
-//! - **Block-aligned reads only.** Multi-block reads (rare in this
-//!   driver — most reads are exactly one fs block) bypass the cache and
-//!   pass through to the inner device.
-//! - **Write-through invalidation.** Any write covering a cached block
-//!   evicts that block before delegating to the inner device. We don't
-//!   write-back; the caller's flush still goes to inner.
-//! - **Crash safety:** because we evict-on-write rather than buffer
-//!   writes, the on-disk state is identical to what the inner device
-//!   would produce. Crash semantics are unchanged.
+//! Design:
+//! - **LRU clean entries** — `entries` holds blocks read from disk
+//!   or written through `write_at`. LRU-evictable; the disk has the
+//!   same bytes so eviction is safe.
+//! - **Pinned entries** — `pinned` holds blocks whose bytes only
+//!   exist in this map and the journal log on disk; the data area on
+//!   disk still has the pre-commit content. Pinned entries are
+//!   NEVER evicted, since evicting them would lose the only
+//!   in-memory copy and the next allocator scan would re-read stale
+//!   bytes from disk. `Filesystem::commit_block_buffer` populates
+//!   `pinned` after a successful journal commit; the
+//!   `Filesystem::replay_journal_if_dirty` hook calls `unpin_all`
+//!   when the journal has been checkpointed.
+//! - **Write-through update** — `write_at` UPDATES the cache (not
+//!   invalidates) and forwards to the inner device. This keeps the
+//!   cache consistent with disk for direct writes (e.g.
+//!   `write_inode_raw`) and means a read-after-write is satisfied
+//!   from the cache without bouncing to disk.
+//! - **Block-aligned reads only.** Multi-block reads bypass the
+//!   cache and pass through.
+//! - **Crash safety unchanged.** Pinned bytes are also persisted in
+//!   the journal log (the caller invoked `populate_cache` after a
+//!   journal commit); on crash, replay applies them. Clean LRU
+//!   entries match disk by construction.
 //! - **No external LRU crate** — hand-rolled to avoid pulling in
 //!   GPL/LGPL deps and to keep the cache logic auditable.
 
@@ -27,15 +39,21 @@ use crate::error::Result;
 use std::collections::HashMap;
 use std::sync::Mutex;
 
-/// Inner LRU state. Held under a Mutex on `CachedDevice`. `lru_seq`
-/// monotonically increases on every access; eviction picks the entry
-/// with the lowest seq.
+/// Inner cache state held under a Mutex on `CachedDevice`.
+///
+/// Two maps:
+/// - `entries`: clean blocks (LRU-evictable; disk has the same bytes).
+/// - `pinned`: blocks whose bytes only exist here and in the journal
+///   log on disk. NEVER evicted until `unpin_all`.
+///
+/// Read order: `pinned` → `entries` → inner device.
+/// Write through `write_at`: updates `entries` only; pinned stays.
+/// Populate via `populate`: inserts into `pinned`.
 struct CacheState {
     capacity: usize,
-    /// Block number → (bytes, last-access seq).
     entries: HashMap<u64, (Vec<u8>, u64)>,
+    pinned: HashMap<u64, Vec<u8>>,
     next_seq: u64,
-    /// Hit / miss counters. Useful for benchmarks and the smoke test.
     hits: u64,
     misses: u64,
 }
@@ -45,6 +63,7 @@ impl CacheState {
         Self {
             capacity,
             entries: HashMap::with_capacity(capacity.min(1024)),
+            pinned: HashMap::new(),
             next_seq: 0,
             hits: 0,
             misses: 0,
@@ -57,9 +76,12 @@ impl CacheState {
         s
     }
 
-    /// Look up `block`. On hit: returns the cached bytes (clone) AND
-    /// bumps the entry's recency. On miss: returns None.
+    /// Look up `block`. Pinned wins over LRU. On miss: None.
     fn get(&mut self, block: u64) -> Option<Vec<u8>> {
+        if let Some(bytes) = self.pinned.get(&block) {
+            self.hits += 1;
+            return Some(bytes.clone());
+        }
         let seq = self.next_seq();
         if let Some(slot) = self.entries.get_mut(&block) {
             slot.1 = seq;
@@ -71,11 +93,17 @@ impl CacheState {
         }
     }
 
-    /// Insert `block` with `bytes`. Evicts the LRU entry first if at
-    /// capacity. O(n) eviction since n is tiny by design (default 64).
+    /// Insert/update a clean LRU entry. Evicts the LRU victim if full.
+    /// Pinned entries are never considered for eviction.
     fn put(&mut self, block: u64, bytes: Vec<u8>) {
+        // If the block is already pinned, replace its pinned bytes
+        // (a journaled write superseded by a direct write — unlikely
+        // in practice but kept consistent).
+        if let std::collections::hash_map::Entry::Occupied(mut e) = self.pinned.entry(block) {
+            e.insert(bytes);
+            return;
+        }
         if self.entries.len() >= self.capacity {
-            // Evict the entry with the oldest seq.
             if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, (_, seq))| *seq) {
                 self.entries.remove(&victim);
             }
@@ -84,9 +112,28 @@ impl CacheState {
         self.entries.insert(block, (bytes, seq));
     }
 
-    /// Drop `block` from the cache (called on writes to invalidate).
-    fn invalidate(&mut self, block: u64) {
+    /// Stash a block whose bytes live only here and in the journal
+    /// log. Will not be evicted until `unpin_all`. If the block was
+    /// in the LRU, the LRU entry is dropped — pinned takes priority.
+    fn pin(&mut self, block: u64, bytes: Vec<u8>) {
         self.entries.remove(&block);
+        self.pinned.insert(block, bytes);
+    }
+
+    /// Move all pinned entries into the LRU (now safe to evict).
+    fn unpin_all(&mut self) {
+        // Drain pinned. Each entry becomes an LRU candidate;
+        // capacity-bound eviction kicks in if the LRU was already full.
+        let drained: Vec<(u64, Vec<u8>)> = self.pinned.drain().collect();
+        for (block, bytes) in drained {
+            if self.entries.len() >= self.capacity {
+                if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, (_, seq))| *seq) {
+                    self.entries.remove(&victim);
+                }
+            }
+            let seq = self.next_seq();
+            self.entries.insert(block, (bytes, seq));
+        }
     }
 }
 
@@ -153,17 +200,45 @@ impl BlockDevice for CachedDevice {
 
     fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
         let bs = self.block_size as u64;
+        // Forward to disk first; if the inner write fails, the cache
+        // still reflects whatever was there before — no partial update.
+        self.inner.write_at(offset, buf)?;
+
+        // Single-block, block-aligned writes update the cache directly
+        // (write-through). Multi-block / unaligned writes fall through
+        // to invalidation since we don't have the full block image
+        // for each affected block.
+        let off_in_block = (offset % bs) as usize;
+        let len = buf.len();
+        if off_in_block == 0 && len == bs as usize {
+            let block = offset / bs;
+            let mut state = self.state.lock().expect("cache mutex poisoned");
+            state.put(block, buf.to_vec());
+            return Ok(());
+        }
+
+        // Unaligned / multi-block write: we don't have a full block
+        // image to install in the cache, so drop the affected entries
+        // entirely. We have to drop `pinned` too — the partial direct
+        // write makes the on-disk block a merge of "journaled bytes
+        // for the unwritten portion + new bytes for the written
+        // portion", which doesn't match either the pre-write pinned
+        // image or the new write. Easiest correct answer: forget what
+        // we knew, let the next read pull the merged truth from disk.
+        //
+        // Caller paid for this — the only sub-block write site in the
+        // crate today is `write_inode_raw` (writes a single inode at
+        // its offset within a 4 KiB inode-table block). Other direct
+        // writes (`set_block_run_used`, BGD blocks, indirect blocks)
+        // are full-block-aligned and take the fast path above.
         let first_block = offset / bs;
         let last_block = (offset + buf.len() as u64).saturating_sub(1) / bs;
-        // Invalidate before writing to avoid serving a stale read between
-        // here and the inner write completing.
-        {
-            let mut state = self.state.lock().expect("cache mutex poisoned");
-            for b in first_block..=last_block {
-                state.invalidate(b);
-            }
+        let mut state = self.state.lock().expect("cache mutex poisoned");
+        for b in first_block..=last_block {
+            state.entries.remove(&b);
+            state.pinned.remove(&b);
         }
-        self.inner.write_at(offset, buf)
+        Ok(())
     }
 
     fn flush(&self) -> Result<()> {
@@ -172,6 +247,16 @@ impl BlockDevice for CachedDevice {
 
     fn is_writable(&self) -> bool {
         self.inner.is_writable()
+    }
+
+    fn populate_cache(&self, block: u64, bytes: Vec<u8>) {
+        let mut state = self.state.lock().expect("cache mutex poisoned");
+        state.pin(block, bytes);
+    }
+
+    fn unpin_all(&self) {
+        let mut state = self.state.lock().expect("cache mutex poisoned");
+        state.unpin_all();
     }
 }
 
@@ -244,16 +329,97 @@ mod tests {
     }
 
     #[test]
-    fn write_invalidates_cache_entry() {
+    fn unaligned_write_invalidates_cache_entry() {
+        // Partial-block writes don't have a full block image to
+        // update the cache with, so we drop the affected entries and
+        // the next read pays the cost of a fresh disk read.
         let inner = CountingDevice::new(4096 * 16, true);
         let cached = CachedDevice::new(inner.clone(), 4096, 8);
         let mut buf = vec![0u8; 100];
         cached.read_at(0, &mut buf).unwrap();
-        cached.write_at(0, &[42u8; 100]).unwrap();
+        cached.write_at(0, &[42u8; 100]).unwrap(); // unaligned: 100 < 4096
         cached.read_at(0, &mut buf).unwrap();
-        // After write the cache entry is gone — second read goes to disk.
         assert_eq!(inner.reads(), 2);
         assert_eq!(buf[0], 42, "post-write read should see the new bytes");
+    }
+
+    #[test]
+    fn aligned_write_updates_cache_entry() {
+        // Full-block, block-aligned writes go straight into the cache
+        // (write-through). The next read is served from cache without
+        // touching the inner device — read-after-write coherence with
+        // zero extra device reads.
+        let inner = CountingDevice::new(4096 * 16, true);
+        let cached = CachedDevice::new(inner.clone(), 4096, 8);
+        // Prime the cache with a read.
+        let mut buf = vec![0u8; 100];
+        cached.read_at(0, &mut buf).unwrap();
+        assert_eq!(inner.reads(), 1);
+        // Full-block write — cache should hold the new bytes.
+        let new_block = vec![0xCDu8; 4096];
+        cached.write_at(0, &new_block).unwrap();
+        // Read back: served from cache, no additional device read.
+        let mut readback = vec![0u8; 100];
+        cached.read_at(0, &mut readback).unwrap();
+        assert_eq!(inner.reads(), 1, "aligned write-through skips disk read");
+        assert_eq!(readback[0], 0xCD);
+        // Verify the inner device also got the bytes.
+        let mut from_disk = vec![0u8; 100];
+        inner.read_at(0, &mut from_disk).unwrap();
+        assert_eq!(from_disk[0], 0xCD);
+    }
+
+    #[test]
+    fn populate_cache_pins_entry_against_lru() {
+        // Pinned entries hold journaled-but-not-checkpointed bytes —
+        // they're the only in-memory copy, so eviction would lose
+        // data. Verify they survive even when the LRU is hammered.
+        let inner = CountingDevice::new(4096 * 16, false);
+        let cached = CachedDevice::new(inner.clone(), 4096, 2); // tiny capacity
+                                                                // Pin block 7 with synthetic journaled bytes.
+        cached.populate_cache(7, vec![0xAAu8; 4096]);
+        // Saturate the LRU with reads of other blocks.
+        let mut throwaway = vec![0u8; 8];
+        for blk in 0..5u64 {
+            cached.read_at(blk * 4096, &mut throwaway).unwrap();
+        }
+        // Block 7 must still be served from the pin, NOT from disk
+        // (which has zeros).
+        let mut buf = vec![0u8; 8];
+        cached.read_at(7 * 4096, &mut buf).unwrap();
+        assert_eq!(buf, vec![0xAA; 8],
+                   "pinned entry must survive LRU pressure — otherwise journaled writes vanish before checkpoint");
+    }
+
+    #[test]
+    fn unpin_all_lets_pinned_entries_evict_normally() {
+        // After journal replay, pinned bytes are also on disk —
+        // unpin_all moves them into the LRU where they can be evicted
+        // under normal pressure, freeing memory.
+        let inner = CountingDevice::new(4096 * 16, false);
+        let cached = CachedDevice::new(inner.clone(), 4096, 1); // capacity=1
+        cached.populate_cache(3, vec![0xBBu8; 4096]);
+        cached.unpin_all();
+        // Now read another block — block 3 should be evicted under
+        // capacity pressure.
+        let mut throwaway = vec![0u8; 8];
+        cached.read_at(0, &mut throwaway).unwrap();
+        // Re-read block 3 — should miss (evicted), serve from disk
+        // (which is zeros — `unpin_all` is purely an in-memory
+        // re-classification, the cache still hands out the pinned
+        // bytes that are STILL there until eviction picks them).
+        // Actually since capacity=1 and we just read block 0, block 3
+        // got evicted; the next read of block 3 misses the cache and
+        // hits the inner device. Inner has zeros (no journal replay
+        // really happened here — this test only exercises the
+        // pin/unpin state machine).
+        let mut buf3 = vec![0u8; 8];
+        cached.read_at(3 * 4096, &mut buf3).unwrap();
+        assert_eq!(
+            buf3,
+            vec![0; 8],
+            "after unpin + LRU eviction, the inner device's bytes win"
+        );
     }
 
     #[test]

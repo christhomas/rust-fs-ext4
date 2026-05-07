@@ -1,12 +1,15 @@
-//! Phase 8.1 — proves CachedDevice meaningfully reduces inner-device
-//! reads when wrapped around a real ext4 filesystem mount.
+//! Proves `Filesystem::mount` wraps the underlying device in
+//! `CachedDevice` and that repeated reads of the same path don't
+//! cause repeated inner-device reads.
 //!
-//! Strategy: count the inner reads with and without the cache for the
-//! same workload (mount + walk a directory + stat a file). The cached
-//! version should be lower by an order of magnitude or more — extent
-//! traversal and BGD reads repeatedly touch the same handful of blocks.
+//! Background: the cache used to be opt-in (callers had to wrap the
+//! device themselves). It's now automatic in `mount_inner` because
+//! the cache holds journaled-but-not-yet-checkpointed bytes that
+//! allocators must see before the journal is checkpointed back to
+//! the data area on disk. This test pins the read-side behaviour:
+//! after the first workload pass, the cache must absorb subsequent
+//! lookups so the inner device stays mostly idle.
 
-use fs_ext4::block_cache::CachedDevice;
 use fs_ext4::block_io::BlockDevice;
 use fs_ext4::error::Result;
 use fs_ext4::Filesystem;
@@ -65,34 +68,35 @@ fn workload(fs: &Filesystem) {
 }
 
 #[test]
-fn cache_reduces_inner_reads_for_repeated_lookups() {
+fn repeated_lookups_hit_cache_not_inner_device() {
     let path = image_path("ext4-basic.img");
     if !std::path::Path::new(&path).exists() {
         return;
     }
 
-    // Baseline: no cache.
-    let inner_baseline = CountingFile::from_file(&path);
-    let fs_baseline = Filesystem::mount(inner_baseline.clone()).expect("mount");
-    workload(&fs_baseline);
-    let baseline_reads = inner_baseline.reads();
+    let inner = CountingFile::from_file(&path);
+    let fs = Filesystem::mount(inner.clone()).expect("mount");
 
-    // With cache: 64-block LRU, 4 KiB blocks.
-    let inner_cached = CountingFile::from_file(&path);
-    let cached: Arc<dyn BlockDevice> = Arc::new(CachedDevice::new(inner_cached.clone(), 4096, 64));
-    let fs_cached = Filesystem::mount(cached.clone()).expect("mount cached");
-    workload(&fs_cached);
-    let cached_reads = inner_cached.reads();
+    // First pass populates the cache.
+    workload(&fs);
+    let after_first = inner.reads();
+
+    // Second pass over the same path should pull almost everything
+    // from the cache — the inner device should see <= a small handful
+    // of additional reads (bookkeeping at most). If subsequent lookups
+    // re-read the same metadata blocks, the cache isn't doing its job.
+    workload(&fs);
+    let after_second = inner.reads();
+    let delta = after_second - after_first;
 
     println!(
-        "block_cache benchmark: baseline={} reads, cached={} reads ({:.1}x)",
-        baseline_reads,
-        cached_reads,
-        baseline_reads as f64 / cached_reads.max(1) as f64
+        "repeated_lookups: first-pass reads={}, second-pass delta={}",
+        after_first, delta
     );
 
     assert!(
-        cached_reads * 2 <= baseline_reads,
-        "cache should at least halve inner-device reads; baseline={baseline_reads}, cached={cached_reads}"
+        delta <= 4,
+        "second pass over the same path should be served from cache; \
+         got {delta} new inner reads (cache likely not wired up at mount time)"
     );
 }

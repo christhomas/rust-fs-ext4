@@ -2230,9 +2230,8 @@ pub type fs_ext4_fsck_finding_fn = Option<
 /// Fsck options struct (matches `fs_ext4_fsck_options_t`).
 #[repr(C)]
 pub struct fs_ext4_fsck_options_t {
-    /// MVP: caller MUST set this to 1. Non-1 values are rejected with
-    /// EINVAL (this entry point never writes; a future repair entry
-    /// point will accept `read_only = 0`).
+    /// 1 = audit only (no writes). 0 + `repair == 1` = repair pass.
+    /// Non-{0,1} values are rejected with EINVAL.
     pub read_only: u8,
     /// 1 = call `fs_ext4_replay_journal_if_dirty` before the audit.
     /// Useful when the volume was mounted via the lazy variant and the
@@ -2250,6 +2249,10 @@ pub struct fs_ext4_fsck_options_t {
     /// Opaque pointer threaded through both callbacks. Not interpreted
     /// by Rust.
     pub context: *mut c_void,
+    /// Repair-pass switch. Only honoured when `read_only == 0`. See
+    /// the C header for the list of anomaly classes the current repair
+    /// pass actually fixes.
+    pub repair: u8,
 }
 
 /// Fsck report (matches `fs_ext4_fsck_report_t`).
@@ -2258,21 +2261,34 @@ pub struct fs_ext4_fsck_report_t {
     pub inodes_visited: u64,
     pub directories_scanned: u64,
     pub entries_scanned: u64,
+    /// Authoritative current anomaly count. After a repair pass this
+    /// is the **post-repair re-scan** count — actual anomalies still
+    /// present on disk, NOT a delta against `repaired_count`.
     pub anomalies_found: u64,
     /// 1 if the on-disk superblock `s_state` showed dirty before the
     /// run started. Captured *before* journal replay (so the caller
     /// can tell whether the volume was crash-state on entry).
     pub was_dirty: u8,
-    /// MVP: always 0. Reserved for the future repair path.
+    /// 1 if a repair commit cleared the dirty bit, 0 otherwise.
     pub dirty_cleared: u8,
+    /// Number of anomalies repaired (0 unless the run was a repair pass).
+    pub repaired_count: u64,
+    /// Anomalies the audit found BEFORE any repair commits. Equal to
+    /// `anomalies_found` for non-repair runs. After a repair pass:
+    /// `initial_anomalies_count - repaired_count` is what we EXPECT
+    /// to remain; `anomalies_found` is what ACTUALLY remains. A
+    /// mismatch flags repair-logic bugs (we either failed to fix
+    /// what we claimed to fix, or fixing one thing introduced a new
+    /// anomaly).
+    pub initial_anomalies_count: u64,
 }
 
 /// Map an [`Anomaly`] variant to its locked C ABI kind string + the
 /// most relevant inode + a short free-form detail blob.
 fn anomaly_to_capi(a: &crate::fsck::Anomaly) -> (&'static str, u32, String) {
     use crate::fsck::Anomaly;
-    match *a {
-        Anomaly::LinkCountTooLow {
+    match a {
+        &Anomaly::LinkCountTooLow {
             ino,
             stored,
             observed,
@@ -2281,7 +2297,7 @@ fn anomaly_to_capi(a: &crate::fsck::Anomaly) -> (&'static str, u32, String) {
             ino,
             format!("stored={stored} observed={observed}"),
         ),
-        Anomaly::LinkCountTooHigh {
+        &Anomaly::LinkCountTooHigh {
             ino,
             stored,
             observed,
@@ -2290,15 +2306,16 @@ fn anomaly_to_capi(a: &crate::fsck::Anomaly) -> (&'static str, u32, String) {
             ino,
             format!("stored={stored} observed={observed}"),
         ),
-        Anomaly::DanglingEntry {
+        &Anomaly::DanglingEntry {
             parent_ino,
             child_ino,
+            observed,
         } => (
             "dangling_entry",
             child_ino,
-            format!("parent_ino={parent_ino}"),
+            format!("parent_ino={parent_ino} observed={observed}"),
         ),
-        Anomaly::WrongDotDot {
+        &Anomaly::WrongDotDot {
             dir_ino,
             claims,
             actual_parent,
@@ -2307,11 +2324,51 @@ fn anomaly_to_capi(a: &crate::fsck::Anomaly) -> (&'static str, u32, String) {
             dir_ino,
             format!("claims={claims} actual_parent={actual_parent}"),
         ),
-        Anomaly::BogusEntry { parent_ino } => (
-            "bogus_entry",
+        &Anomaly::BogusEntry {
             parent_ino,
-            format!("parent_ino={parent_ino}"),
+            child_ino,
+        } => ("bogus_entry", child_ino, format!("parent_ino={parent_ino}")),
+        &Anomaly::BlockGroupFreeCountDrift {
+            group_index,
+            stored_blocks,
+            observed_blocks,
+            stored_inodes,
+            observed_inodes,
+        } => (
+            "block_group_free_count_drift",
+            group_index,
+            format!(
+                "stored_blocks={stored_blocks} observed_blocks={observed_blocks} \
+                 stored_inodes={stored_inodes} observed_inodes={observed_inodes}"
+            ),
         ),
+        &Anomaly::SuperblockFreeCountDrift {
+            stored_blocks,
+            observed_blocks,
+            stored_inodes,
+            observed_inodes,
+        } => (
+            "superblock_free_count_drift",
+            0,
+            format!(
+                "stored_blocks={stored_blocks} observed_blocks={observed_blocks} \
+                 stored_inodes={stored_inodes} observed_inodes={observed_inodes}"
+            ),
+        ),
+        // Surfaced via the new repair-aware Rust API; the C ABI
+        // doesn't expose a repair entry point yet, but the read-only
+        // audit can still encounter and report this variant once a
+        // duplicate has slipped past detection. Mirror the existing
+        // string format: short kind tag + parent/name details for
+        // every alias so a downstream UI can render them.
+        Anomaly::DuplicateDirentForDirInode { ino, dirents } => {
+            let detail = dirents
+                .iter()
+                .map(|(p, n)| format!("{p}:{n}"))
+                .collect::<Vec<_>>()
+                .join(",");
+            ("duplicate_dir_inode", *ino, format!("aliases={detail}"))
+        }
     }
 }
 
@@ -2339,13 +2396,18 @@ pub unsafe extern "C" fn fs_ext4_fsck_run(
             }
             let fs_ref = &(*fs).fs;
             let opts_ref = &*opts;
-            if opts_ref.read_only != 1 {
-                set_err_msg(
-                    "fsck: only read-only audit is supported in this MVP (set opts.read_only = 1)",
-                    EINVAL,
-                );
+            // Sanity: read_only must be 0 or 1; repair can only run
+            // when read_only == 0. Anything outside this matrix is a
+            // caller bug worth surfacing rather than silently ignoring.
+            if opts_ref.read_only > 1 {
+                set_err_msg("fsck: opts.read_only must be 0 or 1", EINVAL);
                 return -1;
             }
+            if opts_ref.read_only == 1 && opts_ref.repair == 1 {
+                set_err_msg("fsck: opts.repair = 1 requires opts.read_only = 0", EINVAL);
+                return -1;
+            }
+            let repair_requested = opts_ref.repair == 1;
 
             // Zero the report so partial fills on early-error paths don't
             // leave stale stack data visible to the caller.
@@ -2417,12 +2479,13 @@ pub unsafe extern "C" fn fs_ext4_fsck_run(
                 }
             };
 
-            let result = crate::fsck::audit_with_callbacks(
+            let result = crate::fsck::audit_with_repair(
                 fs_ref,
                 max_dirs,
                 max_entries,
                 emit_progress,
                 emit_finding,
+                repair_requested,
             );
 
             match result {
@@ -2431,7 +2494,22 @@ pub unsafe extern "C" fn fs_ext4_fsck_run(
                     report_out.directories_scanned = audit_report.directories_scanned as u64;
                     report_out.entries_scanned = audit_report.entries_scanned;
                     report_out.anomalies_found = audit_report.anomalies_count;
-                    // dirty_cleared stays 0 in the read-only MVP.
+                    report_out.initial_anomalies_count = audit_report.initial_anomalies_count;
+                    report_out.repaired_count = audit_report.repaired_count;
+                    // `dirty_cleared` is 1 only when a repair actually
+                    // committed something AND the post-run superblock
+                    // is clean. The repair path itself updates SB
+                    // state when it runs to completion, so this is a
+                    // proxy for "the on-disk dirty bit was cleared by
+                    // this run."
+                    report_out.dirty_cleared = if repair_requested
+                        && audit_report.repaired_count > 0
+                        && fs_ref.sb.is_clean()
+                    {
+                        1
+                    } else {
+                        0
+                    };
                     0
                 }
                 Err(e) => {

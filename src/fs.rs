@@ -137,6 +137,21 @@ impl Filesystem {
             return Err(Error::BadChecksum { what: "superblock" });
         }
         let groups = bgd::read_all(dev.as_ref(), &sb, &csum)?;
+        // Wrap the raw device in a write-through buffer cache. All
+        // reads and writes for the rest of this mount session route
+        // through the cache; `commit_block_buffer` populates pinned
+        // entries with journaled-but-not-yet-checkpointed bytes so
+        // allocator scans don't re-read stale on-disk bitmaps. This is
+        // the role Linux's buffer cache plays for journaled
+        // filesystems. Capacity 256 ≈ 1 MiB at 4 KiB blocks — enough
+        // to cover hot metadata (BGD, bitmaps, recently-touched inode
+        // blocks) for typical sessions; pinned entries are unbounded
+        // until journal replay calls `unpin_all`.
+        let dev: Arc<dyn BlockDevice> = Arc::new(crate::block_cache::CachedDevice::new(
+            dev,
+            sb.block_size(),
+            256,
+        ));
         let mut fs = Self {
             dev,
             sb,
@@ -193,7 +208,13 @@ impl Filesystem {
     /// Designed to pair with [`Filesystem::mount_lazy`], but safe to call
     /// on any handle.
     pub fn replay_journal_if_dirty(&self) -> Result<usize> {
-        crate::journal_apply::replay_if_dirty(self)
+        let n = crate::journal_apply::replay_if_dirty(self)?;
+        // Replay applied every pending journaled write to the data area,
+        // so the device-layer cache's "pinned" entries (post-commit but
+        // pre-checkpoint) are now consistent with disk. Tell the cache
+        // it can stop pinning them — future evictions are safe.
+        self.dev.unpin_all();
+        Ok(n)
     }
 
     /// Phase 6.1 — walk the orphan inode chain rooted at `s_last_orphan`
@@ -319,7 +340,10 @@ impl Filesystem {
         Ok(reclaimed)
     }
 
-    /// Read a whole block by its logical block number.
+    /// Read a whole block by its logical block number. Routes through
+    /// `self.dev`, which at mount time is wrapped in a `CachedDevice` —
+    /// so this single call benefits from the buffer cache that holds
+    /// post-commit, pre-checkpoint journaled writes.
     pub fn read_block(&self, block_num: u64) -> Result<Vec<u8>> {
         let block_size = self.sb.block_size() as usize;
         let byte_offset = block_num
@@ -607,11 +631,7 @@ impl Filesystem {
 
         // Allocate one contiguous physical run.
         let inode_group = (ino - 1) / self.sb.inodes_per_group;
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs, &mut buf)?;
-            Ok(buf)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
             &self.groups,
@@ -1277,6 +1297,15 @@ impl Filesystem {
     /// Commit a `BlockBuffer` atomically. Routes through the journal
     /// writer when one is available (crash-safe four-fence protocol);
     /// falls back to direct device writes + flush otherwise.
+    ///
+    /// In journaled mode, writes go to the **journal log** on disk —
+    /// the *data area* on disk doesn't see them until journal replay
+    /// (checkpointing). To make those bytes visible to subsequent reads
+    /// **before** checkpoint (the read-after-write coherence Linux's
+    /// buffer cache guarantees), every committed block is `populate`'d
+    /// into the device-layer cache after the journal commit succeeds.
+    /// Without this hook, allocators (inode/block bitmap) would re-read
+    /// pre-commit on-disk bytes and produce duplicate allocations.
     pub(crate) fn commit_block_buffer(&self, buf: BlockBuffer) -> Result<()> {
         if buf.dirty.is_empty() {
             return Ok(());
@@ -1286,10 +1315,17 @@ impl Filesystem {
                 Error::Corrupt("journal writer mutex poisoned (prior write panicked)")
             })?;
             let mut tx = jw.begin();
-            for (block, bytes) in buf.dirty {
-                tx.add_write(block, bytes)?;
+            for (block, bytes) in &buf.dirty {
+                tx.add_write(*block, bytes.clone())?;
             }
-            jw.commit(self.dev.as_ref(), &tx)
+            jw.commit(self.dev.as_ref(), &tx)?;
+            // Populate the buffer cache with the post-commit bytes so
+            // any read (this thread or another) sees them before the
+            // journal is checkpointed back to the data area.
+            for (block, bytes) in buf.dirty {
+                self.dev.populate_cache(block, bytes);
+            }
+            Ok(())
         } else {
             let bs = self.sb.block_size() as u64;
             for (block, bytes) in buf.dirty {
@@ -1520,11 +1556,7 @@ impl Filesystem {
 
         // Path B: no external block yet — allocate, build, stage, then
         // point i_file_acl + i_blocks at it.
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut tmp = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs_u64, &mut tmp)?;
-            Ok(tmp)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
         let inode_group = (ino - 1) / self.sb.inodes_per_group;
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
@@ -1841,11 +1873,7 @@ impl Filesystem {
         // Allocate an inode, hinted to the parent's group.
         let parent_group = (parent_ino_num - 1) / self.sb.inodes_per_group;
         let bs = self.sb.block_size();
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs as u64, &mut buf)?;
-            Ok(buf)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_inode_allocation(
             &self.sb,
             &self.groups,
@@ -1955,11 +1983,7 @@ impl Filesystem {
         // Allocate a new inode.
         let parent_group = (parent_ino_num - 1) / self.sb.inodes_per_group;
         let bs = self.sb.block_size();
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs as u64, &mut buf)?;
-            Ok(buf)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_inode_allocation(
             &self.sb,
             &self.groups,
@@ -1991,11 +2015,7 @@ impl Filesystem {
         let raw = if target.len() <= 60 {
             self.build_fast_symlink_inode(new_ino, target.as_bytes())?
         } else {
-            let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-                let mut buf2 = vec![0u8; bs as usize];
-                self.dev.read_at(block * bs as u64, &mut buf2)?;
-                Ok(buf2)
-            };
+            let mut bitmap_reader = |block: u64| self.read_block(block);
             let bplan = crate::alloc::plan_block_allocation(
                 &self.sb,
                 &self.groups,
@@ -2323,11 +2343,7 @@ impl Filesystem {
 
         // Phase 2: allocate one contiguous run for the whole payload.
         let needed_blocks: u32 = data.len().div_ceil(bs as usize) as u32;
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut tmp = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs as u64, &mut tmp)?;
-            Ok(tmp)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
             &self.groups,
@@ -2448,11 +2464,7 @@ impl Filesystem {
             .checked_add(n_indirect)
             .ok_or(Error::Corrupt("indirect_mut: total run count overflow"))?;
 
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs as u64, &mut buf)?;
-            Ok(buf)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
             &self.groups,
@@ -2675,7 +2687,7 @@ impl Filesystem {
     /// negative deltas decrease. Recomputes the BGD csum when `metadata_csum`
     /// is enabled. The in-memory `self.groups` copy is NOT updated — callers
     /// doing a sequence of allocations should `Filesystem::mount` fresh.
-    fn patch_bgd_counters(
+    pub(crate) fn patch_bgd_counters(
         &self,
         gi: usize,
         free_blocks_delta: i32,
@@ -2762,7 +2774,11 @@ impl Filesystem {
 
     /// Apply deltas to SB `s_free_blocks_count` and `s_free_inodes_count`.
     /// Recomputes the SB checksum when enabled. Does not mutate `self.sb`.
-    fn patch_sb_counters(&self, free_blocks_delta: i64, free_inodes_delta: i32) -> Result<()> {
+    pub(crate) fn patch_sb_counters(
+        &self,
+        free_blocks_delta: i64,
+        free_inodes_delta: i32,
+    ) -> Result<()> {
         let mut sb_raw = self.sb.raw.clone();
         // s_free_inodes_count at 0x10..0x14
         let fi = u32::from_le_bytes(sb_raw[0x10..0x14].try_into().unwrap()) as i64;
@@ -3050,11 +3066,7 @@ impl Filesystem {
 
         let bs = self.sb.block_size();
         let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs as u64, &mut buf)?;
-            Ok(buf)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
 
         // 1. Allocate inode (is_dir = true so Orlov picks a dir-friendly group).
         let iplan = crate::alloc::plan_inode_allocation(
@@ -3442,11 +3454,7 @@ impl Filesystem {
 
         // 1. Allocate one fs block. Hint to parent's group.
         let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
-        let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
-            let mut buf = vec![0u8; bs as usize];
-            self.dev.read_at(block * bs_u64, &mut buf)?;
-            Ok(buf)
-        };
+        let mut bitmap_reader = |block: u64| self.read_block(block);
         let plan = crate::alloc::plan_block_allocation(
             &self.sb,
             &self.groups,
