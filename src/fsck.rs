@@ -207,7 +207,15 @@ fn audit_inner(
 ) -> Result<()> {
     // Observed: ino → reference-count.
     let mut observed: HashMap<u32, u32> = HashMap::new();
+    // What each directory's ".." entry CLAIMS the parent is (read off
+    // disk). Compared post-walk against `actual_parent` to flag
+    // WrongDotDot.
     let mut parent_claim: HashMap<u32, u32> = HashMap::new();
+    // The directory that ACTUALLY enqueued each child during the walk
+    // — this is the source of truth for "who is your parent?". Built
+    // up as we pop work items. Root maps to itself by convention so a
+    // corrupted root ".." still flags WrongDotDot.
+    let mut actual_parent: HashMap<u32, u32> = HashMap::new();
     // Directories we couldn't fully walk (parse failure, inline overflow
     // we don't decode, bound cap). Any link-count anomalies that could
     // have been explained by their missing entries are suppressed below.
@@ -231,6 +239,12 @@ fn audit_inner(
         if !visited.insert(dir_ino) {
             continue;
         }
+        // Record who really enqueued us. `parent_ino` is the directory
+        // we were popped under; for the root self-seed it's root
+        // itself. First-seen wins on the rare case a buggy filesystem
+        // has the same inode reachable from two different parents
+        // (the duplicate-dirent class is detected separately).
+        actual_parent.entry(dir_ino).or_insert(parent_ino);
         report.directories_scanned += 1;
 
         let (inode, _raw) = match fs.read_inode_verified(dir_ino) {
@@ -353,24 +367,31 @@ fn audit_inner(
         }
     }
 
-    // Check `..` claims against the actual parent that enqueued us.
+    // Check `..` claims against the actual enqueueing parent. Root
+    // is special-cased to compare against itself (ext4 convention:
+    // root's ".." points at root). For every other directory we
+    // compare against `actual_parent` — the directory that enqueued
+    // it during the walk. A directory we never reached has no
+    // entry in `actual_parent`; we skip those (any anomaly inside an
+    // unreachable subtree is invisible to the audit by definition).
     for (&dir_ino, &claimed) in parent_claim.iter() {
-        if dir_ino == crate::path::EXT4_ROOT_INODE {
-            // root '..' conventionally points at root itself
-            if claimed != crate::path::EXT4_ROOT_INODE {
-                let a = Anomaly::WrongDotDot {
-                    dir_ino,
-                    claims: claimed,
-                    actual_parent: crate::path::EXT4_ROOT_INODE,
-                };
-                on_finding(&a);
-                report.anomalies_count += 1;
+        let truth = if dir_ino == crate::path::EXT4_ROOT_INODE {
+            crate::path::EXT4_ROOT_INODE
+        } else {
+            match actual_parent.get(&dir_ino) {
+                Some(&p) => p,
+                None => continue,
             }
+        };
+        if claimed != truth {
+            let a = Anomaly::WrongDotDot {
+                dir_ino,
+                claims: claimed,
+                actual_parent: truth,
+            };
+            on_finding(&a);
+            report.anomalies_count += 1;
         }
-        // Non-root parent validation requires tracking the enqueueing
-        // parent. We skip here and rely on the LinkCount* checks to
-        // catch the most common class of corruption (hardlinks that
-        // lost their backrefs).
     }
 
     on_progress(FsckPhase::Inodes, 1, 1);
