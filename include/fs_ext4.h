@@ -185,6 +185,27 @@ fs_ext4_fs_t *fs_ext4_mount_with_callbacks(
     const fs_ext4_blockdev_cfg_t *cfg);
 
 /*
+ * Mount via an FsCoreDevice handle from a sister crate
+ * (`qcow2_open` from am-img-qcow2, `partitions_open_slice` from
+ * am-partitions, `fs_core_file_open` from am-fs-core).
+ *
+ * Single entry point — RO vs RW is decided by the inner device's
+ * `is_writable()`, so callers don't need a `_rw` variant.
+ *
+ * The handle's reference count is incremented internally; the caller
+ * still owns their *FsCoreDevice and frees it via
+ * `fs_core_device_close`. Closing the resulting fs_ext4_fs_t via
+ * `fs_ext4_umount` drops the mount's own reference.
+ *
+ * Forward declared FsCoreDevice — full definition in `fs_core.h`.
+ *
+ * Returns NULL on failure; use fs_ext4_last_error() / fs_ext4_last_errno()
+ * for detail.
+ */
+struct FsCoreDevice;
+fs_ext4_fs_t *fs_ext4_mount_with_fs_core_device(struct FsCoreDevice *handle);
+
+/*
  * Mount an ext4 filesystem read-write using callback-based I/O.
  * Companion to fs_ext4_mount_rw — same behaviour (replays a dirty journal
  * before returning), but the device is reached through caller-supplied
