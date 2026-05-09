@@ -492,6 +492,47 @@ unsafe fn mount_with_callbacks_inner(cfg: *const fs_ext4_blockdev_cfg_t) -> *mut
     }
 }
 
+/// Mount via an `FsCoreDevice` handle from a sister crate (`qcow2_open`,
+/// `partitions_open_slice`, `fs_core_file_open`, …). Single entry point —
+/// the inner device's `is_writable()` decides RO vs RW, so callers don't
+/// need a `_rw` variant.
+///
+/// The handle's reference count is incremented; closing this mount via
+/// `fs_ext4_umount` drops that reference. The C caller still owns its
+/// own `*mut FsCoreDevice` and frees it independently via
+/// `fs_core_device_close`.
+///
+/// Returns NULL on failure; consult `fs_ext4_last_error()` for detail.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_mount_with_fs_core_device(
+    handle: *mut fs_core::ffi::FsCoreDevice,
+) -> *mut fs_ext4_fs_t {
+    ffi_guard(
+        std::ptr::null_mut(),
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if handle.is_null() {
+                set_err_msg("null fs_core handle", EINVAL);
+                return std::ptr::null_mut();
+            }
+            // Borrow the handle's Arc<dyn fs_core::BlockDevice> and clone it
+            // so the mount holds its own reference. The caller is free to
+            // close their handle whenever they want.
+            let inner = (*handle).inner().clone();
+            let adapter = crate::fs_core_bridge::CoreDevice::new(inner);
+            let dev: Arc<dyn BlockDevice> = Arc::new(adapter);
+
+            match Filesystem::mount(dev) {
+                Ok(fs) => Box::into_raw(Box::new(fs_ext4_fs_t { fs })),
+                Err(e) => {
+                    set_err_from(&e, "mount via fs_core handle");
+                    std::ptr::null_mut()
+                }
+            }
+        }),
+    )
+}
+
 /// Mount read-write via caller-supplied read+write callbacks. Companion to
 /// `fs_ext4_mount_rw` for sandboxed consumers (FSKit, etc.) that own a
 /// block-device resource but cannot open `/dev/diskN`. Both `cfg.read`
