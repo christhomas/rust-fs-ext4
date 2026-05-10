@@ -13,9 +13,9 @@ crate-type = ["staticlib", "rlib"]
 # Standalone CLI tool. Cross-platform — builds + runs identically on
 # Linux/macOS/Windows because it only depends on this crate's own
 # pure-Rust format path. Distributed via Homebrew tap on macOS and
-# `cargo install` everywhere; the DiskJockey app does NOT bundle this
-# binary (App Store rules forbid bundling CLI tools), it routes through
-# FSKit's startFormat which calls the same format_filesystem() entry.
+# `cargo install` everywhere; embedders that route formatting through
+# their own UI (e.g. an FSKit `startFormat` handler) call
+# `format_filesystem()` directly instead of shelling out to this binary.
 #
 # Binary name uses underscore — Cargo's bin name field doesn't accept
 # dots. Homebrew formula symlinks /usr/local/bin/mkfs.ext4 → mkfs_ext4

@@ -52,9 +52,8 @@
   as an independent FFI-first implementation, and a plain-English
   at-your-own-risk disclaimer restating the MIT no-warranty clause.
 - Framing neutralised: crate is described as a general-purpose FFI
-  ext4 driver. DiskJockey is mentioned once as a production user
-  with an explicit no-coupling note; no more `Swift` / `FSKit`-
-  specific language in the API description.
+  ext4 driver; no more `Swift` / `FSKit`-specific language in the
+  API description.
 - `Cargo.toml` description updated to match (`FFI from C/C++/Go/etc.`
   instead of `Swift/C/Go/etc.`) and `version` bumped to `0.1.1`.
 
