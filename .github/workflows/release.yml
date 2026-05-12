@@ -6,11 +6,14 @@ on:
       - 'v*.*.*'
 
 permissions:
-  id-token: write
   contents: read
 
 env:
   CARGO_TERM_COLOR: always
+  # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
+  # during local build/verify. Bump in lockstep with the am-fs-core version
+  # constraint in Cargo.toml when releasing a new fs-ext4 minor.
+  FS_CORE_REF: v0.2.0
 
 jobs:
   test:
@@ -21,7 +24,7 @@ jobs:
 
       - name: clone am-fs-core sibling
         shell: bash
-        run: git clone --depth 1 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -46,8 +49,16 @@ jobs:
     needs: test
     runs-on: ubuntu-latest
     environment: release
+    permissions:
+      id-token: write
+      contents: read
     steps:
       - uses: actions/checkout@v5
+
+      - name: clone am-fs-core sibling
+        shell: bash
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.94.1
