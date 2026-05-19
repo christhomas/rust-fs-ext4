@@ -2142,6 +2142,13 @@ impl Filesystem {
         raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
+        // i_crtime at 0x90 — birth time. Only valid on inodes with the
+        // extra section (i_extra_isize covers it); 256-byte modern ext4
+        // inodes meet that bar. Without this, `stat -f %B` on darwin /
+        // st_birthtime returns the Unix epoch (1970-01-01).
+        if inode_size >= 0x94 {
+            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
+        }
 
         use std::sync::atomic::{AtomicU32, Ordering};
         static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -2215,6 +2222,10 @@ impl Filesystem {
         raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes()); // atime
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
+        // i_crtime at 0x90 — see build_fast_symlink_inode for rationale.
+        if inode_size >= 0x94 {
+            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
+        }
 
         use std::sync::atomic::{AtomicU32, Ordering};
         static GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -2277,6 +2288,13 @@ impl Filesystem {
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes()); // ctime
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes()); // mtime
                                                              // dtime stays zero (not deleted).
+        // i_crtime at 0x90 — birth time. Only valid on inodes with the
+        // extra section (i_extra_isize covers it); 256-byte modern ext4
+        // inodes meet that bar. Without this, `stat -f %B` on darwin /
+        // st_birthtime returns the Unix epoch (1970-01-01).
+        if inode_size >= 0x94 {
+            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
+        }
 
         // i_generation at 0x64..0x68. We combine pid + a process-lifetime
         // counter so successive creates within the same session have
@@ -3333,6 +3351,10 @@ impl Filesystem {
         raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes());
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
         raw[0x10..0x14].copy_from_slice(&now.to_le_bytes());
+        // i_crtime at 0x90 — see build_regular_file_inode for rationale.
+        if inode_size >= 0x94 {
+            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
+        }
 
         // i_generation at 0x64..0x68 — mirror apply_create's derivation so
         // successive mkdir calls have distinct values.

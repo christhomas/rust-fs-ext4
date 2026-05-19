@@ -171,6 +171,45 @@ fn create_in_subdir_works() {
 }
 
 #[test]
+fn create_sets_timestamps_to_now() {
+    // Regression: `fs_ext4_create` previously wrote atime/ctime/mtime
+    // but left i_crtime at offset 0x90 zero. Finder / `stat -f %B`
+    // then showed "1 January 1970" as the birth time. Verify all four
+    // timestamp fields land within a tolerance of "now".
+    let img = scratch_image();
+    let img_c = CString::new(img.to_str().unwrap()).unwrap();
+    let path_c = CString::new("/freshly_minted.txt").unwrap();
+
+    let before = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32;
+
+    let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
+    assert!(!fs.is_null(), "mount_rw: {}", last_err_str());
+    let ino = unsafe { fs_ext4_create(fs, path_c.as_ptr(), 0o644) };
+    assert!(ino > 0, "create returned 0: {}", last_err_str());
+    let a = stat(fs, "/freshly_minted.txt");
+    unsafe { fs_ext4_umount(fs) };
+
+    let after = std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .unwrap()
+        .as_secs() as u32
+        + 1;
+
+    for (label, ts) in [("atime", a.atime), ("mtime", a.mtime),
+                        ("ctime", a.ctime), ("crtime", a.crtime)] {
+        assert!(
+            ts >= before && ts <= after,
+            "{label}={ts} outside [{before}, {after}]"
+        );
+    }
+
+    std::fs::remove_file(&img).ok();
+}
+
+#[test]
 fn create_null_inputs_do_not_crash() {
     let img = scratch_image();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
