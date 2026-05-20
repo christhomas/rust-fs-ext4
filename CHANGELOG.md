@@ -1,5 +1,48 @@
 # Changelog
 
+## [0.2.1] — 2026-05-20
+
+### Fixes
+
+- **`fs_ext4_create` now writes `i_crtime`** at offset 0x90 across
+  all four inode builders (regular file, directory, fast symlink,
+  slow symlink). Previously the field was left at zero on freshly
+  created inodes, surfacing on Darwin as `st_birthtime` = 0 and
+  Finder showing "1 January 1970" as the file's "Created" date
+  even though atime / ctime / mtime were set correctly. Gated on
+  `inode_size >= 0x94` so ext2 / ext3 128-byte inodes (which lack
+  the extra section) are left alone.
+
+### Tests
+
+- New `tests/capi_create.rs::create_sets_timestamps_to_now`
+  regression test brackets all four timestamp fields against
+  `SystemTime::now()` either side of `fs_ext4_create`. Fails on
+  the pre-fix code.
+
+### Release pipeline
+
+- `cargo publish --locked` in the release workflow. Earlier
+  publish attempts failed because `Cargo.lock` got modified
+  during the implicit publish-verify build and the working tree
+  went dirty; the lazy `--allow-dirty` would have hidden any real
+  drift. With `--locked`, cargo refuses to update the lockfile
+  during publish, so the version of every transitive dep
+  committed at the tag is the version that ships. Discipline:
+  any Cargo.toml `version` bump must be paired with
+  `cargo update --workspace` + a lockfile commit in the same
+  release prep.
+
+## [0.2.0] — TODO
+
+(Pre-existing release. Changelog entry not authored at the time;
+fill in if it ever becomes useful.)
+
+## [0.1.4] — TODO
+
+(Pre-existing release. Changelog entry not authored at the time;
+fill in if it ever becomes useful.)
+
 ## [0.1.3] — 2026-04-22
 
 ### Fixes
