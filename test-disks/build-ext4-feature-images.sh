@@ -153,7 +153,7 @@ echo "nameserver 10.0.2.3" > /etc/resolv.conf
 
 # Install openssh from Alpine CDN.
 echo "https://dl-cdn.alpinelinux.org/alpine/v3.21/main" >> /etc/apk/repositories
-apk add --no-cache openssh-server openssh-keygen 2>/dev/null
+apk add --no-cache openssh-server openssh-keygen util-linux 2>/dev/null
 
 # Generate host keys + configure root access.
 ssh-keygen -A >/dev/null 2>&1

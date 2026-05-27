@@ -199,9 +199,34 @@ build_manyfiles() {
     umount /mnt/img
 }
 
+build_whole_disk() {
+    local img=ext4-whole-disk.img
+    echo "[vm] $img"
+    rm -f $img
+    # 20 MiB: 1 MiB GPT header area + 16 MiB partition (32768 × 512 B) + 1 MiB GPT backup
+    truncate -s 20M $img
+    # GPT with one Linux-fs partition at LBA 2048, 32768 sectors.
+    # sfdisk (util-linux) is required — busybox sfdisk lacks GPT support.
+    printf 'label: gpt\nstart=2048, size=32768, type=L\n' | sfdisk $img >/dev/null
+    # Attach loop device with partition scanning (-P).
+    local loop
+    loop=$(losetup -f --show -P "$img")
+    mkfs.ext4 -q -F -b 4096 \
+        -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
+        -L wholedisk "${loop}p1"
+    mount "${loop}p1" /mnt/img
+    echo 'whole disk test' > /mnt/img/test.txt
+    mkdir -p /mnt/img/subdir
+    echo 'nested' > /mnt/img/subdir/nested.txt
+    ln -s test.txt /mnt/img/link.txt
+    sync
+    umount /mnt/img
+    losetup -d "$loop"
+}
+
 # --- dispatch -------------------------------------------------------------
 
-ALL="basic htree csum_seed no_csum deep_extents inline xattr acl largedir manyfiles"
+ALL="basic htree csum_seed no_csum deep_extents inline xattr acl largedir manyfiles whole_disk"
 TARGETS="${*:-$ALL}"
 
 for t in $TARGETS; do
@@ -216,6 +241,7 @@ for t in $TARGETS; do
         acl)          build_acl ;;
         largedir)     build_largedir ;;
         manyfiles)    build_manyfiles ;;
+        whole_disk)   build_whole_disk ;;
         *)            echo "[vm] unknown target: $t (have: $ALL)" >&2; exit 1 ;;
     esac
 done
