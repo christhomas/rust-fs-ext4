@@ -28,6 +28,29 @@ use crate::extent::{
     EXT_INIT_MAX_LEN,
 };
 
+// Byte offsets within a 12-byte extent tree node header.
+const EXT4_EXT_HDR_MAGIC_OFF: usize = 0;
+const EXT4_EXT_HDR_ENTRIES_OFF: usize = 2;
+const EXT4_EXT_HDR_MAX_OFF: usize = 4;
+const EXT4_EXT_HDR_DEPTH_OFF: usize = 6;
+const EXT4_EXT_HDR_GEN_OFF: usize = 8;
+
+/// Byte offset of extent entry `i` within a node body (entries follow the
+/// 12-byte header, so entry 0 is at offset `EXT4_EXT_NODE_SIZE`).
+#[inline]
+fn extent_entry_offset(i: usize) -> usize {
+    EXT4_EXT_NODE_SIZE * (1 + i)
+}
+
+/// Split a 64-bit physical block address into the hi u16 and lo u32 fields
+/// used by ext4 extent and index entries.
+#[inline]
+pub(crate) fn split_phys_block(block: u64) -> (u16, u32) {
+    let hi = ((block >> 32) & 0xFFFF) as u16;
+    let lo = (block & 0xFFFF_FFFF) as u32;
+    (hi, lo)
+}
+
 /// A primitive change the extent-write path wants to make to the tree. The
 /// caller (E10 or a test) converts this into real I/O under a transaction.
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -55,8 +78,7 @@ fn encode_extent(e: &Extent) -> [u8; EXT4_EXT_NODE_SIZE] {
         e.length
     };
     buf[4..6].copy_from_slice(&ee_len.to_le_bytes());
-    let phys_hi = ((e.physical_block >> 32) & 0xFFFF) as u16;
-    let phys_lo = (e.physical_block & 0xFFFF_FFFF) as u32;
+    let (phys_hi, phys_lo) = split_phys_block(e.physical_block);
     buf[6..8].copy_from_slice(&phys_hi.to_le_bytes());
     buf[8..12].copy_from_slice(&phys_lo.to_le_bytes());
     buf
@@ -67,14 +89,17 @@ fn encode_extent(e: &Extent) -> [u8; EXT4_EXT_NODE_SIZE] {
 /// full-block leaf).
 fn build_root(header: &ExtentHeader, extents: &[Extent], root_len: usize) -> Vec<u8> {
     let mut out = vec![0u8; root_len];
-    // header
-    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
-    out[2..4].copy_from_slice(&(extents.len() as u16).to_le_bytes());
-    out[4..6].copy_from_slice(&header.max.to_le_bytes());
-    out[6..8].copy_from_slice(&header.depth.to_le_bytes());
-    out[8..12].copy_from_slice(&header.generation.to_le_bytes());
+    out[EXT4_EXT_HDR_MAGIC_OFF..EXT4_EXT_HDR_MAGIC_OFF + 2]
+        .copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[EXT4_EXT_HDR_ENTRIES_OFF..EXT4_EXT_HDR_ENTRIES_OFF + 2]
+        .copy_from_slice(&(extents.len() as u16).to_le_bytes());
+    out[EXT4_EXT_HDR_MAX_OFF..EXT4_EXT_HDR_MAX_OFF + 2].copy_from_slice(&header.max.to_le_bytes());
+    out[EXT4_EXT_HDR_DEPTH_OFF..EXT4_EXT_HDR_DEPTH_OFF + 2]
+        .copy_from_slice(&header.depth.to_le_bytes());
+    out[EXT4_EXT_HDR_GEN_OFF..EXT4_EXT_HDR_GEN_OFF + 4]
+        .copy_from_slice(&header.generation.to_le_bytes());
     for (i, e) in extents.iter().enumerate() {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i);
+        let off = extent_entry_offset(i);
         out[off..off + EXT4_EXT_NODE_SIZE].copy_from_slice(&encode_extent(e));
     }
     out
@@ -92,7 +117,7 @@ fn read_leaf_entries(root: &[u8]) -> Result<(ExtentHeader, Vec<Extent>)> {
     }
     let mut out = Vec::with_capacity(header.entries as usize);
     for i in 0..header.entries {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i as usize);
+        let off = extent_entry_offset(i as usize);
         if off + EXT4_EXT_NODE_SIZE > root.len() {
             return Err(Error::CorruptExtentTree("leaf entry out of range"));
         }
@@ -196,13 +221,15 @@ fn build_leaf_block(
     let mut out = vec![0u8; block_size];
     let header_body_len = block_size.saturating_sub(if reserved_tail_csum { 4 } else { 0 });
     let max_entries = ((header_body_len - EXT4_EXT_NODE_SIZE) / EXT4_EXT_NODE_SIZE) as u16;
-    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
-    out[2..4].copy_from_slice(&(extents.len() as u16).to_le_bytes());
-    out[4..6].copy_from_slice(&max_entries.to_le_bytes());
-    out[6..8].copy_from_slice(&0u16.to_le_bytes()); // depth=0 (leaf)
-    out[8..12].copy_from_slice(&generation.to_le_bytes());
+    out[EXT4_EXT_HDR_MAGIC_OFF..EXT4_EXT_HDR_MAGIC_OFF + 2]
+        .copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[EXT4_EXT_HDR_ENTRIES_OFF..EXT4_EXT_HDR_ENTRIES_OFF + 2]
+        .copy_from_slice(&(extents.len() as u16).to_le_bytes());
+    out[EXT4_EXT_HDR_MAX_OFF..EXT4_EXT_HDR_MAX_OFF + 2].copy_from_slice(&max_entries.to_le_bytes());
+    out[EXT4_EXT_HDR_DEPTH_OFF..EXT4_EXT_HDR_DEPTH_OFF + 2].copy_from_slice(&0u16.to_le_bytes());
+    out[EXT4_EXT_HDR_GEN_OFF..EXT4_EXT_HDR_GEN_OFF + 4].copy_from_slice(&generation.to_le_bytes());
     for (i, e) in extents.iter().enumerate() {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i);
+        let off = extent_entry_offset(i);
         out[off..off + EXT4_EXT_NODE_SIZE].copy_from_slice(&encode_extent(e));
     }
     out
@@ -212,14 +239,15 @@ fn build_leaf_block(
 /// pointing at `leaf_phys` (logical 0).
 fn build_depth1_index_root(generation: u32, leaf_phys: u64) -> Vec<u8> {
     let mut out = vec![0u8; 60];
-    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
-    out[2..4].copy_from_slice(&1u16.to_le_bytes()); // entries=1
-    out[4..6].copy_from_slice(&4u16.to_le_bytes()); // max=4 (inline root)
-    out[6..8].copy_from_slice(&1u16.to_le_bytes()); // depth=1
-    out[8..12].copy_from_slice(&generation.to_le_bytes());
+    out[EXT4_EXT_HDR_MAGIC_OFF..EXT4_EXT_HDR_MAGIC_OFF + 2]
+        .copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[EXT4_EXT_HDR_ENTRIES_OFF..EXT4_EXT_HDR_ENTRIES_OFF + 2]
+        .copy_from_slice(&1u16.to_le_bytes()); // entries=1
+    out[EXT4_EXT_HDR_MAX_OFF..EXT4_EXT_HDR_MAX_OFF + 2].copy_from_slice(&4u16.to_le_bytes()); // max=4 (inline root)
+    out[EXT4_EXT_HDR_DEPTH_OFF..EXT4_EXT_HDR_DEPTH_OFF + 2].copy_from_slice(&1u16.to_le_bytes()); // depth=1
+    out[EXT4_EXT_HDR_GEN_OFF..EXT4_EXT_HDR_GEN_OFF + 4].copy_from_slice(&generation.to_le_bytes());
     let ei_block: u32 = 0;
-    let ei_leaf_lo = (leaf_phys & 0xFFFF_FFFF) as u32;
-    let ei_leaf_hi = ((leaf_phys >> 32) & 0xFFFF) as u16;
+    let (ei_leaf_hi, ei_leaf_lo) = split_phys_block(leaf_phys);
     out[12..16].copy_from_slice(&ei_block.to_le_bytes());
     out[16..20].copy_from_slice(&ei_leaf_lo.to_le_bytes());
     out[20..22].copy_from_slice(&ei_leaf_hi.to_le_bytes());
@@ -347,8 +375,7 @@ struct PathFrame {
 /// whose smallest logical block is `logical_block`.
 fn encode_index(logical_block: u32, child_phys: u64) -> [u8; EXT4_EXT_NODE_SIZE] {
     let mut buf = [0u8; EXT4_EXT_NODE_SIZE];
-    let leaf_lo = (child_phys & 0xFFFF_FFFF) as u32;
-    let leaf_hi = ((child_phys >> 32) & 0xFFFF) as u16;
+    let (leaf_hi, leaf_lo) = split_phys_block(child_phys);
     buf[0..4].copy_from_slice(&logical_block.to_le_bytes());
     buf[4..8].copy_from_slice(&leaf_lo.to_le_bytes());
     buf[8..10].copy_from_slice(&leaf_hi.to_le_bytes());
@@ -361,7 +388,7 @@ fn encode_index(logical_block: u32, child_phys: u64) -> [u8; EXT4_EXT_NODE_SIZE]
 fn parse_leaf_entries(node: &[u8], header: &ExtentHeader) -> Result<Vec<Extent>> {
     let mut out = Vec::with_capacity(header.entries as usize);
     for i in 0..header.entries {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i as usize);
+        let off = extent_entry_offset(i as usize);
         if off + EXT4_EXT_NODE_SIZE > node.len() {
             return Err(Error::CorruptExtentTree("leaf entry out of range"));
         }
@@ -375,7 +402,7 @@ fn parse_leaf_entries(node: &[u8], header: &ExtentHeader) -> Result<Vec<Extent>>
 fn parse_index_entries(node: &[u8], header: &ExtentHeader) -> Result<Vec<ExtentIdx>> {
     let mut out = Vec::with_capacity(header.entries as usize);
     for i in 0..header.entries {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i as usize);
+        let off = extent_entry_offset(i as usize);
         if off + EXT4_EXT_NODE_SIZE > node.len() {
             return Err(Error::CorruptExtentTree("index entry out of range"));
         }
@@ -398,13 +425,15 @@ fn node_max_entries(block_size: usize) -> u16 {
 fn build_full_leaf_block(generation: u32, extents: &[Extent], block_size: usize) -> Vec<u8> {
     let mut out = vec![0u8; block_size];
     let max = node_max_entries(block_size);
-    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
-    out[2..4].copy_from_slice(&(extents.len() as u16).to_le_bytes());
-    out[4..6].copy_from_slice(&max.to_le_bytes());
-    out[6..8].copy_from_slice(&0u16.to_le_bytes());
-    out[8..12].copy_from_slice(&generation.to_le_bytes());
+    out[EXT4_EXT_HDR_MAGIC_OFF..EXT4_EXT_HDR_MAGIC_OFF + 2]
+        .copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[EXT4_EXT_HDR_ENTRIES_OFF..EXT4_EXT_HDR_ENTRIES_OFF + 2]
+        .copy_from_slice(&(extents.len() as u16).to_le_bytes());
+    out[EXT4_EXT_HDR_MAX_OFF..EXT4_EXT_HDR_MAX_OFF + 2].copy_from_slice(&max.to_le_bytes());
+    out[EXT4_EXT_HDR_DEPTH_OFF..EXT4_EXT_HDR_DEPTH_OFF + 2].copy_from_slice(&0u16.to_le_bytes());
+    out[EXT4_EXT_HDR_GEN_OFF..EXT4_EXT_HDR_GEN_OFF + 4].copy_from_slice(&generation.to_le_bytes());
     for (i, e) in extents.iter().enumerate() {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i);
+        let off = extent_entry_offset(i);
         out[off..off + EXT4_EXT_NODE_SIZE].copy_from_slice(&encode_extent(e));
     }
     out
@@ -420,13 +449,15 @@ fn build_full_index_block(
 ) -> Vec<u8> {
     let mut out = vec![0u8; block_size];
     let max = node_max_entries(block_size);
-    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
-    out[2..4].copy_from_slice(&(indices.len() as u16).to_le_bytes());
-    out[4..6].copy_from_slice(&max.to_le_bytes());
-    out[6..8].copy_from_slice(&depth.to_le_bytes());
-    out[8..12].copy_from_slice(&generation.to_le_bytes());
+    out[EXT4_EXT_HDR_MAGIC_OFF..EXT4_EXT_HDR_MAGIC_OFF + 2]
+        .copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[EXT4_EXT_HDR_ENTRIES_OFF..EXT4_EXT_HDR_ENTRIES_OFF + 2]
+        .copy_from_slice(&(indices.len() as u16).to_le_bytes());
+    out[EXT4_EXT_HDR_MAX_OFF..EXT4_EXT_HDR_MAX_OFF + 2].copy_from_slice(&max.to_le_bytes());
+    out[EXT4_EXT_HDR_DEPTH_OFF..EXT4_EXT_HDR_DEPTH_OFF + 2].copy_from_slice(&depth.to_le_bytes());
+    out[EXT4_EXT_HDR_GEN_OFF..EXT4_EXT_HDR_GEN_OFF + 4].copy_from_slice(&generation.to_le_bytes());
     for (i, (logical, child)) in indices.iter().enumerate() {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i);
+        let off = extent_entry_offset(i);
         out[off..off + EXT4_EXT_NODE_SIZE].copy_from_slice(&encode_index(*logical, *child));
     }
     out
@@ -435,13 +466,15 @@ fn build_full_index_block(
 /// Build the 60-byte inline root for an index node at the given depth.
 fn build_inline_index_root(generation: u32, depth: u16, indices: &[(u32, u64)]) -> Vec<u8> {
     let mut out = vec![0u8; 60];
-    out[0..2].copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
-    out[2..4].copy_from_slice(&(indices.len() as u16).to_le_bytes());
-    out[4..6].copy_from_slice(&4u16.to_le_bytes());
-    out[6..8].copy_from_slice(&depth.to_le_bytes());
-    out[8..12].copy_from_slice(&generation.to_le_bytes());
+    out[EXT4_EXT_HDR_MAGIC_OFF..EXT4_EXT_HDR_MAGIC_OFF + 2]
+        .copy_from_slice(&EXT4_EXT_MAGIC.to_le_bytes());
+    out[EXT4_EXT_HDR_ENTRIES_OFF..EXT4_EXT_HDR_ENTRIES_OFF + 2]
+        .copy_from_slice(&(indices.len() as u16).to_le_bytes());
+    out[EXT4_EXT_HDR_MAX_OFF..EXT4_EXT_HDR_MAX_OFF + 2].copy_from_slice(&4u16.to_le_bytes()); // max=4 (inline root)
+    out[EXT4_EXT_HDR_DEPTH_OFF..EXT4_EXT_HDR_DEPTH_OFF + 2].copy_from_slice(&depth.to_le_bytes());
+    out[EXT4_EXT_HDR_GEN_OFF..EXT4_EXT_HDR_GEN_OFF + 4].copy_from_slice(&generation.to_le_bytes());
     for (i, (logical, child)) in indices.iter().enumerate() {
-        let off = EXT4_EXT_NODE_SIZE * (1 + i);
+        let off = extent_entry_offset(i);
         out[off..off + EXT4_EXT_NODE_SIZE].copy_from_slice(&encode_index(*logical, *child));
     }
     out
@@ -559,7 +592,7 @@ fn descend_to_leaf(
         let mut chosen_pos: usize = 0;
         let mut chosen_idx: Option<ExtentIdx> = None;
         for i in 0..header.entries {
-            let off = EXT4_EXT_NODE_SIZE * (1 + i as usize);
+            let off = extent_entry_offset(i as usize);
             let idx = ExtentIdx::parse(&frame.bytes[off..off + EXT4_EXT_NODE_SIZE])?;
             if idx.logical_block <= target_logical {
                 chosen_pos = i as usize;
@@ -573,7 +606,7 @@ fn descend_to_leaf(
         let idx = match chosen_idx {
             Some(i) => i,
             None => {
-                let off = EXT4_EXT_NODE_SIZE;
+                let off = extent_entry_offset(0);
                 ExtentIdx::parse(&frame.bytes[off..off + EXT4_EXT_NODE_SIZE])?
             }
         };
