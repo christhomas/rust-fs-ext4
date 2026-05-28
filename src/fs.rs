@@ -50,6 +50,34 @@ impl BlockBuffer {
     }
 }
 
+/// Patch a split u32 counter (lo: u16 + optional hi: u16) in `buf` by `delta`.
+///
+/// ext4 BGD counters are stored as a 16-bit low word at `lo_off` and an
+/// optional 16-bit high word at `hi_off` (present when desc_size >= 64). The
+/// combined 32-bit value is clamped to zero on underflow.
+fn patch_counter_u32(buf: &mut [u8], lo_off: usize, hi_off: Option<usize>, delta: i32) {
+    let cur_lo = u16::from_le_bytes(buf[lo_off..lo_off + 2].try_into().unwrap()) as u32;
+    let cur_hi = hi_off
+        .map(|h| u16::from_le_bytes(buf[h..h + 2].try_into().unwrap()) as u32)
+        .unwrap_or(0);
+    let cur = (cur_hi << 16) | cur_lo;
+    let new = (cur as i64 + delta as i64).max(0) as u32;
+    buf[lo_off..lo_off + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
+    if let Some(h) = hi_off {
+        buf[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
+    }
+}
+
+/// Pack the low bits of an ext4 nanosecond timestamp field.
+///
+/// ext4 stores extra precision in a 32-bit extra field: bits [31:2] hold the
+/// low 30 bits of the nanosecond value; bits [1:0] are the 2-bit epoch
+/// extension that extends the 32-bit seconds counter beyond 2038.
+#[inline]
+fn pack_nsec_lo(nsec: u32) -> u32 {
+    (nsec & 0x3FFF_FFFF) << 2
+}
+
 /// Split a `/a/b/c` path into (`/a/b`, `c`). Returns an error for empty or
 /// `"/"` paths (no basename to act on).
 fn split_parent_and_base(path: &str) -> Result<(String, String)> {
@@ -904,8 +932,7 @@ impl Filesystem {
                 e.length
             };
             root[off + 4..off + 6].copy_from_slice(&ee_len.to_le_bytes());
-            let phys_hi = ((e.physical_block >> 32) & 0xFFFF) as u16;
-            let phys_lo = (e.physical_block & 0xFFFF_FFFF) as u32;
+            let (phys_hi, phys_lo) = crate::extent_mut::split_phys_block(e.physical_block);
             root[off + 6..off + 8].copy_from_slice(&phys_hi.to_le_bytes());
             root[off + 8..off + 12].copy_from_slice(&phys_lo.to_le_bytes());
         }
@@ -1141,20 +1168,7 @@ impl Filesystem {
         let off_in_block = (byte_in_bgt % bs) as usize;
 
         let block = buf.get_mut(self, bgt_block)?;
-        // Same patch logic as patch_bgd_counters.
-        let patch_u32 = |block: &mut [u8], lo: usize, hi: Option<usize>, delta: i32| {
-            let cur_lo = u16::from_le_bytes(block[lo..lo + 2].try_into().unwrap()) as u32;
-            let cur_hi = hi
-                .map(|h| u16::from_le_bytes(block[h..h + 2].try_into().unwrap()) as u32)
-                .unwrap_or(0);
-            let cur = (cur_hi << 16) | cur_lo;
-            let new = (cur as i64 + delta as i64).max(0) as u32;
-            block[lo..lo + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
-            if let Some(h) = hi {
-                block[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
-            }
-        };
-        patch_u32(
+        patch_counter_u32(
             block,
             off_in_block + 0x0C,
             if desc_size >= 0x40 {
@@ -1164,7 +1178,7 @@ impl Filesystem {
             },
             free_blocks_delta,
         );
-        patch_u32(
+        patch_counter_u32(
             block,
             off_in_block + 0x0E,
             if desc_size >= 0x40 {
@@ -1174,7 +1188,7 @@ impl Filesystem {
             },
             free_inodes_delta,
         );
-        patch_u32(
+        patch_counter_u32(
             block,
             off_in_block + 0x10,
             if desc_size >= 0x40 {
@@ -1713,8 +1727,7 @@ impl Filesystem {
 
         // Splice block_nr into the inode: i_file_acl_lo at 0x68..0x6C, hi
         // at 0x74..0x76.
-        let acl_lo = (block_nr & 0xFFFF_FFFF) as u32;
-        let acl_hi = ((block_nr >> 32) & 0xFFFF) as u16;
+        let (acl_hi, acl_lo) = crate::extent_mut::split_phys_block(block_nr);
         raw[0x68..0x6C].copy_from_slice(&acl_lo.to_le_bytes());
         if raw.len() >= 0x76 {
             raw[0x74..0x76].copy_from_slice(&acl_hi.to_le_bytes());
@@ -1793,11 +1806,11 @@ impl Filesystem {
                 raw[0x84..0x88].copy_from_slice(&0u32.to_le_bytes());
             }
             if mtime_sec != u32::MAX && i_extra_isize >= 12 && raw.len() >= 0x8C {
-                let packed = (mtime_nsec & 0x3FFF_FFFF) << 2;
+                let packed = pack_nsec_lo(mtime_nsec);
                 raw[0x88..0x8C].copy_from_slice(&packed.to_le_bytes());
             }
             if atime_sec != u32::MAX && i_extra_isize >= 16 && raw.len() >= 0x90 {
-                let packed = (atime_nsec & 0x3FFF_FFFF) << 2;
+                let packed = pack_nsec_lo(atime_nsec);
                 raw[0x8C..0x90].copy_from_slice(&packed.to_le_bytes());
             }
         }
@@ -2353,8 +2366,7 @@ impl Filesystem {
         let extent_entry_off = extent_header_off + 12;
         raw[extent_entry_off..extent_entry_off + 4].copy_from_slice(&0u32.to_le_bytes());
         raw[extent_entry_off + 4..extent_entry_off + 6].copy_from_slice(&1u16.to_le_bytes());
-        let extent_phys_hi = ((data_phys >> 32) & 0xFFFF) as u16;
-        let extent_phys_lo = (data_phys & 0xFFFF_FFFF) as u32;
+        let (extent_phys_hi, extent_phys_lo) = crate::extent_mut::split_phys_block(data_phys);
         raw[extent_entry_off + 6..extent_entry_off + 8]
             .copy_from_slice(&extent_phys_hi.to_le_bytes());
         raw[extent_entry_off + 8..extent_entry_off + 12]
@@ -3202,27 +3214,8 @@ impl Filesystem {
 
         let mut block = self.read_block(bgt_block)?;
 
-        // Patch one little-endian u16+hi_u16 pair inside the descriptor.
-        let patch_u32 = |block: &mut [u8], lo: usize, hi: Option<usize>, delta: i32| {
-            let cur_lo = u16::from_le_bytes(block[lo..lo + 2].try_into().unwrap()) as u32;
-            let cur_hi = hi
-                .map(|h| u16::from_le_bytes(block[h..h + 2].try_into().unwrap()) as u32)
-                .unwrap_or(0);
-            let cur = (cur_hi << 16) | cur_lo;
-            let new = (cur as i64 + delta as i64).max(0) as u32;
-            block[lo..lo + 2].copy_from_slice(&((new & 0xFFFF) as u16).to_le_bytes());
-            if let Some(h) = hi {
-                block[h..h + 2].copy_from_slice(&(((new >> 16) & 0xFFFF) as u16).to_le_bytes());
-            }
-        };
-        let patch_u16 = |block: &mut [u8], at: usize, delta: i32| {
-            let cur = u16::from_le_bytes(block[at..at + 2].try_into().unwrap()) as i32;
-            let new = (cur + delta).max(0) as u16;
-            block[at..at + 2].copy_from_slice(&new.to_le_bytes());
-        };
-
         // Free-blocks: 16-bit at 0x0C, hi at 0x2A when 64-bit
-        patch_u32(
+        patch_counter_u32(
             &mut block,
             off_in_block + 0x0C,
             if desc_size >= 0x40 {
@@ -3233,7 +3226,7 @@ impl Filesystem {
             free_blocks_delta,
         );
         // Free-inodes: 16-bit at 0x0E, hi at 0x2C when 64-bit
-        patch_u32(
+        patch_counter_u32(
             &mut block,
             off_in_block + 0x0E,
             if desc_size >= 0x40 {
@@ -3245,7 +3238,7 @@ impl Filesystem {
         );
         // Used-dirs: 16-bit only (kernel defines u16+u16 hi at 0x2E too, but
         // dirs per group realistically fit in u16 — handle both anyway).
-        patch_u32(
+        patch_counter_u32(
             &mut block,
             off_in_block + 0x10,
             if desc_size >= 0x40 {
@@ -3255,7 +3248,6 @@ impl Filesystem {
             },
             used_dirs_delta,
         );
-        let _ = patch_u16;
 
         if self.csum.enabled {
             let stored_at = off_in_block + 0x1E;
