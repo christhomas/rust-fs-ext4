@@ -659,4 +659,31 @@ mod tests {
         );
         assert_eq!(buf, vec![0b0001_1111, 0x03]);
     }
+
+    // --- blocks_in_group ---
+
+    #[test]
+    fn blocks_in_group_full_groups_return_blocks_per_group() {
+        // 3 full groups of 32768 each: total = 3*32768 + 1 (first_data_block=1).
+        let sb = mk_sb(4096, 32768, 8192, 3 * 32768 + 1);
+        // Groups 0 and 1 are not the last group, so they return blocks_per_group.
+        assert_eq!(blocks_in_group(&sb, 0), 32768);
+        assert_eq!(blocks_in_group(&sb, 1), 32768);
+    }
+
+    #[test]
+    fn blocks_in_group_last_group_exact_multiple_returns_full() {
+        // usable = 2*32768, first_data_block=1 → blocks_count = 2*32768+1
+        // remainder = (2*32768+1-1) % 32768 = 65536 % 32768 = 0 → full group
+        let sb = mk_sb(4096, 32768, 8192, 2 * 32768 + 1);
+        assert_eq!(blocks_in_group(&sb, 1), 32768);
+    }
+
+    #[test]
+    fn blocks_in_group_short_last_group() {
+        // 1 full group + 100 extra blocks: total = 32768 + 100 + 1 = 32869
+        let sb = mk_sb(4096, 32768, 8192, 32769 + 100);
+        assert_eq!(blocks_in_group(&sb, 0), 32768); // full
+        assert_eq!(blocks_in_group(&sb, 1), 100); // short last group
+    }
 }

@@ -396,4 +396,186 @@ mod tests {
         let _ = name_hash(b"", HashVersion::Tea, &s);
         let _ = name_hash(b"", HashVersion::HalfMd4, &s);
     }
+
+    // --- init_state ---
+
+    #[test]
+    fn init_state_zero_seed_returns_md4_constants() {
+        let state = init_state(&[0; 4]);
+        assert_eq!(state, [0x6745_2301, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476]);
+    }
+
+    #[test]
+    fn init_state_nonzero_seed_returns_verbatim() {
+        let seed = [0xDEAD_BEEF, 0xCAFE_BABE, 0x1234_5678, 0x9ABC_DEF0];
+        assert_eq!(init_state(&seed), seed);
+    }
+
+    #[test]
+    fn init_state_partial_nonzero_is_not_zero_seed() {
+        // Only one word non-zero — still uses seed verbatim, not defaults.
+        let seed = [0, 0, 0, 1];
+        assert_ne!(init_state(&seed)[0], 0x6745_2301);
+        assert_eq!(init_state(&seed), seed);
+    }
+
+    // --- rol ---
+
+    #[test]
+    fn rol_shift_by_one() {
+        assert_eq!(rol(1, 1), 2);
+        assert_eq!(rol(0x8000_0000, 1), 1); // wraps MSB to LSB
+    }
+
+    #[test]
+    fn rol_full_rotation_is_identity() {
+        assert_eq!(rol(0xDEAD_BEEF, 32), 0xDEAD_BEEF);
+    }
+
+    #[test]
+    fn rol_matches_rotate_left() {
+        assert_eq!(rol(0x1234_5678, 7), 0x1234_5678u32.rotate_left(7));
+    }
+
+    // --- f / g / h ---
+
+    #[test]
+    fn f_acts_as_mux() {
+        // f(x, y, z) = z ^ (x & (y ^ z))
+        // When x=all-ones: f = z ^ (y^z) = y
+        assert_eq!(f(u32::MAX, 0xAAAA_AAAA, 0x5555_5555), 0xAAAA_AAAA);
+        // When x=all-zeros: f = z ^ 0 = z
+        assert_eq!(f(0, 0xAAAA_AAAA, 0x5555_5555), 0x5555_5555);
+    }
+
+    #[test]
+    fn g_is_majority() {
+        // g(x, y, z) = (x&y) + ((x^y)&z) — majority function
+        // majority of (1,1,0): expect 1 (1&1 + (1^1)&0 = 1 + 0 = 1)
+        assert_eq!(g(1, 1, 0), 1);
+        // majority of (0,0,1): expect 0
+        assert_eq!(g(0, 0, 1), 0);
+        // majority of (1,1,1): all-ones
+        assert_eq!(g(u32::MAX, u32::MAX, u32::MAX), u32::MAX);
+    }
+
+    #[test]
+    fn h_is_xor3() {
+        assert_eq!(
+            h(0xAAAA_AAAA, 0x5555_5555, 0xF0F0_F0F0),
+            0xAAAA_AAAA ^ 0x5555_5555 ^ 0xF0F0_F0F0
+        );
+        // x ^ x ^ x = (x^x) ^ x = 0 ^ x = x
+        let x = 0xDEAD_BEEF_u32;
+        assert_eq!(h(x, x, x), x);
+        assert_eq!(h(0, 0, 0), 0);
+        assert_eq!(h(u32::MAX, 0, 0), u32::MAX);
+    }
+
+    // --- legacy_hash ---
+
+    #[test]
+    fn legacy_hash_empty_returns_initial() {
+        // No iterations: hash stays at 0x12A3FE2D.
+        assert_eq!(legacy_hash(b"", true), 0x12A3FE2D);
+        assert_eq!(legacy_hash(b"", false), 0x12A3FE2D);
+    }
+
+    #[test]
+    fn legacy_hash_deterministic() {
+        assert_eq!(legacy_hash(b"hello", true), legacy_hash(b"hello", true));
+    }
+
+    #[test]
+    fn legacy_hash_differs_by_input() {
+        assert_ne!(legacy_hash(b"foo", true), legacy_hash(b"bar", true));
+    }
+
+    #[test]
+    fn legacy_hash_signed_vs_unsigned_differs_on_high_byte() {
+        // 0x80 is -128 as i8, +128 as u8 — signed and unsigned paths diverge.
+        let name = &[0x80u8];
+        assert_ne!(legacy_hash(name, true), legacy_hash(name, false));
+    }
+
+    // --- str_to_le32 ---
+
+    #[test]
+    fn str_to_le32_packs_bytes_lsb_first() {
+        let mut buf = [0u32; 1];
+        str_to_le32(b"abcd", &mut buf, false);
+        // 'a'=0x61, 'b'=0x62, 'c'=0x63, 'd'=0x64 → little-endian u32 = 0x64636261
+        assert_eq!(buf[0], 0x6463_6261);
+    }
+
+    #[test]
+    fn str_to_le32_pads_short_input_with_len() {
+        let mut buf = [0u32; 1];
+        // "ab" → 2 bytes; pad_byte = 2; pad fills remaining byte slots.
+        str_to_le32(b"ab", &mut buf, false);
+        // bytes: [0x61, 0x62, 0x02, 0x02] → 0x02026261
+        assert_eq!(buf[0], 0x0202_6261);
+    }
+
+    #[test]
+    fn str_to_le32_empty_fills_with_zero_pad() {
+        let mut buf = [0u32; 1];
+        // Empty name: pad_byte = 0 (len=0). All bytes = 0.
+        str_to_le32(b"", &mut buf, false);
+        assert_eq!(buf[0], 0x0000_0000);
+    }
+
+    // --- tea_transform ---
+
+    #[test]
+    fn tea_transform_is_deterministic() {
+        let mut h1 = [0x6745_2301u32, 0xEFCD_AB89, 0, 0];
+        let mut h2 = [0x6745_2301u32, 0xEFCD_AB89, 0, 0];
+        let data = [1u32, 2, 3, 4];
+        tea_transform(&mut h1, &data);
+        tea_transform(&mut h2, &data);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn tea_transform_modifies_h0_and_h1() {
+        let original = [0x6745_2301u32, 0xEFCD_AB89, 0x1234_5678, 0xABCD_EF01];
+        let mut hash = original;
+        tea_transform(&mut hash, &[0u32; 4]);
+        assert_ne!(hash[0], original[0]);
+        assert_ne!(hash[1], original[1]);
+        // h[2] and h[3] are key material; tea_transform does not write them
+        assert_eq!(hash[2], original[2]);
+        assert_eq!(hash[3], original[3]);
+    }
+
+    // --- half_md4_transform ---
+
+    #[test]
+    fn half_md4_transform_is_deterministic() {
+        let mut h1 = [0x6745_2301u32, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
+        let mut h2 = [0x6745_2301u32, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
+        let data = [1u32, 2, 3, 4, 5, 6, 7, 8];
+        let r1 = half_md4_transform(&mut h1, data);
+        let r2 = half_md4_transform(&mut h2, data);
+        assert_eq!(r1, r2);
+        assert_eq!(h1, h2);
+    }
+
+    #[test]
+    fn half_md4_transform_return_equals_hash1() {
+        let mut hash = [0x6745_2301u32, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
+        let ret = half_md4_transform(&mut hash, [0u32; 8]);
+        assert_eq!(ret, hash[1]);
+    }
+
+    #[test]
+    fn half_md4_transform_updates_all_words() {
+        let original = [0x6745_2301u32, 0xEFCD_AB89, 0x98BA_DCFE, 0x1032_5476];
+        let mut hash = original;
+        half_md4_transform(&mut hash, [1u32; 8]);
+        for i in 0..4 {
+            assert_ne!(hash[i], original[i], "word {i} should change");
+        }
+    }
 }

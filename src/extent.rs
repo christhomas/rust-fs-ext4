@@ -581,4 +581,91 @@ mod tests {
         assert!(!entries.is_empty());
         assert_eq!(entries[0].name, b".");
     }
+
+    fn make_extent(logical_block: u32, length: u16, physical_block: u64) -> Extent {
+        Extent {
+            logical_block,
+            length,
+            physical_block,
+            uninitialized: false,
+        }
+    }
+
+    #[test]
+    fn extent_contains_within_range() {
+        let e = make_extent(10, 5, 100); // covers logical 10..15
+        assert!(e.contains(10));
+        assert!(e.contains(12));
+        assert!(e.contains(14));
+    }
+
+    #[test]
+    fn extent_contains_rejects_before_start() {
+        let e = make_extent(10, 5, 100);
+        assert!(!e.contains(9));
+        assert!(!e.contains(0));
+    }
+
+    #[test]
+    fn extent_contains_rejects_at_end() {
+        let e = make_extent(10, 5, 100); // end = 15, exclusive
+        assert!(!e.contains(15));
+        assert!(!e.contains(100));
+    }
+
+    #[test]
+    fn extent_contains_single_block_extent() {
+        let e = make_extent(7, 1, 50);
+        assert!(e.contains(7));
+        assert!(!e.contains(6));
+        assert!(!e.contains(8));
+    }
+
+    #[test]
+    fn extent_map_start_of_extent() {
+        let e = make_extent(10, 5, 100);
+        assert_eq!(e.map(10), 100);
+    }
+
+    #[test]
+    fn extent_map_interior_block() {
+        let e = make_extent(10, 5, 100);
+        assert_eq!(e.map(13), 103);
+    }
+
+    #[test]
+    fn extent_map_last_block() {
+        let e = make_extent(10, 5, 100);
+        assert_eq!(e.map(14), 104);
+    }
+
+    #[test]
+    fn extent_parse_rejects_short_buffer() {
+        let short = vec![0u8; 4];
+        assert!(Extent::parse(&short).is_err());
+    }
+
+    #[test]
+    fn extent_parse_uninitialized_flag() {
+        let mut raw = vec![0u8; 12];
+        // ee_len > EXT_INIT_MAX_LEN (32768) marks as uninitialized
+        let uninit_len: u16 = EXT_INIT_MAX_LEN + 1;
+        raw[4..6].copy_from_slice(&uninit_len.to_le_bytes());
+        let e = Extent::parse(&raw).unwrap();
+        assert!(e.uninitialized);
+        assert_eq!(e.length, 1);
+    }
+
+    #[test]
+    fn extent_parse_initialized() {
+        let mut raw = vec![0u8; 12];
+        raw[0..4].copy_from_slice(&5u32.to_le_bytes()); // logical_block
+        raw[4..6].copy_from_slice(&3u16.to_le_bytes()); // ee_len (init)
+        raw[8..12].copy_from_slice(&200u32.to_le_bytes()); // phys lo
+        let e = Extent::parse(&raw).unwrap();
+        assert_eq!(e.logical_block, 5);
+        assert_eq!(e.length, 3);
+        assert_eq!(e.physical_block, 200);
+        assert!(!e.uninitialized);
+    }
 }
