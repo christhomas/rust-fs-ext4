@@ -534,6 +534,15 @@ int fs_ext4_chmod(fs_ext4_fs_t *fs, const char *path, uint16_t mode);
 int fs_ext4_chown(fs_ext4_fs_t *fs, const char *path,
                   uint32_t uid, uint32_t gid);
 
+/* Create a special file (FIFO, socket, char device, block device).
+ * `mode` must include the file-type bits (S_IFIFO=0x1000, S_IFSOCK=0xC000,
+ * S_IFCHR=0x2000, S_IFBLK=0x6000) plus permission bits.
+ * `major`/`minor` are device numbers for char/block devices; pass 0
+ * for FIFOs and sockets. Returns the new inode number on success, 0 on
+ * failure. */
+uint32_t fs_ext4_mknod(fs_ext4_fs_t *fs, const char *path,
+                       uint16_t mode, uint32_t major, uint32_t minor);
+
 /* Set the i_flags word (FS_IOC_SETFLAGS) on `path`. `flags` is the
  * full new flags value; common flags:
  *   0x00000010  EXT4_IMMUTABLE_FL

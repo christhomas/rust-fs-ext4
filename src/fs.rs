@@ -1993,6 +1993,152 @@ impl Filesystem {
         }
     }
 
+    /// Create a special file (FIFO, socket, char device, block device).
+    /// `mode` must include the type bits (`S_IFIFO`, `S_IFSOCK`, `S_IFCHR`,
+    /// or `S_IFBLK`) plus the permission bits. `major` and `minor` are the
+    /// device numbers (both 0 for FIFOs and sockets). Mirrors POSIX `mknod`.
+    pub fn apply_mknod(&self, path: &str, mode: u16, major: u32, minor: u32) -> Result<u32> {
+        if !self.dev.is_writable() {
+            return Err(Error::ReadOnly);
+        }
+        let file_type = mode & crate::inode::S_IFMT;
+        let dir_entry_type = match file_type {
+            crate::inode::S_IFCHR => crate::dir::DirEntryType::CharDev,
+            crate::inode::S_IFBLK => crate::dir::DirEntryType::BlockDev,
+            crate::inode::S_IFIFO => crate::dir::DirEntryType::Fifo,
+            crate::inode::S_IFSOCK => crate::dir::DirEntryType::Socket,
+            _ => {
+                return Err(Error::InvalidArgument(
+                    "mknod: unsupported type; use create/mkdir for reg/dir",
+                ))
+            }
+        };
+        let (parent_path, base_name) = split_parent_and_base(path)?;
+        if base_name.len() > 255 {
+            return Err(Error::NameTooLong);
+        }
+
+        let mut reader = |ino: u32| self.read_inode_verified(ino).map(|(i, _)| i);
+        let parent_ino_num =
+            crate::path::lookup(self.dev.as_ref(), &self.sb, &mut reader, &parent_path)?;
+        let (parent_inode, _parent_raw) = self.read_inode_verified(parent_ino_num)?;
+        if !parent_inode.is_dir() {
+            return Err(Error::NotADirectory);
+        }
+        if self
+            .find_entry_in_dir(&parent_inode, base_name.as_bytes())
+            .is_ok()
+        {
+            return Err(Error::AlreadyExists);
+        }
+
+        let parent_group = (parent_ino_num - 1) / self.sb.inodes_per_group;
+        let bs = self.sb.block_size();
+        let mut bitmap_reader = |block: u64| self.read_block(block);
+        let plan = crate::alloc::plan_inode_allocation(
+            &self.sb,
+            &self.groups,
+            false,
+            parent_group,
+            &mut bitmap_reader,
+        )?;
+        let new_ino = plan.inode;
+
+        let mut buf = BlockBuffer::new(bs);
+        self.buffer_mark_inode_used(&mut buf, new_ino)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            plan.sb.free_blocks_delta,
+            plan.sb.free_inodes_delta,
+        )?;
+
+        let raw = self.build_special_file_inode(new_ino, mode, major, minor)?;
+        self.buffer_write_inode(&mut buf, new_ino, &raw)?;
+
+        match self.buffer_add_dir_entry_inplace(
+            &mut buf,
+            parent_ino_num,
+            &parent_inode,
+            base_name.as_bytes(),
+            new_ino,
+            dir_entry_type,
+        ) {
+            Ok(()) => {
+                self.commit_block_buffer(buf)?;
+                Ok(new_ino)
+            }
+            Err(Error::OutOfBounds) => {
+                self.commit_block_buffer(buf)?;
+                self.extend_dir_and_add_entry(
+                    parent_ino_num,
+                    base_name.as_bytes(),
+                    new_ino,
+                    dir_entry_type,
+                )?;
+                Ok(new_ino)
+            }
+            Err(e) => Err(e),
+        }
+    }
+
+    fn build_special_file_inode(
+        &self,
+        ino: u32,
+        mode: u16,
+        major: u32,
+        minor: u32,
+    ) -> Result<Vec<u8>> {
+        let inode_size = self.sb.inode_size as usize;
+        let mut raw = vec![0u8; inode_size];
+
+        raw[0x00..0x02].copy_from_slice(&mode.to_le_bytes());
+        raw[0x1A..0x1C].copy_from_slice(&1u16.to_le_bytes());
+
+        // Device files: store encoded device number in i_block (no EXTENTS).
+        // Linux stores old (i_block[0]) and new (i_block[1]) formats.
+        let file_type = mode & crate::inode::S_IFMT;
+        if file_type == crate::inode::S_IFBLK || file_type == crate::inode::S_IFCHR {
+            let old_dev = (major << 8) | (minor & 0xff);
+            raw[0x28..0x2C].copy_from_slice(&old_dev.to_le_bytes());
+            let new_dev = (minor & 0xff) | (major << 8) | ((minor & !0xff) << 12);
+            raw[0x2C..0x30].copy_from_slice(&new_dev.to_le_bytes());
+        }
+
+        let now = now_unix_seconds();
+        raw[0x08..0x0C].copy_from_slice(&now.to_le_bytes());
+        raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
+        raw[0x10..0x14].copy_from_slice(&now.to_le_bytes());
+        if inode_size >= 0x94 {
+            raw[0x90..0x94].copy_from_slice(&now.to_le_bytes());
+        }
+
+        use std::sync::atomic::{AtomicU32, Ordering};
+        static MKNOD_GEN: AtomicU32 = AtomicU32::new(1);
+        let generation = std::process::id().wrapping_add(MKNOD_GEN.fetch_add(1, Ordering::Relaxed));
+        raw[0x64..0x68].copy_from_slice(&generation.to_le_bytes());
+
+        if inode_size >= 0x82 + 2 {
+            raw[0x80..0x82].copy_from_slice(&32u16.to_le_bytes());
+        }
+
+        if self.csum.enabled {
+            if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, &raw) {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        Ok(raw)
+    }
+
     /// Create a symbolic link at `linkpath` whose target is `target`.
     /// Mirrors POSIX `symlink(target, linkpath)`: allocates a fresh inode
     /// with mode S_IFLNK, installs the target bytes, and adds a dir entry
@@ -4352,7 +4498,10 @@ impl Filesystem {
             data_plan.bgd.free_inodes_delta,
             data_plan.bgd.used_dirs_delta,
         )?;
-        self.patch_sb_counters(data_plan.sb.free_blocks_delta, data_plan.sb.free_inodes_delta)?;
+        self.patch_sb_counters(
+            data_plan.sb.free_blocks_delta,
+            data_plan.sb.free_inodes_delta,
+        )?;
 
         let reader = FsBlockReader { fs: self };
         let mut meta_block_count: u64 = 0;
@@ -4405,13 +4554,12 @@ impl Filesystem {
         // Patch inode: root bytes, size (+1 data block), i_blocks.
         Self::patch_inode_block_area(parent_raw, &deep_plan.new_root)?;
         let new_size = parent_inode.size + bs_u64;
-        let new_blocks =
-            parent_inode.blocks + (bs_u64 / 512) * (1 + meta_block_count);
+        let new_blocks = parent_inode.blocks + (bs_u64 / 512) * (1 + meta_block_count);
         Self::patch_inode_size_and_blocks(parent_raw, new_size, new_blocks)?;
         if self.csum.enabled {
-            if let Some((lo, hi)) = self
-                .csum
-                .compute_inode_checksum(parent_ino, parent_inode.generation, parent_raw)
+            if let Some((lo, hi)) =
+                self.csum
+                    .compute_inode_checksum(parent_ino, parent_inode.generation, parent_raw)
             {
                 parent_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
                 if parent_raw.len() >= 0x84 {
@@ -4441,8 +4589,7 @@ impl Filesystem {
             block[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes());
             block[end - 6] = 0;
             block[end - 5] = 0xDE;
-            let mut c =
-                crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
+            let mut c = crate::checksum::linux_crc32c(self.csum.seed, &parent_ino.to_le_bytes());
             c = crate::checksum::linux_crc32c(c, &parent_inode.generation.to_le_bytes());
             c = crate::checksum::linux_crc32c(c, &block[..end - 12]);
             block[end - 4..end].copy_from_slice(&c.to_le_bytes());

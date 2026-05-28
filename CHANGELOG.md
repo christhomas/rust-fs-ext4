@@ -22,6 +22,17 @@
   vs 'Ñ', 'ß' vs 'ss') in CASEFOLD-enabled directories to miss the htree
   entry and silently fail to find the file.
 
+- **`fs_ext4_mknod`** — New C API function to create special files: FIFOs,
+  Unix domain sockets, character devices, and block devices. Mirrors POSIX
+  `mknod(2)`; accepts `mode` with type bits (S_IFIFO=0x1000, S_IFSOCK=0xC000,
+  S_IFCHR=0x2000, S_IFBLK=0x6000) plus permission bits, and `major`/`minor`
+  device numbers (0 for FIFOs and sockets). Device numbers encoded using both
+  old format (i_block[0]) and new format (i_block[1]) for maximum
+  compatibility.
+
+- **`fs_ext4_set_flags`** — New C API function to update the `i_flags` word
+  (FS_IOC_SETFLAGS) on any path. Bumps i_ctime on write.
+
 - **`fs_ext4_attr_t` extended** — Seven new fields appended at the end of the
   struct (ABI-compatible for consumers that zero-initialise):
   - `atime_nsec`, `mtime_nsec`, `ctime_nsec`, `crtime_nsec` — sub-second

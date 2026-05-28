@@ -2094,6 +2094,43 @@ pub unsafe extern "C" fn fs_ext4_chown(
     )
 }
 
+/// Create a special file: FIFO, socket, or character/block device.
+///
+/// `mode` must include the file-type bits plus permission bits, e.g.:
+///   `0x1000 | 0644` for a FIFO (S_IFIFO), `0xC000 | 0666` for a socket,
+///   `0x2000 | 0660` for a char device, `0x6000 | 0660` for a block device.
+///
+/// `major` / `minor` are device numbers for char/block devices; pass 0 for
+/// FIFOs and sockets. Returns the new inode number on success, 0 on failure.
+#[no_mangle]
+pub unsafe extern "C" fn fs_ext4_mknod(
+    fs: *mut fs_ext4_fs_t,
+    path: *const c_char,
+    mode: u16,
+    major: u32,
+    minor: u32,
+) -> u32 {
+    ffi_guard(
+        0u32,
+        AssertUnwindSafe(|| {
+            clear_last_error();
+            if fs.is_null() || path.is_null() {
+                set_err_msg("null fs/path", EINVAL);
+                return 0u32;
+            }
+            let fs_ref = &(*fs).fs;
+            let path_str = cstr_to_str(path);
+            match fs_ref.apply_mknod(path_str, mode, major, minor) {
+                Ok(ino) => ino,
+                Err(e) => {
+                    set_err_from(&e, &format!("mknod {path_str}"));
+                    0u32
+                }
+            }
+        }),
+    )
+}
+
 /// Set the `i_flags` word (FS_IOC_SETFLAGS) on `path`.
 ///
 /// `flags` is the full new flags value. Common flags:
