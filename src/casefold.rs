@@ -51,7 +51,13 @@ pub fn fold_name(name: &[u8]) -> Vec<u8> {
         Err(_) => {
             // Invalid UTF-8: ASCII-only fold so lookup is still deterministic.
             name.iter()
-                .map(|&b| if (0x41..=0x5A).contains(&b) { b + 0x20 } else { b })
+                .map(|&b| {
+                    if (0x41..=0x5A).contains(&b) {
+                        b + 0x20
+                    } else {
+                        b
+                    }
+                })
                 .collect()
         }
     }
@@ -168,7 +174,10 @@ mod tests {
         // The result is "n\u{0303}" (NFD form), same as folding 'ñ' (U+00F1).
         let folded_upper = fold_name("Ñ".as_bytes());
         let folded_lower = fold_name("ñ".as_bytes());
-        assert_eq!(folded_upper, folded_lower, "Ñ and ñ must produce the same hash input");
+        assert_eq!(
+            folded_upper, folded_lower,
+            "Ñ and ñ must produce the same hash input"
+        );
     }
 
     #[test]
