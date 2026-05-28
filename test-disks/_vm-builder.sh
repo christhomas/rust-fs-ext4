@@ -50,7 +50,10 @@ build_htree() {
     echo "[vm] $img"
     rm -f $img
     truncate -s 16M $img
+    # Fixed hash_seed makes the htree directory entry order deterministic
+    # across builds (mkfs.ext4 randomises it by default).
     mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum \
+        -E hash_seed=a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
         -L htree-vol $img
     mount -t ext4 -o loop $img /mnt/img
     mkdir -p /mnt/img/bigdir
@@ -208,13 +211,16 @@ build_whole_disk() {
     # GPT with one Linux-fs partition at LBA 2048, 32768 sectors.
     # sfdisk (util-linux) is required — busybox sfdisk lacks GPT support.
     printf 'label: gpt\nstart=2048, size=32768, type=L\n' | sfdisk $img >/dev/null
-    # Attach loop device with partition scanning (-P).
-    local loop
-    loop=$(losetup -f --show -P "$img")
+    # Use --offset/--sizelimit to map the partition area directly, avoiding
+    # the need for kernel partition device support (-P / /dev/loopNpM).
+    local offset sizelimit loop
+    offset=$((2048 * 512))
+    sizelimit=$((32768 * 512))
+    loop=$(losetup -f --show --offset "$offset" --sizelimit "$sizelimit" "$img")
     mkfs.ext4 -q -F -b 4096 \
         -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
-        -L wholedisk "${loop}p1"
-    mount "${loop}p1" /mnt/img
+        -L wholedisk "$loop"
+    mount -t ext4 "$loop" /mnt/img
     echo 'whole disk test' > /mnt/img/test.txt
     mkdir -p /mnt/img/subdir
     echo 'nested' > /mnt/img/subdir/nested.txt

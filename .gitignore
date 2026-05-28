@@ -13,6 +13,8 @@ Cargo.lock.bak
 
 # Test artifacts
 test-disks/*.img
+test-disks/[0-9]*/
+test-disks/test-run/
 !test-disks/.gitkeep
 
 # Cross-validator scratch areas (lwext4 source tree, Vagrant per-VM state).

@@ -66,6 +66,11 @@ LIBFDISK_APK="libfdisk-2.40.4-r1.apk"
 LIBSMARTCOLS_APK="libsmartcols-2.40.4-r1.apk"
 LIBNCURSESW_APK="libncursesw-6.5_p20241006-r3.apk"
 NCURSES_TERMINFO_APK="ncurses-terminfo-base-6.5_p20241006-r3.apk"
+# openssh for server mode sshd — pre-downloaded so no network needed at boot.
+# libcrypto3 and zlib are already present (alpine-base dependency chain).
+OPENSSH_SERVER_APK="openssh-server-9.9_p2-r0.apk"
+OPENSSH_SERVER_COMMON_APK="openssh-server-common-9.9_p2-r0.apk"
+OPENSSH_KEYGEN_APK="openssh-keygen-9.9_p2-r0.apk"
 
 download_if_missing() {
     local url="$1" out="$2"
@@ -96,6 +101,9 @@ download_if_missing "$ALPINE_MAIN/$LIBFDISK_APK"      "$CACHE/extra-apks/$LIBFDI
 download_if_missing "$ALPINE_MAIN/$LIBSMARTCOLS_APK"  "$CACHE/extra-apks/$LIBSMARTCOLS_APK"
 download_if_missing "$ALPINE_MAIN/$LIBNCURSESW_APK"   "$CACHE/extra-apks/$LIBNCURSESW_APK"
 download_if_missing "$ALPINE_MAIN/$NCURSES_TERMINFO_APK" "$CACHE/extra-apks/$NCURSES_TERMINFO_APK"
+download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_APK"        "$CACHE/extra-apks/$OPENSSH_SERVER_APK"
+download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_COMMON_APK" "$CACHE/extra-apks/$OPENSSH_SERVER_COMMON_APK"
+download_if_missing "$ALPINE_MAIN/$OPENSSH_KEYGEN_APK"        "$CACHE/extra-apks/$OPENSSH_KEYGEN_APK"
 
 # ---------------------------------------------------------------------------
 # Step 2 (server mode only) — generate SSH keypair for builder VM access.
@@ -138,8 +146,11 @@ cat > "$OVL_TMP/etc/apk/repositories" <<'REPO_EOF'
 REPO_EOF
 
 if [[ "$SERVER_MODE" == "1" ]]; then
-    # Server mode: mount 9p, install attr/acl + openssh (from CDN via
-    # qemu user networking), set up sshd for root login, stay running.
+    # Server mode: mount 9p, extract all extra-apks (includes openssh +
+    # sfdisk/losetup), set up sshd for root login, stay running.
+    # Two 9p shares:
+    #   host  → SERVER_IMAGE_DIR (where finished images land)
+    #   cache → CACHE (.vm-cache: APKs, builder-key, ready signal)
     cat > "$OVL_TMP/etc/local.d/99-ext4.start" <<'WRAPPER_EOF'
 #!/bin/sh
 exec > /dev/console 2>&1
@@ -147,42 +158,45 @@ echo "=== [vm] server mode starting ==="
 
 modprobe 9p 9pnet 9pnet_virtio loop 2>/dev/null || true
 
-mkdir -p /host
+mkdir -p /host /cache
 if ! mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host; then
-    echo "=== [vm] 9p mount failed — aborting ==="
+    echo "=== [vm] 9p mount (host) failed — aborting ==="
+    poweroff -f
+fi
+if ! mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 cache /cache; then
+    echo "=== [vm] 9p mount (cache) failed — aborting ==="
     poweroff -f
 fi
 echo "=== [vm] /host mounted ==="
 
-# attr + acl from 9p share (same as batch mode).
-for pkg in /host/.vm-cache/extra-apks/*.apk; do
+# Extract all extra-apks: attr, acl, sfdisk, losetup, openssh, etc.
+for pkg in /cache/extra-apks/*.apk; do
     tar -xzf "$pkg" -C / --exclude=.PKGINFO --exclude='.SIGN.*' \
         --exclude=.pre-install --exclude=.post-install \
         --exclude=.pre-upgrade --exclude=.post-upgrade 2>/dev/null || true
 done
 
-# Bring up network (qemu SLIRP provides DHCP + DNS at 10.0.2.3).
+# Bring up network so sshd binds to the SLIRP interface (10.0.2.15).
 ip link set eth0 up 2>/dev/null || true
 udhcpc -i eth0 -t 10 -T 1 -q 2>/dev/null || true
-echo "nameserver 10.0.2.3" > /etc/resolv.conf
-
-# Install openssh from Alpine CDN.
-echo "https://dl-cdn.alpinelinux.org/alpine/v3.21/main" >> /etc/apk/repositories
-apk add --no-cache openssh-server openssh-keygen util-linux 2>/dev/null
 
 # Generate host keys + configure root access.
 ssh-keygen -A >/dev/null 2>&1
 mkdir -p /root/.ssh
 chmod 700 /root/.ssh
-cat /host/.vm-cache/builder-key.pub > /root/.ssh/authorized_keys
+cat /cache/builder-key.pub > /root/.ssh/authorized_keys
 chmod 600 /root/.ssh/authorized_keys
 echo "PermitRootLogin yes"            >> /etc/ssh/sshd_config
 echo "PasswordAuthentication no"      >> /etc/ssh/sshd_config
 echo "StrictModes no"                 >> /etc/ssh/sshd_config
 
+if [ ! -x /usr/sbin/sshd ]; then
+    echo "=== [vm] sshd not found — openssh not installed ==="
+    poweroff -f
+fi
 /usr/sbin/sshd
 echo "=== [vm] sshd ready ==="
-touch /host/.vm-cache/server-ready
+touch /cache/server-ready
 WRAPPER_EOF
 else
     # Batch mode: run builder then power off (original behaviour).
@@ -240,6 +254,16 @@ if [[ "$SERVER_MODE" == "1" ]]; then
     EXT4_BUILDER_PORT="${EXT4_BUILDER_PORT:-2222}"
     rm -f "$CACHE/server-ready" "$CACHE/server.env"
 
+    # In server mode the 9p share must point at HOST_IMAGE_DIR (where the
+    # harness expects to find finished images) rather than SCRIPT_DIR.
+    # HOST_IMAGE_DIR is exported by run-matrix.sh after reading .test-env.
+    # Default to SCRIPT_DIR only when running standalone (outside the harness).
+    SERVER_IMAGE_DIR="${HOST_IMAGE_DIR:-$SCRIPT_DIR}"
+    mkdir -p "$SERVER_IMAGE_DIR"
+
+    # Make _vm-builder.sh accessible inside the VM via the 9p share.
+    cp "$SCRIPT_DIR/_vm-builder.sh" "$SERVER_IMAGE_DIR/_vm-builder.sh"
+
     echo "[host] starting Alpine builder VM (SSH on localhost:${EXT4_BUILDER_PORT})..."
     qemu-system-x86_64 \
         -kernel "$CACHE/vmlinuz-virt" \
@@ -247,14 +271,15 @@ if [[ "$SERVER_MODE" == "1" ]]; then
         -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
         -drive file="$CACHE/alpine-virt.iso",media=cdrom,readonly=on,if=ide,index=0 \
         -drive file="$CACHE/ovl.iso",media=cdrom,readonly=on,if=ide,index=1 \
-        -virtfs local,path="$SCRIPT_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
+        -virtfs local,path="$SERVER_IMAGE_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
+        -virtfs local,path="$CACHE",mount_tag=cache,security_model=mapped-xattr,id=cache \
         -netdev "user,id=net0,hostfwd=tcp::${EXT4_BUILDER_PORT}-:22" \
         -device virtio-net-pci,netdev=net0 \
         -m 1024 \
         -smp 2 \
         -nographic \
         -no-reboot \
-        > "$CACHE/server-boot.log" 2>&1 &
+        &
 
     QEMU_PID=$!
 
@@ -266,8 +291,7 @@ if [[ "$SERVER_MODE" == "1" ]]; then
             break
         fi
         if ! kill -0 "$QEMU_PID" 2>/dev/null; then
-            echo "[host] qemu exited unexpectedly. Boot log:" >&2
-            tail -n 40 "$CACHE/server-boot.log" >&2 || true
+            echo "[host] qemu exited unexpectedly" >&2
             exit 1
         fi
         sleep 1
@@ -275,8 +299,7 @@ if [[ "$SERVER_MODE" == "1" ]]; then
     done
 
     if [[ ! -f "$CACHE/server-ready" ]]; then
-        echo "[host] timed out waiting for sshd. Boot log:" >&2
-        tail -n 40 "$CACHE/server-boot.log" >&2 || true
+        echo "[host] timed out waiting for sshd" >&2
         kill "$QEMU_PID" 2>/dev/null || true
         exit 1
     fi
