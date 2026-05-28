@@ -4475,7 +4475,28 @@ impl Filesystem {
             });
         }
 
-        let muts = crate::extent_mut::plan_insert_extent(&leaf, new_extent)?;
+        let muts = match crate::extent_mut::plan_insert_extent(&leaf, new_extent) {
+            Ok(muts) => muts,
+            Err(Error::CorruptExtentTree(msg)) if msg.contains("LEAF_FULL_NEEDS_PROMOTION") => {
+                // The single depth-1 leaf is full (≥340 extents in a 4 KiB block
+                // with csum). Fall back to the deep path, which handles adding a
+                // sibling leaf or promoting to depth 2. The data block hasn't
+                // been committed yet, so pass `plan` unchanged.
+                return self.extend_dir_and_add_entry_deep(
+                    parent_ino,
+                    parent_inode,
+                    parent_raw,
+                    name,
+                    target_ino,
+                    file_type,
+                    has_ft,
+                    new_phys,
+                    new_extent,
+                    plan,
+                );
+            }
+            Err(e) => return Err(e),
+        };
         let new_leaf = muts
             .into_iter()
             .find_map(|m| match m {
