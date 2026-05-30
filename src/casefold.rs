@@ -14,8 +14,9 @@
 //!
 //! 1. Decode UTF-8 → codepoints (invalid sequences fall back to ASCII fold).
 //! 2. NFD-decompose with the `unicode-normalization` crate.
-//! 3. Case-fold each decomposed char with `char::to_lowercase()` (Unicode
-//!    full case fold, which is a superset of simple case fold).
+//! 3. Apply Unicode full case fold with the `caseless` crate
+//!    (`caseless::default_case_fold_str`). `char::to_lowercase()` is not
+//!    used — it is simple lowercase, not full case fold (e.g. ß → "ss").
 //! 4. Re-encode as UTF-8. The result is what SipHash-2-4 hashes.
 //!
 //! This matches the kernel for the overwhelming majority of real filenames.
