@@ -17,8 +17,18 @@ set -eu
 # the image types to build (same as before). Accepting an output dir
 # lets the persistent-VM caller write images into per-run subdirectories:
 #   sh /host/_vm-builder.sh /host/{run_id} basic
-OUTPUT_DIR="${1:-/host}"
-shift 2>/dev/null || true
+# Distinguish a directory path from a target name: if $1 looks like a
+# known target (or is empty), treat it as a target and leave OUTPUT_DIR
+# as the default; otherwise treat it as the output directory and shift.
+case "${1:-}" in
+    ""|basic|htree|csum_seed|no_csum|deep_extents|inline|xattr|acl|largedir|manyfiles|whole_disk)
+        OUTPUT_DIR=/host
+        ;;
+    *)
+        OUTPUT_DIR=$1
+        shift
+        ;;
+esac
 mkdir -p "$OUTPUT_DIR"
 cd "$OUTPUT_DIR"
 
