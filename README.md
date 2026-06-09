@@ -22,9 +22,8 @@ against; write is journaled through JBD2 and crash-safe under
 fault-injection sweeps for every multi-block op the driver
 exposes. Specific gaps are listed under "What doesn't work" below.
 
-- Extensive automated suite — hundreds of lib unit tests plus
-  hundreds of integration tests across ~100 test binaries
-  (`cargo test --release`).
+- 700+ automated tests — 200+ lib unit tests and 450+ integration
+  tests across ~100 test binaries (`cargo test --release`).
 - All 15 multi-block write ops (`5.2.1`–`5.2.15` of the write-support
   plan) committed atomically through the JBD2 writer with explicit
   crash-safety sweeps.
