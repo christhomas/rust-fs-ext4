@@ -13,7 +13,7 @@ env:
   # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
   # during local build/verify. Bump in lockstep with the am-fs-core version
   # constraint in Cargo.toml when releasing a new fs-ext4 minor.
-  FS_CORE_REF: v0.2.0
+  FS_CORE_REF: v0.2.2
 
 jobs:
   test:
@@ -84,12 +84,10 @@ jobs:
       - name: cargo publish
         env:
           CARGO_REGISTRY_TOKEN: ${{ steps.auth.outputs.token }}
-        # `--locked` makes cargo refuse to silently update Cargo.lock
-        # during publish-verify. If the lockfile committed at the tag
-        # doesn't match the resolver's view of the current index +
-        # path-pinned siblings, the job fails loudly here rather than
-        # publishing a divergent artifact. Discipline: any time
-        # Cargo.toml's `version` changes, regenerate the lockfile
-        # (`cargo update --workspace`) and commit it in the same
-        # release prep.
-        run: cargo publish --locked
+        # No `--locked`: publish must rewrite the `am-fs-core` path
+        # dependency into its registry equivalent in the packaged
+        # lockfile, which `--locked` forbids ("cannot update the lock
+        # file"). The verify-build resolves am-fs-core from crates.io
+        # via the `version` constraint, so the published artifact is
+        # pinned by that constraint, not by the local path checkout.
+        run: cargo publish
