@@ -5,8 +5,9 @@ formats. Mounts disk images and block devices, journals writes
 through JBD2, replays the journal on dirty mounts, and exposes a
 stable C ABI (`fs_ext4_*`) so any FFI host (Swift/C/C++/Go/…) can
 link `libfs_ext4.a` and `#include "fs_ext4.h"`. MIT-licensed. Zero
-kernel calls; zero non-MIT/BSD/Apache dependencies; the only
-runtime crates are `crc32c` and `bitflags`.
+kernel calls; zero non-MIT/BSD/Apache dependencies. Runtime crates
+are `crc32c`, `bitflags`, `unicode-normalization` and `caseless`
+(casefold), plus the sister `am-fs-core` block-device crate.
 
 Designed for FFI: the C ABI is stable and the static library has no
 host-specific assumptions, so the same `libfs_ext4.a` works equally
@@ -21,8 +22,9 @@ against; write is journaled through JBD2 and crash-safe under
 fault-injection sweeps for every multi-block op the driver
 exposes. Specific gaps are listed under "What doesn't work" below.
 
-- 814 tests passing — 186 lib unit tests + 628 integration tests
-  across 95 test binaries.
+- Extensive automated suite — hundreds of lib unit tests plus
+  hundreds of integration tests across ~100 test binaries
+  (`cargo test --release`).
 - All 15 multi-block write ops (`5.2.1`–`5.2.15` of the write-support
   plan) committed atomically through the JBD2 writer with explicit
   crash-safety sweeps.
@@ -114,8 +116,8 @@ Per-operation, on a clean image:
   `fallocate(ZERO_RANGE)`.
 - `audit` (read-only fsck — link counts, dangling entries).
 - `fsck_run` (callback-mode audit exposed through the C ABI).
-- `format_filesystem` (in-process `mkfs` — same entry FFI hosts
-  call when the user formats a fresh volume).
+- `format_filesystem` (in-process `mkfs`; the C-ABI entry FFI hosts
+  call to format a fresh volume is `fs_ext4_mkfs`).
 
 ## What doesn't work
 
@@ -209,14 +211,14 @@ credited in the License section.
 
 ## Test contract
 
-- **Lib unit tests:** 186 across 36 modules
+- **Lib unit tests:** across most modules
   (`alloc`, `bgd`, `block_cache`, `block_io`, `casefold`,
   `checksum`, `dir`, `extent`, `extent_mut`, `features`, `fs`,
   `hash`, `htree`, `htree_mut`, `indirect`, `indirect_mut`,
   `inline_data`, `inode`, `jbd2`, `journal_apply`,
   `journal_writer`, `mkfs`, `path`, `superblock`, `transaction`,
   `verify`, `xattr`, …).
-- **Integration tests:** 628 across 95 test binaries in `tests/`,
+- **Integration tests:** ~100 test binaries in `tests/`,
   covering every C ABI entry point, end-to-end mutation
   round-trips, journaled-path regressions, htree large-dir
   growth, ACL parse, large-dir HTree, deep-extent reads,
@@ -432,7 +434,7 @@ See `examples/capi_demo.rs` for the Rust-side equivalent.
 
 ```toml
 [dependencies]
-fs-ext4 = "0.1"
+fs-ext4 = "0.3"
 ```
 
 ```rust
