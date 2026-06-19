@@ -42,17 +42,18 @@
 //! - No batching across calls. Every commit checkpoints immediately, so
 //!   the journal only ever holds one transaction at rest. This is
 //!   correctness-first; ring-style batching is a Phase 8 perf concern.
-//! - The JBD2 superblock checksum (v2-only field at 0xFC) is left intact
-//!   from mount time. Our code only mutates `s_start` + `s_sequence`,
-//!   neither of which the kernel rechecksums on mount, so this is safe in
-//!   practice. A formal `verify_jsb` would catch the staleness; we don't
-//!   ship one yet.
+//! - The JBD2 superblock checksum (`s_checksum` at 0xFC) is recomputed by
+//!   `write_jsb` whenever the journal is checksummed (CSUM_V2/V3), because we
+//!   mutate `s_start` + `s_sequence` on every commit. A real Linux kernel AND
+//!   `e2fsck` REFUSE a checksummed journal whose superblock checksum is stale
+//!   ("Journal superblock is corrupt"), so leaving it unrecomputed bricks the
+//!   fs on the next mount. v1 journals have no such field and are untouched.
 
 use crate::block_io::BlockDevice;
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use crate::inode::Inode;
-use crate::jbd2::{self, JournalSuperblock, JBD2_MAGIC_NUMBER, JBD2_SUPERBLOCK_V2};
+use crate::jbd2::{self, JournalSuperblock, JBD2_MAGIC_NUMBER};
 use crate::transaction::Transaction;
 
 /// Owns the live-write side of the JBD2 journal. Built once at mount time
@@ -234,13 +235,19 @@ impl JournalWriter {
         buf[0x18..0x1C].copy_from_slice(&self.jsb.sequence.to_be_bytes());
         buf[0x1C..0x20].copy_from_slice(&self.jsb.start.to_be_bytes());
 
-        // V2 superblocks carry s_checksum at 0xFC. We don't recompute it
-        // here — the kernel does NOT verify the JSB checksum on mount;
-        // a userspace consistency-checker would warn but not refuse.
-        // Phase 5 may patch this once we wire JSB checksums end-to-end.
-        // For now leave the existing bytes (best-effort: it'll mismatch
-        // but not block).
-        let _ = JBD2_SUPERBLOCK_V2; // silence unused import warning
+        // Recompute the JBD2 superblock checksum (s_checksum at 0xFC) when the
+        // journal is checksummed (CSUM_V2/V3). It covers the whole 1024-byte
+        // journal_superblock_t with s_checksum zeroed, seeded ~0 — the journal
+        // is self-contained, so this is NOT the fs metadata_csum seed. Leaving
+        // it stale after mutating s_start/s_sequence makes a real kernel and
+        // e2fsck refuse the journal ("Journal superblock is corrupt"). v1
+        // journals carry no such field; their bytes are left intact.
+        if self.jsb.uses_csum_v2_or_v3() {
+            const JSB_LEN: usize = 1024; // sizeof(journal_superblock_t)
+            buf[0xFC..0x100].copy_from_slice(&0u32.to_be_bytes());
+            let csum = crate::checksum::linux_crc32c(!0, &buf[..JSB_LEN]);
+            buf[0xFC..0x100].copy_from_slice(&csum.to_be_bytes());
+        }
 
         dev.write_at(phys * bs_u64, &buf)?;
         Ok(())
