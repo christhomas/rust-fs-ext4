@@ -3417,24 +3417,17 @@ impl Filesystem {
         free_blocks_delta: i64,
         free_inodes_delta: i32,
     ) -> Result<()> {
-        let mut sb_raw = self.sb.raw.clone();
-        // s_free_inodes_count at 0x10..0x14
-        let fi = u32::from_le_bytes(sb_raw[0x10..0x14].try_into().unwrap()) as i64;
-        let fi_new = (fi + free_inodes_delta as i64).max(0) as u32;
-        sb_raw[0x10..0x14].copy_from_slice(&fi_new.to_le_bytes());
-        // s_free_blocks_count split lo (0x0C..0x10, u32) + hi (0x158..0x15C, u32)
-        let lo = u32::from_le_bytes(sb_raw[0x0C..0x10].try_into().unwrap()) as u64;
-        let hi = u32::from_le_bytes(sb_raw[0x158..0x15C].try_into().unwrap()) as u64;
-        let cur = ((hi << 32) | lo) as i64;
-        let new = (cur + free_blocks_delta).max(0) as u64;
-        sb_raw[0x0C..0x10].copy_from_slice(&(new as u32).to_le_bytes());
-        sb_raw[0x158..0x15C].copy_from_slice(&((new >> 32) as u32).to_le_bytes());
-        if self.csum.enabled {
-            let csum = crate::checksum::linux_crc32c(!0, &sb_raw[..0x3FC]);
-            sb_raw[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
-        }
-        self.dev
-            .write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb_raw)?;
+        // Route through the cache-coherent buffer path (which reads the SB via
+        // read_block) so consecutive ops accumulate against the CURRENT
+        // on-disk superblock. The old body re-read the immutable mount-time
+        // snapshot `self.sb.raw` every call, so within a single mount each
+        // call rewrote the SB from mount-time values — a sequence of
+        // frees/allocs clobbered each other (e.g. directory growth froze
+        // free_blocks at mount-1 and reset free_inodes, which e2fsck flags as
+        // "Free blocks/inodes count wrong").
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+        self.buffer_patch_sb_counters(&mut buf, free_blocks_delta, free_inodes_delta)?;
+        self.commit_block_buffer(buf)?;
         Ok(())
     }
 
@@ -3487,35 +3480,6 @@ impl Filesystem {
             self.patch_bgd_counters(gi, len as i32, 0, 0)?;
         }
         Ok(len)
-    }
-
-    /// Mark a physical-block run `[start, start+len)` as USED in the
-    /// containing group's block bitmap. Inverse of [`free_block_run`].
-    /// Assumes the run is within one block group (allocator contract).
-    fn mark_block_run_used(&self, start: u64, len: u64) -> Result<()> {
-        let bpg = self.sb.blocks_per_group as u64;
-        let first_data = self.sb.first_data_block as u64;
-        let gi = ((start - first_data) / bpg) as usize;
-        if gi >= self.groups.len() {
-            return Err(Error::InvalidBlock(start));
-        }
-        let group_start = first_data + gi as u64 * bpg;
-        let bit_start = (start - group_start) as u32;
-        let bitmap_block = self.groups[gi].block_bitmap;
-
-        let bs = self.sb.block_size() as u64;
-        let mut buf = vec![0u8; bs as usize];
-        self.dev.read_at(bitmap_block * bs, &mut buf)?;
-        for i in 0..len {
-            let bit = bit_start as u64 + i;
-            let byte = (bit / 8) as usize;
-            let mask = 1u8 << (bit % 8);
-            if byte < buf.len() {
-                buf[byte] |= mask;
-            }
-        }
-        self.dev.write_at(bitmap_block * bs, &buf)?;
-        Ok(())
     }
 
     // -----------------------------------------------------------------------
@@ -4279,6 +4243,35 @@ impl Filesystem {
     /// image (size +block_size, +1 extent, recomputed CSUM). Assumes the
     /// parent's inline extent root still has a free slot (the common case
     /// until htree promotion lands).
+    /// Mark a freshly-allocated single block used and apply its BGD + SB
+    /// free-count deltas in one cache-coherent transaction. Routes through
+    /// `buffer_mark_block_run_used`, which refreshes the block-bitmap
+    /// checksum — the bare `mark_block_run_used` + `patch_*_counters` sequence
+    /// the directory-grow path used to run left that csum stale, so e2fsck
+    /// reported "block bitmap does not match checksum" once a directory grew a
+    /// block (and on 1 KiB images, where dirs grow at far fewer entries).
+    fn commit_dir_block_alloc(
+        &self,
+        phys: u64,
+        plan: &crate::alloc::BlockAllocationPlan,
+    ) -> Result<()> {
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+        self.buffer_mark_block_run_used(&mut buf, phys, 1)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.buffer_patch_sb_counters(
+            &mut buf,
+            plan.sb.free_blocks_delta,
+            plan.sb.free_inodes_delta,
+        )?;
+        self.commit_block_buffer(buf)
+    }
+
     fn extend_dir_and_add_entry(
         &self,
         parent_ino: u32,
@@ -4370,14 +4363,7 @@ impl Filesystem {
                 Err(Error::CorruptExtentTree(msg)) if msg.contains("LEAF_FULL_NEEDS_PROMOTION") => {
                     // Commit the data-block allocation NOW so the next plan picks
                     // a different run (plan_block_allocation reads the bitmap).
-                    self.mark_block_run_used(new_phys, 1)?;
-                    self.patch_bgd_counters(
-                        plan.bgd.group_idx as usize,
-                        plan.bgd.free_blocks_delta,
-                        plan.bgd.free_inodes_delta,
-                        plan.bgd.used_dirs_delta,
-                    )?;
-                    self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+                    self.commit_dir_block_alloc(new_phys, &plan)?;
 
                     // Second allocation: the leaf node block.
                     let mut reader2 = |block: u64| -> Result<Vec<u8>> {
@@ -4469,26 +4455,9 @@ impl Filesystem {
         //    commit the leaf-node allocation. On the simple path we commit the
         //    data block as usual.
         if let Some(meta_plan) = leaf_meta_alloc {
-            self.mark_block_run_used(meta_plan.first_block, 1)?;
-            self.patch_bgd_counters(
-                meta_plan.bgd.group_idx as usize,
-                meta_plan.bgd.free_blocks_delta,
-                meta_plan.bgd.free_inodes_delta,
-                meta_plan.bgd.used_dirs_delta,
-            )?;
-            self.patch_sb_counters(
-                meta_plan.sb.free_blocks_delta,
-                meta_plan.sb.free_inodes_delta,
-            )?;
+            self.commit_dir_block_alloc(meta_plan.first_block, &meta_plan)?;
         } else {
-            self.mark_block_run_used(new_phys, 1)?;
-            self.patch_bgd_counters(
-                plan.bgd.group_idx as usize,
-                plan.bgd.free_blocks_delta,
-                plan.bgd.free_inodes_delta,
-                plan.bgd.used_dirs_delta,
-            )?;
-            self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+            self.commit_dir_block_alloc(new_phys, &plan)?;
         }
 
         Ok(())
@@ -4778,14 +4747,7 @@ impl Filesystem {
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
         // Commit data-block allocation.
-        self.mark_block_run_used(new_phys, 1)?;
-        self.patch_bgd_counters(
-            plan.bgd.group_idx as usize,
-            plan.bgd.free_blocks_delta,
-            plan.bgd.free_inodes_delta,
-            plan.bgd.used_dirs_delta,
-        )?;
-        self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        self.commit_dir_block_alloc(new_phys, &plan)?;
 
         Ok(())
     }
