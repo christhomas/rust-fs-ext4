@@ -289,3 +289,24 @@ fn op_slow_symlink_unlink() {
     }
     done(&p, "slow_symlink_unlink");
 }
+
+#[test]
+fn op_fragmented_extent_tree() {
+    let Some(p) = copy("frag_extents") else {
+        return;
+    };
+    {
+        let fs = rw(&p);
+        fs.apply_create("/frag", 0o644).expect("create");
+        // Logically-gapped single-block writes → many separate extents. >4
+        // extents overflow the 4 inline slots in the inode's i_block and spill
+        // to an external extent block (tree depth >= 1), whose ext4_extent_tail
+        // checksum must be computed on write. All our other files are
+        // single-extent, so this is the only test that exercises that path.
+        for i in 0..16u64 {
+            fs.apply_pwrite("/frag", i * 8192, b"x")
+                .unwrap_or_else(|e| panic!("pwrite gap {i}: {e:?}"));
+        }
+    }
+    done(&p, "frag_extents");
+}
