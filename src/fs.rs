@@ -2866,6 +2866,28 @@ impl Filesystem {
         let first_lb = offset / bs;
         let last_lb_excl = end.div_ceil(bs);
 
+        // A single pwrite journals all its data blocks plus the inode/bitmap/
+        // BGD/SB metadata in ONE transaction, whose descriptor block holds only
+        // ~(block_size - 12)/16 tags. A write spanning more than that overflows
+        // it ("descriptor block overflow"). Split large writes into block-
+        // aligned chunks that each fit one transaction; every chunk commits
+        // atomically (POSIX pwrite is not atomic across a large range anyway).
+        let tags_per_desc = (bs_usize.saturating_sub(12)) / 16;
+        let max_data_blocks = tags_per_desc.saturating_sub(8).max(1) as u64;
+        let max_chunk = max_data_blocks * bs;
+        if len > max_chunk {
+            let mut chunk_off = 0u64;
+            while chunk_off < len {
+                let take = max_chunk.min(len - chunk_off);
+                let s = chunk_off as usize;
+                let e = (chunk_off + take) as usize;
+                self.apply_pwrite(path, offset + chunk_off, &data[s..e])?;
+                chunk_off += take;
+            }
+            let (after, _) = self.read_inode_verified(ino)?;
+            return Ok(after.size);
+        }
+
         // Working copy of the 60-byte inline extent root. Updated in place
         // as we insert extents for each unmapped run; patched into `raw`
         // once at the end.

@@ -231,14 +231,13 @@ fn op_large_file_extents() {
     {
         let fs = rw(&p);
         fs.apply_create("/lf", 0o644).expect("create");
-        // 240 KiB (60 blocks) — multi-block extent write. NOTE: a single
-        // pwrite large enough to journal > ~255 blocks (≈1 MiB) currently
-        // fails with "descriptor block overflow (too many tags)": the journal
-        // writer doesn't span multiple descriptor blocks per transaction. It's
-        // a SAFE abort (no corruption), and FSKit delivers writes in page-sized
-        // chunks in practice, so we stay under that limit here.
-        let data = vec![0xC3u8; 240 * 1024];
-        fs.apply_pwrite("/lf", 0, &data).expect("pwrite 240KiB");
+        // 2 MiB — larger than one journal transaction's descriptor capacity
+        // (~255 blocks), so apply_pwrite must split it into block-aligned
+        // chunks that each commit as their own transaction. Pre-fix this
+        // failed with "descriptor block overflow (too many tags)".
+        let data = vec![0xC3u8; 2 * 1024 * 1024];
+        let n = fs.apply_pwrite("/lf", 0, &data).expect("pwrite 2MiB");
+        assert_eq!(n, data.len() as u64, "short write");
     }
     done(&p, "large_file");
 }
