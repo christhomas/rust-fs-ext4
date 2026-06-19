@@ -549,6 +549,10 @@ fn encode_external_block(block: &mut [u8], entries: &[DecodedEntry], refcount: u
     let block_len = block.len();
     let mut entry_cursor: usize = 0x20;
     let mut value_cursor: usize = block_len;
+    // Fold each entry's e_hash into the block hash (h_hash). Mirrors the
+    // kernel's ext4_xattr_rehash: any zero entry hash forces h_hash = 0.
+    let mut block_hash: u32 = 0;
+    let mut any_zero_hash = false;
 
     for e in &sorted {
         let name_len = e.name_bytes.len();
@@ -563,6 +567,10 @@ fn encode_external_block(block: &mut [u8], entries: &[DecodedEntry], refcount: u
             value_cursor
         };
 
+        // External-block entries carry a real e_hash (over name + value); the
+        // kernel and e2fsck reject a zero hash ("has a hash (0) which is invalid").
+        let e_hash = xattr_entry_hash(&e.name_bytes, &e.value);
+
         block[entry_cursor] = name_len as u8;
         block[entry_cursor + 1] = e.name_index;
         block[entry_cursor + 2..entry_cursor + 4]
@@ -570,11 +578,40 @@ fn encode_external_block(block: &mut [u8], entries: &[DecodedEntry], refcount: u
         // e_value_inum at +4..+8 = 0 (no EA_INODE)
         block[entry_cursor + 8..entry_cursor + 12]
             .copy_from_slice(&(e.value.len() as u32).to_le_bytes());
-        // e_hash at +12..+16 = 0
+        block[entry_cursor + 12..entry_cursor + 16].copy_from_slice(&e_hash.to_le_bytes());
         block[entry_cursor + 16..entry_cursor + 16 + name_len].copy_from_slice(&e.name_bytes);
         entry_cursor += entry_padded;
+
+        if e_hash == 0 {
+            any_zero_hash = true;
+        } else if !any_zero_hash {
+            block_hash = (block_hash << 16) ^ (block_hash >> 16) ^ e_hash;
+        }
     }
+    // h_hash (0x0C): zero if any entry hash was zero, else the folded value.
+    let h_hash = if any_zero_hash { 0 } else { block_hash };
+    block[0x0C..0x10].copy_from_slice(&h_hash.to_le_bytes());
     // Terminator already zero from the wipe.
+}
+
+/// ext4 xattr entry hash (`ext4_xattr_hash_entry`): a rolling hash over the
+/// name bytes (shift 5), then the value as little-endian 32-bit words (shift
+/// 16) with the final partial word zero-padded. External-block entries store
+/// this in `e_hash`; in-inode entries leave it zero.
+fn xattr_entry_hash(name: &[u8], value: &[u8]) -> u32 {
+    const NAME_SHIFT: u32 = 5;
+    const VALUE_SHIFT: u32 = 16;
+    let mut hash: u32 = 0;
+    for &b in name {
+        hash = (hash << NAME_SHIFT) ^ (hash >> (32 - NAME_SHIFT)) ^ (b as u32);
+    }
+    for chunk in value.chunks(4) {
+        let mut word = [0u8; 4];
+        word[..chunk.len()].copy_from_slice(chunk);
+        let v = u32::from_le_bytes(word);
+        hash = (hash << VALUE_SHIFT) ^ (hash >> (32 - VALUE_SHIFT)) ^ v;
+    }
+    hash
 }
 
 /// Set (create-or-replace) an xattr in an external block buffer.
