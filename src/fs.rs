@@ -1146,6 +1146,47 @@ impl Filesystem {
         if byte < bm.len() {
             bm[byte] |= mask;
         }
+
+        // Maintain bg_itable_unused: this inode is now in use, so the count of
+        // never-used inodes at the END of the group's table can be no larger
+        // than the inodes after this one. A stale value makes e2fsck and the
+        // kernel treat freshly-allocated inodes as unused ("references inode
+        // found in unused inodes area" / "invalid unused inodes count"). lo at
+        // 0x1C, hi at 0x32 (desc_size >= 64). The BGD checksum is recomputed so
+        // the change stands alone; the following counter patch recomputes it
+        // again harmlessly.
+        let floor = ipg.saturating_sub(bit as u32 + 1);
+        let bs = self.sb.block_size() as u64;
+        let desc_size = self.sb.desc_size as u64;
+        let bgt_first_block = self.sb.first_data_block as u64 + 1;
+        let byte_in_bgt = gi as u64 * desc_size;
+        let bgt_block = bgt_first_block + byte_in_bgt / bs;
+        let off = (byte_in_bgt % bs) as usize;
+        let has_hi = desc_size >= 0x40;
+        let block = buf.get_mut(self, bgt_block)?;
+        let cur_lo = u16::from_le_bytes(block[off + 0x1C..off + 0x1E].try_into().unwrap()) as u32;
+        let cur_hi = if has_hi {
+            u16::from_le_bytes(block[off + 0x32..off + 0x34].try_into().unwrap()) as u32
+        } else {
+            0
+        };
+        let cur = (cur_hi << 16) | cur_lo;
+        if floor < cur {
+            block[off + 0x1C..off + 0x1E].copy_from_slice(&((floor & 0xFFFF) as u16).to_le_bytes());
+            if has_hi {
+                block[off + 0x32..off + 0x34]
+                    .copy_from_slice(&(((floor >> 16) & 0xFFFF) as u16).to_le_bytes());
+            }
+            if self.csum.enabled {
+                let stored_at = off + 0x1E;
+                let end_desc = off + desc_size as usize;
+                block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
+                let seed = self.csum.seed;
+                let mut c = crate::checksum::linux_crc32c(seed, &(gi as u32).to_le_bytes());
+                c = crate::checksum::linux_crc32c(c, &block[off..end_desc]);
+                block[stored_at..stored_at + 2].copy_from_slice(&(c as u16).to_le_bytes());
+            }
+        }
         Ok(())
     }
 
