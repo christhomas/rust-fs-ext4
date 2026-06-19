@@ -1681,9 +1681,15 @@ impl Filesystem {
                     return Ok(());
                 }
                 crate::xattr::BlockRemoveOutcome::RemovedNowEmpty => {
-                    // Free the block + clear i_file_acl + decrement i_blocks.
-                    self.free_block_run_and_bgd(block_nr, 1)?;
-                    self.patch_sb_counters(1, 0)?;
+                    // Free the now-empty external block + clear i_file_acl + drop
+                    // i_blocks, all in one journaled transaction. The previous
+                    // direct path used free_block_run_and_bgd, which skipped the
+                    // block-bitmap checksum recompute and wrote a stale BGD —
+                    // corrupting the bitmap csum and the free counters. The
+                    // buffer helpers do it correctly and atomically.
+                    let mut buf = BlockBuffer::new(bs);
+                    self.buffer_free_block_run_and_bgd(&mut buf, block_nr, 1)?;
+                    self.buffer_patch_sb_counters(&mut buf, 1, 0)?;
                     raw[0x68..0x6C].copy_from_slice(&0u32.to_le_bytes());
                     if raw.len() >= 0x76 {
                         raw[0x74..0x76].copy_from_slice(&0u16.to_le_bytes());
@@ -1691,9 +1697,10 @@ impl Filesystem {
                     let sectors_per_block = bs_u64 / 512;
                     let new_blocks = inode.blocks.saturating_sub(sectors_per_block);
                     Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_blocks)?;
-                    self.bump_inode_ctime(ino, inode.generation, &mut raw)?;
-                    self.dev.flush()?;
-                    return Ok(());
+                    raw[0x0C..0x10].copy_from_slice(&now_unix_seconds().to_le_bytes());
+                    self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+                    self.buffer_write_inode(&mut buf, ino, &raw)?;
+                    return self.commit_block_buffer(buf);
                 }
                 crate::xattr::BlockRemoveOutcome::NotFound => { /* fall through */ }
             }
