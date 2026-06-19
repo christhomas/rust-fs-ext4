@@ -4877,6 +4877,19 @@ impl Filesystem {
         // SB: free_blocks_count += freed, free_inodes_count += 1.
         self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 1)?;
 
+        // Zero the freed directory inode body (mode/links -> 0, set dtime, keep
+        // the generation) so the slot no longer reads as a live directory.
+        // Without this the freed inode keeps S_IFDIR + its "." / ".." and
+        // e2fsck reports "unconnected directory inode", a stale ".." and bad
+        // refcounts — the same cleanup apply_unlink already does for files.
+        let inode_size = self.sb.inode_size as usize;
+        let mut target_raw = vec![0u8; inode_size];
+        let dtime = now_unix_seconds();
+        target_raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
+        target_raw[0x64..0x68].copy_from_slice(&target_inode.generation.to_le_bytes());
+        self.finalize_inode_raw(target_ino, target_inode.generation, &mut target_raw)?;
+        self.buffer_write_inode(&mut buf, target_ino, &target_raw)?;
+
         // Remove the entry from the parent directory.
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);
         let mut removed = false;
