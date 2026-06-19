@@ -223,14 +223,23 @@ pub fn format_filesystem_with_flavor(
     // BGD it CRCs over carries stale bitmap-csum slots.)
 
     // ----- Block bitmap (group 0) ------------------------------------------
-    // Bits 0..used_blocks are used (for ext3 this includes the journal
-    // data run; for ext2/ext4 it stops at root_dir_block).
+    // Block-bitmap bit `i` maps to absolute block (first_data_block + i), per
+    // the ext4 convention. For 1 KiB blocks first_data_block is 1, so the whole
+    // bitmap is shifted down one block relative to absolute numbering; indexing
+    // it by absolute block over-marks the tail by one block and skips the
+    // trailing pad bit (e2fsck flags both as "Free blocks count wrong" +
+    // "Padding at end of block bitmap is not set"). Work in bit space.
+    let fdb = first_data_block as u64;
     let mut block_bitmap = vec![0u8; block_size as usize];
-    set_bitmap_range(&mut block_bitmap, 0, used_blocks);
-    // Tail-pad: blocks past `blocks_count` (within the group's bitmap window)
-    // are flagged "used" so the allocator never tries them. blocks_per_group
+    // Metadata occupies absolute blocks [first_data_block, used_blocks) (for
+    // ext3 this includes the journal data run; for ext2/ext4 it stops at
+    // root_dir_block), i.e. bits [0, used_blocks - first_data_block).
+    set_bitmap_range(&mut block_bitmap, 0, used_blocks - fdb);
+    // Tail-pad: bits whose block (first_data_block + bit) is >= blocks_count
+    // are out of range and must read "used" so the allocator never tries them
+    // and the bitmap checksum matches what e2fsck recomputes. blocks_per_group
     // bits cover the bitmap's logical span.
-    set_bitmap_range(&mut block_bitmap, blocks_count, blocks_per_group as u64);
+    set_bitmap_range(&mut block_bitmap, blocks_count - fdb, blocks_per_group as u64);
 
     // ----- Inode bitmap (group 0) ------------------------------------------
     // ext4 inode numbers are 1-based; bit i = inode (i+1). e2fsprogs marks
