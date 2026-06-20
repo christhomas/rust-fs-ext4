@@ -75,16 +75,7 @@ pub fn format_filesystem_with_flavor(
     // metadata_csum, 32-byte BGDs) and ext4 (everything on) — same layout
     // as ext2 plus a journal inode + JBD2 log area at the head of the
     // data region.
-    let inode_size: u16 = match flavor {
-        FsFlavor::Ext2 | FsFlavor::Ext3 => 128,
-        FsFlavor::Ext4 => 256,
-    };
-    let desc_size: u16 = match flavor {
-        FsFlavor::Ext2 | FsFlavor::Ext3 => 32, // legacy 32-byte BGDs (no INCOMPAT_64BIT)
-        FsFlavor::Ext4 => 64,
-    };
-    let csum_enabled = matches!(flavor, FsFlavor::Ext4);
-    let dir_csum_tail: usize = if csum_enabled { 12 } else { 0 };
+    let (inode_size, desc_size, csum_enabled, dir_csum_tail) = flavor.geometry();
     // Journal sizing for ext3. JBD2's documented minimum is 1024 blocks;
     // we pick exactly that for fixture friendliness — at 1 KiB block_size
     // it's a 1 MiB journal that fits in our smallest-realistic test image.
