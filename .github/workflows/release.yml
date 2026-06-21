@@ -56,8 +56,8 @@ jobs:
       - name: generate test disks
         run: bash test-disks/build-ext4-feature-images.sh
 
-      - run: cargo test --all-targets
-      - run: cargo clippy --all-targets -- -D warnings
+      - run: cargo test --locked --all-targets
+      - run: cargo clippy --locked --all-targets -- -D warnings
 
   # Strict functional gate: build the mkfs_ext4 CLI, format an image, and
   # run the kernel's own fsck.ext4 (from e2fsprogs) against it. This is the

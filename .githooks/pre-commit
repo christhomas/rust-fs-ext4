@@ -21,6 +21,10 @@ set -euo pipefail
 
 cd "$(git rev-parse --show-toplevel)"
 
+# Refuse to commit unpinned dependencies (floating workflow clones, drifted
+# or missing Cargo.lock). Cheap, no sibling path-deps required.
+"$(git rev-parse --show-toplevel)/.githooks/check-deps-pinned.sh"
+
 echo "[pre-commit] cargo fmt --check"
 if ! cargo fmt --check; then
     echo
