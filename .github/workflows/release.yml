@@ -59,9 +59,60 @@ jobs:
       - run: cargo test --all-targets
       - run: cargo clippy --all-targets -- -D warnings
 
+  # Strict functional gate: build the mkfs_ext4 CLI, format an image, and
+  # run the kernel's own fsck.ext4 (from e2fsprogs) against it. This is the
+  # canonical "does Linux think this is a valid ext4 volume?" oracle —
+  # stricter than the crate's own read-path round-trip because it exercises
+  # every assertion in e2fsck's superblock + group-descriptor + inode-table
+  # validation, including metadata-csum. Publish is gated on this passing so
+  # a regression in the mkfs path can never ship to crates.io. Mirrors the
+  # validate-mkfs-bin job in ci.yml.
+  validate-fsck:
+    name: validate mkfs_ext4 (fsck.ext4 strict)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v5
+
+      - name: clone am-fs-core sibling
+        shell: bash
+        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          toolchain: 1.95.0
+      - uses: Swatinem/rust-cache@v2
+
+      - name: install e2fsprogs
+        run: |
+          sudo apt-get update -qq
+          sudo apt-get install -y -qq e2fsprogs
+
+      - name: build mkfs_ext4
+        run: cargo build --locked --release --bin mkfs_ext4
+
+      # 32 MiB is the v1 single-block-group cap. Keep it as the smoke
+      # test target and add a larger one once multi-group lands.
+      - name: format 32 MiB image and validate with fsck.ext4
+        run: |
+          truncate -s 32M /tmp/out.img
+          ./target/release/mkfs_ext4 -L CITEST -U deadbeef-cafe-1234-5678-0123456789ab /tmp/out.img
+          # -f forces a check even if FS thinks it's clean; -n declines
+          # any repair offer (so this is read-only and exits non-zero
+          # if anything is wrong rather than silently auto-fixing).
+          fsck.ext4 -fnv /tmp/out.img
+
+      - name: verify volume label and UUID round-tripped
+        run: |
+          # tune2fs prints the on-disk superblock metadata; grep confirms
+          # the CLI args propagated to the bytes fsck just validated.
+          tune2fs -l /tmp/out.img > /tmp/sb.txt
+          cat /tmp/sb.txt
+          grep -q "Filesystem volume name:.*CITEST" /tmp/sb.txt
+          grep -qi "Filesystem UUID:.*deadbeef-cafe-1234-5678-0123456789ab" /tmp/sb.txt
+
   publish:
     name: publish to crates.io
-    needs: test
+    needs: [test, validate-fsck]
     runs-on: ubuntu-latest
     environment: release
     permissions:
