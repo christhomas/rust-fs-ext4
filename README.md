@@ -1,4 +1,4 @@
-# fs-ext4 — pure-Rust ext2/3/4 driver
+# am-fs-ext4 — pure-Rust ext2/3/4 driver
 
 Pure-Rust read/write driver for the ext2, ext3, and ext4 on-disk
 formats. Mounts disk images and block devices, journals writes
@@ -433,7 +433,7 @@ See `examples/capi_demo.rs` for the Rust-side equivalent.
 
 ```toml
 [dependencies]
-fs-ext4 = "0.3"
+am-fs-ext4 = "0.3"
 ```
 
 ```rust
