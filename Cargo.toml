@@ -1,5 +1,5 @@
 [package]
-name = "fs-ext4"
+name = "am-fs-ext4"
 version = "0.3.2"
 edition = "2021"
 license = "MIT"
