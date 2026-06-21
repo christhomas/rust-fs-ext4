@@ -88,7 +88,7 @@ jobs:
           sudo apt-get install -y -qq e2fsprogs
 
       - name: build mkfs_ext4
-        run: cargo build --release --bin mkfs_ext4
+        run: cargo build --locked --release --bin mkfs_ext4
 
       # 32 MiB is the v1 single-block-group cap. Keep it as the smoke
       # test target and add a larger one once multi-group lands.
