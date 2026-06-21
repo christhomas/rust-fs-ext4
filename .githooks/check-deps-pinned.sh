@@ -88,6 +88,33 @@ if [ -f Cargo.toml ]; then
     fi
 fi
 
+# ── 4. authoritative stale-lock check (cargo is the oracle), best-effort ──────
+# `cargo metadata --locked` refuses to rewrite the lock and errors if it is out
+# of date with Cargo.toml — catching staleness the cheap version check above
+# can't (e.g. a dependency added or version-bumped in Cargo.toml but never
+# re-locked). Run it --offline so the hook stays fast and never hangs on the
+# network. We only BLOCK when cargo says the lock needs updating; if cargo can't
+# resolve for an unrelated reason (a path-dep sibling not checked out on a fresh
+# clone, or an empty offline cache) we SKIP rather than false-block — CI's
+# `--locked` is the final backstop.
+if [ -f Cargo.toml ] && [ -f Cargo.lock ] && command -v cargo >/dev/null 2>&1; then
+    if ! err=$(cargo metadata --locked --offline --format-version 1 2>&1 >/dev/null); then
+        # cargo's staleness signal under --locked is "cannot update the lock
+        # file ... because --locked was passed" (older cargo: "needs to be
+        # updated"). Anything else (missing path-dep sibling, empty offline
+        # cache) is an environment limitation, not staleness → skip.
+        if printf '%s\n' "$err" | grep -qiE 'cannot update the lock file|needs to be updated|out.?of.?date'; then
+            echo "[deps] Cargo.lock is STALE — it no longer matches Cargo.toml:"
+            printf '%s\n' "$err" | grep -iE 'cannot update the lock file|needs to be updated|out.?of.?date' | head -1 | sed 's/^/       /'
+            echo "       Fix: cargo generate-lockfile && git add Cargo.lock"
+            fail=1
+        else
+            echo "[deps] note: deep lock-freshness check skipped (path-dep sibling or"
+            echo "       registry cache unavailable offline); CI --locked is the backstop."
+        fi
+    fi
+fi
+
 if [ "$fail" != 0 ]; then
     echo "[deps] commit blocked — pin your dependencies (see above). Bypass once: git commit --no-verify"
     exit 1
