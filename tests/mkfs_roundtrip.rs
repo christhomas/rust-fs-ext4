@@ -9,6 +9,7 @@ use fs_ext4::extent;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::S_IFDIR;
 use fs_ext4::mkfs;
+use fs_ext4::superblock::EXT4_MAGIC;
 use std::sync::{Arc, Mutex};
 
 /// In-memory R/W block device backed by a single Vec<u8>.
@@ -124,4 +125,77 @@ fn mkfs_then_mount_yields_empty_root() {
         assert_eq!(e.inode, 2, "both `.` and `..` point to root inode 2");
         assert_eq!(e.file_type, dir::DirEntryType::Directory);
     }
+}
+
+#[test]
+fn mkfs_multi_group_reads_root() {
+    let size: u64 = 256 * 1024 * 1024;
+    let block_size: u32 = 4096;
+    let dev = MemDev::new(size);
+
+    mkfs::format_filesystem(dev.as_ref(), Some("MULTIGRP"), None, size, block_size)
+        .expect("format failed");
+
+    let dev_dyn: Arc<dyn BlockDevice> = dev.clone();
+    let fs = Filesystem::mount(dev_dyn.clone()).expect("mount failed");
+
+    assert_eq!(
+        fs.sb.volume_name, "MULTIGRP",
+        "filesystem label is malformed"
+    );
+    assert_eq!(fs.sb.block_size(), block_size);
+    assert!(
+        fs.sb.block_group_count() >= 2,
+        "expected >= 2 block groups, got {}",
+        fs.sb.block_group_count()
+    );
+    assert!(fs.csum.enabled, "fs.csum.enabled is not enabled");
+    assert!(fs.sb.is_clean(), "fs.sb is not clean");
+
+    let bpg = u64::from(fs.sb.blocks_per_group);
+    let mut sb_blk = vec![0u8; block_size as usize];
+    dev_dyn
+        .read_at(bpg * block_size as u64, &mut sb_blk)
+        .expect("reading group 1 backup superblock failed");
+    assert_eq!(
+        u16::from_le_bytes([sb_blk[0x38], sb_blk[0x39]]),
+        EXT4_MAGIC,
+        "group 1 must hold a backup superblock"
+    );
+    assert_eq!(
+        u16::from_le_bytes([sb_blk[0x5A], sb_blk[0x5B]]),
+        1,
+        "backup superblock s_block_group_nr must equal its group"
+    );
+
+    let (root, _raw) = fs.read_inode_verified(2).expect("root inode");
+    assert!(root.is_dir(), "root must be a directory");
+    assert_eq!(root.mode & S_IFDIR, S_IFDIR);
+    assert_eq!(root.mode & 0o7777, 0o755, "invalid root permissions");
+    assert_eq!(root.links_count, 2, "invalid root link count (!= 2)");
+    assert!(root.has_extents(), "root must have extents");
+
+    let bs = fs.sb.block_size();
+    let Some(phys) =
+        extent::map_logical(&root.block, dev_dyn.as_ref(), bs, 0).expect("extent mapping failed")
+    else {
+        panic!("extent returned unexpected sparse hole.");
+    };
+
+    let mut block = vec![0u8; bs as usize];
+    dev_dyn
+        .read_at(phys * bs as u64, &mut block)
+        .expect("reading root directory block failed");
+    assert!(
+        dir::has_csum_tail(&block),
+        "root dir block should carry the csum tail"
+    );
+    assert!(
+        fs.csum.verify_dir_entry_tail(2, root.generation, &block),
+        "fs.csum does not verify"
+    );
+    let entries = dir::parse_block(&block, true).expect("parsing root directory block failed");
+    assert_eq!(entries.len(), 2, "expected only `.` and `..`");
+    assert_eq!(entries[0].name, b".", "first entry must be `.`");
+    assert_eq!(entries[1].name, b"..", "second entry must be `..`");
 }

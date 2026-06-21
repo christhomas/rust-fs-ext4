@@ -4,6 +4,15 @@
 
 ### Features
 
+- **Multiple block groups (ext4)** — `format_filesystem` /
+  `format_filesystem_with_flavor` formats ext4 volumes spanning more than one
+  block group: a full block-group descriptor table plus per-group block and
+  inode bitmaps and inode tables. Superblock/GDT backups are written in the
+  `RO_COMPAT_SPARSE_SUPER` groups (0, 1, and further powers of 3/5/7), so that a
+  damaged primary superblock is recoverable via `e2fsck -b`. Only the filesystem
+  metadata is written, so large volumes format quickly. ext2/ext3 remain
+  single-group entities.
+
 - **Directory extent trees beyond depth 1** — `extend_dir_and_add_entry` now
   handles directories whose extent trees have reached depth ≥ 2 (previously
   returned a hard error). Uses the same `plan_insert_extent_deep` machinery

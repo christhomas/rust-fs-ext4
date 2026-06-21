@@ -12,8 +12,9 @@
 //! - Blocks 4..N                 : group 0 inode table
 //! - Block (4+itable_blocks)     : root directory data block
 //!
-//! Features enabled: FILETYPE, EXTENTS, 64BIT, METADATA_CSUM. Journal is
-//! intentionally OFF for v1 — the resulting FS mounts cleanly without it.
+//! Features enabled: FILETYPE, EXTENTS, 64BIT, METADATA_CSUM, SPARSE_SUPER.
+//! Journal is intentionally OFF for v1, as the resulting FS mounts cleanly
+//! without it.
 //!
 //! Inode 1 is reserved (unused), inode 2 is the root `/` directory.
 
@@ -75,16 +76,7 @@ pub fn format_filesystem_with_flavor(
     // metadata_csum, 32-byte BGDs) and ext4 (everything on) — same layout
     // as ext2 plus a journal inode + JBD2 log area at the head of the
     // data region.
-    let inode_size: u16 = match flavor {
-        FsFlavor::Ext2 | FsFlavor::Ext3 => 128,
-        FsFlavor::Ext4 => 256,
-    };
-    let desc_size: u16 = match flavor {
-        FsFlavor::Ext2 | FsFlavor::Ext3 => 32, // legacy 32-byte BGDs (no INCOMPAT_64BIT)
-        FsFlavor::Ext4 => 64,
-    };
-    let csum_enabled = matches!(flavor, FsFlavor::Ext4);
-    let dir_csum_tail: usize = if csum_enabled { 12 } else { 0 };
+    let (inode_size, desc_size, csum_enabled, dir_csum_tail) = flavor.geometry();
     // Journal sizing for ext3. JBD2's documented minimum is 1024 blocks;
     // we pick exactly that for fixture friendliness — at 1 KiB block_size
     // it's a 1 MiB journal that fits in our smallest-realistic test image.
@@ -118,16 +110,14 @@ pub fn format_filesystem_with_flavor(
         return Err(Error::InvalidArgument("mkfs: too few blocks"));
     }
 
-    // For v1 we only fully initialise group 0; the rest are marked
-    // BLOCK_UNINIT + INODE_UNINIT. Restrict to a single group to match the
-    // brief's "v1 minimum-viable" scope and to keep block-layout math
-    // tractable for the test fixture (32 MiB single-group image).
+    if matches!(flavor, FsFlavor::Ext4) && block_size >= 2048 {
+        return format_block_groups(dev, label, uuid, size_bytes, block_size);
+    }
     if blocks_count > blocks_per_group as u64 {
         return Err(Error::InvalidArgument(
-            "mkfs: multi-group volumes not yet supported (v1 single-group only)",
+            "mkfs: multi-group volumes require ext4 with block_size >= 2048",
         ));
     }
-    let group_count: u64 = 1;
 
     let inodes_per_group: u32 = 8192;
     let inode_table_blocks: u32 =
@@ -186,6 +176,7 @@ pub fn format_filesystem_with_flavor(
         0
     };
     let mut sb = build_superblock(
+        inodes_per_group,
         blocks_count,
         free_blocks,
         free_inodes,
@@ -216,12 +207,12 @@ pub fn format_filesystem_with_flavor(
 
     // ----- Block group descriptor (group 0 only) ---------------------------
     let mut bgd = vec![0u8; desc_size as usize];
-    write_bgd_group0(
+    write_bgd_group(
         &mut bgd,
         blk_bitmap,
         ino_bitmap,
         inode_table_start,
-        free_blocks as u32,
+        free_blocks,
         free_inodes,
         /* used_dirs */ 1, // root dir lives in group 0
         desc_size,
@@ -235,24 +226,11 @@ pub fn format_filesystem_with_flavor(
     // Bits 0..used_blocks are used (for ext3 this includes the journal
     // data run; for ext2/ext4 it stops at root_dir_block).
     let mut block_bitmap = vec![0u8; block_size as usize];
-    for b in 0..used_blocks {
-        let byte = (b / 8) as usize;
-        let bit = (b % 8) as u8;
-        if byte < block_bitmap.len() {
-            block_bitmap[byte] |= 1 << bit;
-        }
-    }
+    set_bitmap_range(&mut block_bitmap, 0, used_blocks);
     // Tail-pad: blocks past `blocks_count` (within the group's bitmap window)
     // are flagged "used" so the allocator never tries them. blocks_per_group
     // bits cover the bitmap's logical span.
-    for b in blocks_count..blocks_per_group as u64 {
-        let byte = (b / 8) as usize;
-        if byte >= block_bitmap.len() {
-            break;
-        }
-        let bit = (b % 8) as u8;
-        block_bitmap[byte] |= 1 << bit;
-    }
+    set_bitmap_range(&mut block_bitmap, blocks_count, blocks_per_group as u64);
 
     // ----- Inode bitmap (group 0) ------------------------------------------
     // ext4 inode numbers are 1-based; bit i = inode (i+1). e2fsprogs marks
@@ -263,13 +241,12 @@ pub fn format_filesystem_with_flavor(
     // bitmap checksum matches what e2fsck recomputes (which assumes all
     // out-of-range bits are 1 — "Padding at end of inode bitmap is not set").
     let mut inode_bitmap = vec![0u8; block_size as usize];
-    for i in 0..RESERVED_INODES {
-        inode_bitmap[(i / 8) as usize] |= 1 << (i % 8);
-    }
-    let bitmap_bits = block_size * 8;
-    for i in inodes_per_group..bitmap_bits {
-        inode_bitmap[(i / 8) as usize] |= 1 << (i % 8);
-    }
+    set_bitmap_range(&mut inode_bitmap, 0, RESERVED_INODES as u64);
+    set_bitmap_range(
+        &mut inode_bitmap,
+        inodes_per_group as u64,
+        block_size as u64 * 8,
+    );
 
     // ----- Inode table (group 0) — only inode 2 has content ----------------
     let mut inode_table = vec![0u8; inode_table_blocks as usize * block_size as usize];
@@ -281,16 +258,8 @@ pub fn format_filesystem_with_flavor(
         block_size,
         flavor,
         inode_size,
+        &csum,
     );
-    // Inode CRC: only when metadata_csum is on (the lo/hi fields live past
-    // byte 0x7C / 0x82 which are only present in 256-byte inodes anyway).
-    if csum_enabled {
-        let slot = &mut inode_table[root_inode_off..root_inode_off + inode_size as usize];
-        if let Some((lo, hi)) = csum.compute_inode_checksum(EXT4_ROOT_INO, 0, slot) {
-            slot[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
-            slot[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
-        }
-    }
 
     // ----- Journal inode (ext3 only): inode 8 -------------------------------
     // Built from the same `indirect_mut::plan_contiguous` primitive every
@@ -344,50 +313,7 @@ pub fn format_filesystem_with_flavor(
         }
     }
 
-    // ----- Root directory data block ---------------------------------------
-    // Two entries (`.`, `..`). On metadata_csum volumes the last 12 bytes
-    // are reserved for the `ext4_dir_entry_tail` csum slot; ext2/3 reclaim
-    // those bytes and the final `..` entry's `rec_len` extends to end-of-
-    // block instead.
-    let mut root_dir = vec![0u8; block_size as usize];
-    let usable = block_size as usize - dir_csum_tail;
-    // Bootstrap: one big tombstone entry that fills the usable region. The
-    // dir helper splits this on each add.
-    root_dir[0..4].copy_from_slice(&0u32.to_le_bytes()); // inode = 0 (tombstone)
-    root_dir[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
-    // name_len + file_type already zero.
-
-    dir::add_entry_to_block(
-        &mut root_dir,
-        EXT4_ROOT_INO,
-        b".",
-        DirEntryType::Directory,
-        true,
-        dir_csum_tail,
-    )?;
-    dir::add_entry_to_block(
-        &mut root_dir,
-        EXT4_ROOT_INO,
-        b"..",
-        DirEntryType::Directory,
-        true,
-        dir_csum_tail,
-    )?;
-
-    // Csum tail + CRC32C — only on metadata_csum volumes.
-    if csum_enabled {
-        let end = root_dir.len();
-        root_dir[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes()); // inode
-        root_dir[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
-        root_dir[end - 6] = 0; // name_len
-        root_dir[end - 5] = 0xDE; // file_type marker
-        root_dir[end - 4..end].copy_from_slice(&0u32.to_le_bytes()); // csum slot
-
-        let mut c = linux_crc32c(csum.seed, &EXT4_ROOT_INO.to_le_bytes());
-        c = linux_crc32c(c, &0u32.to_le_bytes()); // generation = 0
-        c = linux_crc32c(c, &root_dir[..root_dir.len() - 12]);
-        root_dir[end - 4..end].copy_from_slice(&c.to_le_bytes());
-    }
+    let root_dir = build_root_dir(block_size, dir_csum_tail, &csum)?;
 
     // ----- BGD bitmap-csums + final BGD csum -------------------------------
     // Per Linux `fs/ext4/bitmap.c::ext4_{block,inode}_bitmap_csum_set`:
@@ -402,22 +328,7 @@ pub fn format_filesystem_with_flavor(
         let ib_sz = (inodes_per_group as usize) / 8;
         let bb_csum = csum.crc(&block_bitmap[..bb_sz.min(block_bitmap.len())]);
         let ib_csum = csum.crc(&inode_bitmap[..ib_sz.min(inode_bitmap.len())]);
-        bgd[0x18..0x1A].copy_from_slice(&((bb_csum & 0xFFFF) as u16).to_le_bytes());
-        bgd[0x1A..0x1C].copy_from_slice(&((ib_csum & 0xFFFF) as u16).to_le_bytes());
-        if desc_size >= 64 {
-            bgd[0x38..0x3A].copy_from_slice(&((bb_csum >> 16) as u16).to_le_bytes());
-            bgd[0x3A..0x3C].copy_from_slice(&((ib_csum >> 16) as u16).to_le_bytes());
-        }
-
-        // BGD CRC slot lives at 0x1E..0x20. Computed over the full
-        // descriptor with the slot itself zeroed, prefixed by the LE
-        // group number (0 for group 0). Folded down to its low 16 bits.
-        let mut tmp = bgd.clone();
-        tmp[0x1E] = 0;
-        tmp[0x1F] = 0;
-        let bgd_csum_full = csum.crc_with_prefix(0u32, &tmp);
-        let bgd_csum16 = (bgd_csum_full & 0xFFFF) as u16;
-        bgd[0x1E..0x20].copy_from_slice(&bgd_csum16.to_le_bytes());
+        finalize_bgd_checksum(&mut bgd, 0, bb_csum, ib_csum, desc_size, &csum);
     }
 
     // ----- Write everything out --------------------------------------------
@@ -458,8 +369,272 @@ pub fn format_filesystem_with_flavor(
     }
 
     dev.flush()?;
-    let _ = group_count; // single-group v1; future multi-group will use this
     Ok(())
+}
+
+/// Set bits `[start, end)` in a little-endian on-disk bitmap, clamped to the
+/// buffer length.
+fn set_bitmap_range(bitmap: &mut [u8], start: u64, end: u64) {
+    for bit in start..end {
+        let byte = (bit / 8) as usize;
+        if byte >= bitmap.len() {
+            break;
+        }
+        bitmap[byte] |= 1 << (bit % 8);
+    }
+}
+
+/// Build the root directory's data block i.e., a `.`/`..` pair filling the
+/// block, plus the `ext4_dir_entry_tail` checksum slot on metadata_csum
+/// volumes.
+fn build_root_dir(block_size: u32, dir_csum_tail: usize, csum: &Checksummer) -> Result<Vec<u8>> {
+    let mut root_dir = vec![0u8; block_size as usize];
+    let usable = block_size as usize - dir_csum_tail;
+    // Bootstrap: one big tombstone entry that fills the usable region. The
+    // dir helper splits this on each add.
+    root_dir[0..4].copy_from_slice(&0u32.to_le_bytes()); // inode = 0 (tombstone)
+    root_dir[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
+
+    dir::add_entry_to_block(
+        &mut root_dir,
+        EXT4_ROOT_INO,
+        b".",
+        DirEntryType::Directory,
+        true,
+        dir_csum_tail,
+    )?;
+    dir::add_entry_to_block(
+        &mut root_dir,
+        EXT4_ROOT_INO,
+        b"..",
+        DirEntryType::Directory,
+        true,
+        dir_csum_tail,
+    )?;
+
+    if csum.enabled {
+        let end = root_dir.len();
+        root_dir[end - 12..end - 8].copy_from_slice(&0u32.to_le_bytes()); // inode
+        root_dir[end - 8..end - 6].copy_from_slice(&12u16.to_le_bytes()); // rec_len
+        root_dir[end - 6] = 0; // name_len
+        root_dir[end - 5] = 0xDE; // file_type marker
+        root_dir[end - 4..end].copy_from_slice(&0u32.to_le_bytes()); // csum slot
+
+        let mut c = linux_crc32c(csum.seed, &EXT4_ROOT_INO.to_le_bytes());
+        c = linux_crc32c(c, &0u32.to_le_bytes()); // generation = 0
+        c = linux_crc32c(c, &root_dir[..root_dir.len() - 12]);
+        root_dir[end - 4..end].copy_from_slice(&c.to_le_bytes());
+    }
+    Ok(root_dir)
+}
+
+/// Write the block/inode bitmap checksums and the descriptor's own CRC into a
+/// block-group descriptor `bgd`.
+fn finalize_bgd_checksum(
+    bgd: &mut [u8],
+    group: u32,
+    bb_csum: u32,
+    ib_csum: u32,
+    desc_size: u16,
+    csum: &Checksummer,
+) {
+    bgd[0x18..0x1A].copy_from_slice(&((bb_csum & 0xFFFF) as u16).to_le_bytes());
+    bgd[0x1A..0x1C].copy_from_slice(&((ib_csum & 0xFFFF) as u16).to_le_bytes());
+    if desc_size >= 64 {
+        bgd[0x38..0x3A].copy_from_slice(&((bb_csum >> 16) as u16).to_le_bytes());
+        bgd[0x3A..0x3C].copy_from_slice(&((ib_csum >> 16) as u16).to_le_bytes());
+    }
+    let mut tmp = bgd.to_vec();
+    tmp[0x1E] = 0;
+    tmp[0x1F] = 0;
+    let bgd_csum = (csum.crc_with_prefix(group, &tmp) & 0xFFFF) as u16;
+    bgd[0x1E..0x20].copy_from_slice(&bgd_csum.to_le_bytes());
+}
+
+/// Format an ext4 volume as one or more block groups. Superblock + GDT
+/// backups follow the classic RO_COMPAT_SPARSE_SUPER rule (groups 0, 1, and
+/// powers of 3/5/7); every group gets its own block and inode bitmaps plus an
+/// inode table. Classic non-flex_bg layout, and no journal for the time being.
+#[allow(clippy::too_many_lines)]
+fn format_block_groups(
+    dev: &dyn BlockDevice,
+    label: Option<&str>,
+    uuid: Option<[u8; 16]>,
+    size_bytes: u64,
+    block_size: u32,
+) -> Result<()> {
+    const RESERVED_INODES: u32 = 10;
+
+    let (inode_size, desc_size, _, dir_csum_tail) = FsFlavor::Ext4.geometry();
+
+    let bs = block_size as u64;
+    let log_block_size = (block_size.trailing_zeros() as i32 - 10) as u32;
+    let blocks_per_group: u32 = 8 * block_size;
+    let bpg = blocks_per_group as u64;
+    let inodes_per_group: u32 = 8192;
+    let inode_table_blocks: u32 = (inodes_per_group as u64 * inode_size as u64).div_ceil(bs) as u32;
+
+    let blocks_count: u64 = size_bytes / bs;
+    let group_count: u64 = blocks_count.div_ceil(bpg);
+    let gdt_blocks: u32 = (group_count * desc_size as u64).div_ceil(bs) as u32;
+
+    if bpg <= 4 + gdt_blocks as u64 + inode_table_blocks as u64 {
+        return Err(Error::InvalidArgument(
+            "mkfs: group descriptor table does not fit in a single block group",
+        ));
+    }
+
+    let inodes_count: u64 = group_count * inodes_per_group as u64;
+    if inodes_count > u32::MAX as u64 {
+        return Err(Error::InvalidArgument("mkfs: too many inodes for layout"));
+    }
+    let total_free_inodes: u64 = inodes_count - RESERVED_INODES as u64;
+
+    let uuid = uuid.unwrap_or_else(generate_uuid);
+    let csum = Checksummer {
+        seed: linux_crc32c(!0, &uuid),
+        enabled: true,
+    };
+
+    let mut gdt = vec![0u8; gdt_blocks as usize * block_size as usize];
+    let mut total_free_blocks: u64 = 0;
+    let mut root_dir_block: u64 = 0;
+
+    for g in 0..group_count {
+        let gstart = g * bpg;
+        let glen = bpg.min(blocks_count - gstart);
+
+        let group_meta = if group_has_super(g) {
+            1 + gdt_blocks as u64
+        } else {
+            0
+        };
+        let bb_block = gstart + group_meta;
+        let ib_block = bb_block + 1;
+        let it_block = ib_block + 1;
+        let data_start = it_block + inode_table_blocks as u64;
+        let used = (data_start - gstart) + u64::from(g == 0);
+        if g == 0 {
+            root_dir_block = data_start;
+        }
+        let free = glen.checked_sub(used).ok_or(Error::InvalidArgument(
+            "mkfs: group overhead exceeds group size",
+        ))?;
+        total_free_blocks += free;
+
+        let mut block_bitmap = vec![0u8; block_size as usize];
+        set_bitmap_range(&mut block_bitmap, 0, used);
+        // Pad blocks past a short final group:
+        set_bitmap_range(&mut block_bitmap, glen, bpg);
+        let bb_csum = csum.crc(&block_bitmap[..blocks_per_group as usize / 8]);
+
+        let mut inode_bitmap = vec![0u8; block_size as usize];
+        if g == 0 {
+            set_bitmap_range(&mut inode_bitmap, 0, RESERVED_INODES as u64);
+        }
+        set_bitmap_range(&mut inode_bitmap, inodes_per_group as u64, bs * 8);
+        let ib_csum = csum.crc(&inode_bitmap[..inodes_per_group as usize / 8]);
+
+        let mut inode_table = vec![0u8; inode_table_blocks as usize * block_size as usize];
+        if g == 0 {
+            let off = (EXT4_ROOT_INO as usize - 1) * inode_size as usize;
+            write_root_inode(
+                &mut inode_table[off..off + inode_size as usize],
+                root_dir_block,
+                block_size,
+                FsFlavor::Ext4,
+                inode_size,
+                &csum,
+            );
+        }
+
+        let free_inodes_g = if g == 0 {
+            inodes_per_group - RESERVED_INODES
+        } else {
+            inodes_per_group
+        };
+        let used_dirs_g = u32::from(g == 0);
+        let bgd = &mut gdt[g as usize * desc_size as usize..(g as usize + 1) * desc_size as usize];
+        write_bgd_group(
+            bgd,
+            bb_block,
+            ib_block,
+            it_block,
+            free,
+            free_inodes_g,
+            used_dirs_g,
+            desc_size,
+        );
+        finalize_bgd_checksum(bgd, g as u32, bb_csum, ib_csum, desc_size, &csum);
+
+        dev.write_at(bb_block * bs, &block_bitmap)?;
+        dev.write_at(ib_block * bs, &inode_bitmap)?;
+        dev.write_at(it_block * bs, &inode_table)?;
+    }
+
+    let mut sb = build_superblock(
+        inodes_count as u32,
+        blocks_count,
+        total_free_blocks,
+        total_free_inodes as u32,
+        0,
+        log_block_size,
+        blocks_per_group,
+        inodes_per_group,
+        &uuid,
+        label.unwrap_or(""),
+        FsFlavor::Ext4,
+        inode_size,
+        desc_size,
+        0,
+    );
+    let c = linux_crc32c(!0, &sb[..0x3FC]);
+    sb[0x3FC..0x400].copy_from_slice(&c.to_le_bytes());
+
+    let root_dir = build_root_dir(block_size, dir_csum_tail, &csum)?;
+
+    dev.write_at(0, &vec![0u8; block_size as usize])?;
+    dev.write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb)?;
+    dev.write_at(bs, &gdt)?;
+    dev.write_at(root_dir_block * bs, &root_dir)?;
+
+    // Superblock/GDT backups go into sparse-super groups 0, 1, and further
+    // following powers of 3/5/7.
+    //
+    // Each backup is a verbatim GDT combined with a copy of the primary
+    // superblock differing only in `s_block_group_nr` (and thus its checksum);
+    // `e2fsck` reads them to recover a damaged primary block. The backup
+    // superbock sits at offset 0 of the group's first block, with the GDT copy
+    // in the blocks immediately after.
+    for g in 1..group_count {
+        if !group_has_super(g) {
+            continue;
+        }
+        let gstart = g * bpg;
+        let mut sb_blk = vec![0u8; block_size as usize];
+        sb_blk[..sb.len()].copy_from_slice(&sb);
+        sb_blk[0x5A..0x5C].copy_from_slice(&(g as u16).to_le_bytes());
+        let c = linux_crc32c(!0, &sb_blk[..0x3FC]);
+        sb_blk[0x3FC..0x400].copy_from_slice(&c.to_le_bytes());
+        dev.write_at(gstart * bs, &sb_blk)?;
+        dev.write_at((gstart + 1) * bs, &gdt)?;
+    }
+
+    dev.flush()?;
+    Ok(())
+}
+
+/// True if block group `g` carries a superblock + GDT backup under the classic
+/// RO_COMPAT_SPARSE_SUPER rule: group 0, group 1, and every power of 3, 5, or
+/// 7. Mirrors the kernel's / e2fsprogs' `ext4_bg_has_super`.
+fn group_has_super(g: u64) -> bool {
+    fn is_power_of(mut g: u64, base: u64) -> bool {
+        while g.is_multiple_of(base) {
+            g /= base;
+        }
+        g == 1
+    }
+    g <= 1 || is_power_of(g, 3) || is_power_of(g, 5) || is_power_of(g, 7)
 }
 
 /// Build a clean JBD2 v2 superblock for a fresh ext3 journal. Layout per
@@ -548,6 +723,7 @@ fn generate_uuid() -> [u8; 16] {
 
 #[allow(clippy::too_many_arguments)]
 fn build_superblock(
+    inodes_count: u32,
     blocks_count: u64,
     free_blocks: u64,
     free_inodes: u32,
@@ -562,8 +738,6 @@ fn build_superblock(
     desc_size: u16,
     journal_inum: u32,
 ) -> Vec<u8> {
-    // Single-group v1: total inodes = inodes_per_group.
-    let inodes_count: u32 = inodes_per_group;
     let mut sb = vec![0u8; 1024];
 
     let blocks_lo = (blocks_count & 0xFFFF_FFFF) as u32;
@@ -626,7 +800,8 @@ fn build_superblock(
         FsFlavor::Ext4 => (
             0u32,
             Incompat::FILETYPE.bits() | Incompat::EXTENTS.bits() | Incompat::BIT64.bits(),
-            RoCompat::METADATA_CSUM.bits(),
+            // SPARSE_SUPER: backups in groups 0, 1, and powers of 3/5/7.
+            RoCompat::METADATA_CSUM.bits() | RoCompat::SPARSE_SUPER.bits(),
         ),
     };
     sb[0x5C..0x60].copy_from_slice(&feat_compat.to_le_bytes());
@@ -717,12 +892,12 @@ fn build_superblock(
 }
 
 #[allow(clippy::too_many_arguments)]
-fn write_bgd_group0(
+fn write_bgd_group(
     out: &mut [u8],
     block_bitmap_block: u64,
     inode_bitmap_block: u64,
     inode_table_block: u64,
-    free_blocks: u32,
+    free_blocks: u64,
     free_inodes: u32,
     used_dirs: u32,
     desc_size: u16,
@@ -746,7 +921,7 @@ fn write_bgd_group0(
         out[0x20..0x24].copy_from_slice(&((block_bitmap_block >> 32) as u32).to_le_bytes());
         out[0x24..0x28].copy_from_slice(&((inode_bitmap_block >> 32) as u32).to_le_bytes());
         out[0x28..0x2C].copy_from_slice(&((inode_table_block >> 32) as u32).to_le_bytes());
-        out[0x2C..0x2E].copy_from_slice(&0u16.to_le_bytes()); // free_blocks_hi
+        out[0x2C..0x2E].copy_from_slice(&((free_blocks >> 16) as u16).to_le_bytes()); // free_blocks_hi
         out[0x2E..0x30].copy_from_slice(&0u16.to_le_bytes()); // free_inodes_hi
         out[0x30..0x32].copy_from_slice(&0u16.to_le_bytes()); // used_dirs_hi
         out[0x32..0x34].copy_from_slice(&0u16.to_le_bytes()); // itable_unused_hi
@@ -767,6 +942,7 @@ fn write_root_inode(
     block_size: u32,
     flavor: FsFlavor,
     inode_size: u16,
+    csum: &Checksummer,
 ) {
     // i_mode
     slot[0x00..0x02].copy_from_slice(&ROOT_MODE.to_le_bytes());
@@ -824,5 +1000,12 @@ fn write_root_inode(
         slot[0x80..0x82].copy_from_slice(&I_EXTRA_ISIZE.to_le_bytes());
         // i_checksum_hi (0x82..0x84) patched by caller on csum volumes.
         // 0x84..0x98 *_extra timestamps + crtime — zero.
+    }
+
+    if csum.enabled {
+        if let Some((lo, hi)) = csum.compute_inode_checksum(EXT4_ROOT_INO, 0, slot) {
+            slot[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+            slot[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+        }
     }
 }

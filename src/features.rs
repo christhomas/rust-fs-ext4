@@ -144,6 +144,15 @@ impl FsFlavor {
             FsFlavor::Ext4 => "ext4",
         }
     }
+
+    /// Returns `(inode_size, desc_size, csum_enabled, dir_csum_tail)` tuple.
+    pub(crate) fn geometry(&self) -> (u16, u16, bool, usize) {
+        let csum_enabled = matches!(self, FsFlavor::Ext4);
+        let inode_size: u16 = if csum_enabled { 256 } else { 128 };
+        let desc_size: u16 = if csum_enabled { 64 } else { 32 };
+        let dir_csum_tail: usize = if csum_enabled { 12 } else { 0 };
+        (inode_size, desc_size, csum_enabled, dir_csum_tail)
+    }
 }
 
 /// Check whether the filesystem can be mounted read-only.
