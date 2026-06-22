@@ -1,39 +1,13 @@
 #!/usr/bin/env bash
+# github-guard hook: pre-commit
 #
-# Pre-commit hook — runs the two fast checks CI enforces, so a push
-# doesn't fail on something we could have caught locally in <30s.
+# Fires:    On `git commit`, before the commit message is requested.
+# Use for:  Linting, formatting, and fast checks on the staged snapshot.
+# Blocking: yes (non-zero aborts the commit)
 #
-# Enable once per clone:
-#   git config core.hooksPath .githooks
-# or:
-#   ./scripts/install-hooks.sh
-#
-# Skip for a single WIP commit (use sparingly):
-#   git commit --no-verify
-#
-# NOTE: we deliberately don't run `cargo test` here — the test suite
-# needs qemu-system-x86 + root + generated disk images and takes
-# minutes. That stays in CI. Fmt + clippy are the ones that have bitten
-# us before ("release: 0.1.2" shipped with an unformatted test line;
-# CI caught it but only after the push).
-
-set -euo pipefail
-
-cd "$(git rev-parse --show-toplevel)"
-
-# Refuse to commit unpinned dependencies (floating workflow clones, drifted
-# or missing Cargo.lock). Cheap, no sibling path-deps required.
-"$(git rev-parse --show-toplevel)/.githooks/check-deps-pinned.sh"
-
-echo "[pre-commit] cargo fmt --check"
-if ! cargo fmt --check; then
-    echo
-    echo "[pre-commit] rustfmt would reformat the above files."
-    echo "[pre-commit] Fix with: cargo fmt"
-    exit 1
-fi
-
-echo "[pre-commit] cargo clippy --all-targets -- -D warnings"
-cargo clippy --all-targets -- -D warnings
-
-echo "[pre-commit] OK"
+# Dispatcher: runs every executable script in  .githooks/pre-commit.d/  in lexical
+# order. Add behaviour by dropping a guard script there; remove it by deleting
+# the file (or `chmod -x`). No pre-commit.d/ (or an empty one) = no-op. Managed by
+# github-guard — edit guards in the .d/ dir, not this file.
+d=$(cd "$(dirname "$0")" && pwd)
+exec "$d/lib/run-guards.sh" "$(basename "$0")" "$@"
