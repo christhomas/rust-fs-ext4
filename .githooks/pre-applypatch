@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# github-guard hook: pre-applypatch
+#
+# Fires:    During `git am`, after the patch is applied to the tree but before committing.
+# Use for:  Inspecting or testing the applied tree before it becomes a commit.
+# Blocking: yes (non-zero stops `git am`)
+#
+# Dispatcher: runs every executable script in  .githooks/pre-applypatch.d/  in lexical
+# order. Add behaviour by dropping a guard script there; remove it by deleting
+# the file (or `chmod -x`). No pre-applypatch.d/ (or an empty one) = no-op. Managed by
+# github-guard — edit guards in the .d/ dir, not this file.
+d=$(cd "$(dirname "$0")" && pwd)
+exec "$d/lib/run-guards.sh" "$(basename "$0")" "$@"
