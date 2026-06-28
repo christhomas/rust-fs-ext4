@@ -144,9 +144,20 @@ pub fn format_filesystem_with_flavor(
     // is then a one-shot call.
     let journal_data_start: u64 = root_dir_block + 1;
     let journal_data_end: u64 = journal_data_start + ext3_journal_blocks as u64;
+    // The ext3 journal inode maps its data run with legacy indirect blocks.
+    // Those mapping blocks are allocated contiguously right after the data run
+    // (see the journal-inode section below), so they must be counted as used —
+    // both in the block bitmap and in the free-block totals. Counting them here
+    // lets the main bitmap loop mark them and keeps free_blocks correct.
+    let journal_indirect_blocks: u64 = if matches!(flavor, FsFlavor::Ext3) {
+        crate::indirect_mut::count_indirect_blocks(ext3_journal_blocks, block_size)
+    } else {
+        0
+    };
+    let journal_end: u64 = journal_data_end + journal_indirect_blocks;
 
     // Sanity: every metadata block + journal (if any) must fit in the device.
-    if journal_data_end >= blocks_count {
+    if journal_end >= blocks_count {
         return Err(Error::InvalidArgument(
             "mkfs: device too small for layout (journal won't fit)",
         ));
@@ -159,7 +170,7 @@ pub fn format_filesystem_with_flavor(
     // no flavor-specific bookkeeping is needed for free_inodes.
     const RESERVED_INODES: u32 = 10;
     let used_blocks: u64 = if matches!(flavor, FsFlavor::Ext3) {
-        journal_data_end // blocks 0..journal_data_end
+        journal_end // journal data run + its indirect-tree blocks
     } else {
         root_dir_block + 1
     };
@@ -285,10 +296,8 @@ pub fn format_filesystem_with_flavor(
         // tree only needs 1 single-indirect block (12 direct + 256 in single
         // tier covers 268; for 1024 we'll spill into double — count the
         // exact need via `count_indirect_blocks`).
-        let n_indirect =
-            crate::indirect_mut::count_indirect_blocks(ext3_journal_blocks, block_size);
-        let journal_indirect_start: u64 = journal_data_end;
-        let mut next_indirect = journal_indirect_start;
+        let n_indirect = journal_indirect_blocks;
+        let mut next_indirect = journal_data_end;
 
         // Track the indirect-tree blocks so we can mark them allocated in
         // the bitmap a few lines below.
@@ -309,17 +318,10 @@ pub fn format_filesystem_with_flavor(
             &plan.i_block,
         );
         journal_indirect_writes = plan.block_writes;
-
-        // Mark indirect-tree blocks as allocated in the block bitmap so
-        // they don't get reused. Data blocks were already marked above as
-        // part of `used_blocks`.
-        for ib in &plan.indirect_blocks_allocated {
-            let byte = (*ib / 8) as usize;
-            let bit = (*ib % 8) as u8;
-            if byte < block_bitmap.len() {
-                block_bitmap[byte] |= 1 << bit;
-            }
-        }
+        // The indirect-tree blocks sit contiguously right after the journal
+        // data run, so the main block-bitmap loop already marked them used
+        // (used_blocks includes journal_indirect_blocks) — no separate marking
+        // needed, which also keeps the bitmap bit math first_data_block-correct.
     }
 
     let root_dir = build_root_dir(block_size, dir_csum_tail, &csum)?;

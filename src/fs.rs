@@ -4587,27 +4587,13 @@ impl Filesystem {
         }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
-        // All writes succeeded — now commit the allocation accounting.
-        self.mark_block_run_used(data_plan.first_block, 1)?;
-        self.patch_bgd_counters(
-            data_plan.bgd.group_idx as usize,
-            data_plan.bgd.free_blocks_delta,
-            data_plan.bgd.free_inodes_delta,
-            data_plan.bgd.used_dirs_delta,
-        )?;
-        self.patch_sb_counters(
-            data_plan.sb.free_blocks_delta,
-            data_plan.sb.free_inodes_delta,
-        )?;
+        // All writes succeeded — now commit the allocation accounting. Route
+        // through commit_dir_block_alloc so the block-bitmap checksum is
+        // refreshed together with the BGD + SB free-count deltas (the bare
+        // mark_block_run_used + patch_*_counters sequence left the csum stale).
+        self.commit_dir_block_alloc(data_plan.first_block, &data_plan)?;
         for plan in pending_meta {
-            self.mark_block_run_used(plan.first_block, 1)?;
-            self.patch_bgd_counters(
-                plan.bgd.group_idx as usize,
-                plan.bgd.free_blocks_delta,
-                plan.bgd.free_inodes_delta,
-                plan.bgd.used_dirs_delta,
-            )?;
-            self.patch_sb_counters(plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+            self.commit_dir_block_alloc(plan.first_block, &plan)?;
         }
 
         Ok(())
