@@ -10,16 +10,21 @@
 # it is shared. Annotated tags are peeled to their commit before the check.
 set -u
 
-# Resolve the default branch (origin/HEAD -> main fallback) and collect every
+# The remote being pushed to is the hook's first arg; resolve the default
+# branch against THAT remote rather than a hardcoded "origin", so pushing a
+# tag to an alternate remote still validates against the right branch.
+remote="${1:-origin}"
+
+# Resolve the default branch ($remote/HEAD -> main fallback) and collect every
 # tip that represents it: the remote-tracking ref and the local branch. A tag
 # commit reachable from EITHER counts as on-main, so a momentarily-stale
-# origin/main can't cause a false block.
-default=$(git symbolic-ref --quiet --short refs/remotes/origin/HEAD 2>/dev/null)
-default=${default#origin/}
+# remote-tracking ref can't cause a false block.
+default=$(git symbolic-ref --quiet --short "refs/remotes/$remote/HEAD" 2>/dev/null)
+default=${default#"$remote"/}
 [ -n "$default" ] || default=main
 
 mains=""
-for ref in "refs/remotes/origin/$default" "refs/heads/$default"; do
+for ref in "refs/remotes/$remote/$default" "refs/heads/$default"; do
   sha=$(git rev-parse --quiet --verify "$ref" 2>/dev/null) && mains="$mains $sha"
 done
 # Can't locate main at all (no clone of it locally) — fail open, never block.
@@ -34,8 +39,15 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # Tag deletion (local_sha all-zero): nothing to inspect.
   printf '%s' "$local_sha" | grep -qE '^0+$' && continue
 
-  # Peel annotated/lightweight tag to the commit it ultimately points at.
-  commit=$(git rev-parse --quiet --verify "${local_sha}^{commit}" 2>/dev/null) || continue
+  # Peel annotated/lightweight tag to the commit it ultimately points at. A tag
+  # that doesn't peel to a commit (points at a tree/blob) can never be on the
+  # default branch — block it rather than silently letting it through.
+  commit=$(git rev-parse --quiet --verify "${local_sha}^{commit}" 2>/dev/null) || {
+    tag=${remote_ref#refs/tags/}
+    printf 'github-guard: BLOCKED — tag %q does not point at a commit object.\n' "$tag" >&2
+    status=1
+    continue
+  }
 
   on_main=0
   for m in $mains; do
@@ -44,11 +56,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
   if [ "$on_main" != 1 ]; then
     tag=${remote_ref#refs/tags/}
-    printf 'github-guard: BLOCKED — tag %s points at %s, which is not on %s.\n' \
+    printf 'github-guard: BLOCKED — tag %q points at %s, which is not on %s.\n' \
       "$tag" "$(git rev-parse --short "$commit")" "$default" >&2
     printf '  Release tags must mark a commit that landed on %s. Re-point it:\n' "$default" >&2
-    printf '    git tag -f %s <commit-on-%s>   # e.g. the squash-merge commit\n' "$tag" "$default" >&2
-    printf '    git push --force origin %s\n' "$tag" >&2
+    printf '    git tag -f %q <commit-on-%s>   # e.g. the squash-merge commit\n' "$tag" "$default" >&2
+    printf '    git push --force %q %q\n' "$remote" "$tag" >&2
     status=1
   fi
 done
