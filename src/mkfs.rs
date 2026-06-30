@@ -55,9 +55,9 @@ pub fn format_filesystem(
 ///   128-byte inodes, no journal, no metadata_csum. Mounts under both this
 ///   crate and the kernel's single ext4 driver running in ext2-compat mode.
 /// - [`FsFlavor::Ext3`] — ext2 layout plus a journal inode and JBD2 log area.
-///   Formats successfully and mounts read/write under both this crate and the
-///   kernel. NOTE: the produced journal is not yet fully `e2fsck`-clean (a
-///   separate, tracked limitation); the data/bitmap layout itself is correct.
+///   PARTIAL support: it formats and mounts read/write under this crate, but the
+///   produced journal is not yet `e2fsck`-clean (the `mkfs_ext3_oracle` cases
+///   stay `#[ignore]`d), so it is not yet a fully validated ext3 image.
 ///
 /// Arguments:
 /// - `label`     — volume name (truncated to 16 bytes; UTF-8 stored verbatim).
@@ -158,7 +158,10 @@ pub fn format_filesystem_with_flavor(
     let journal_end: u64 = journal_data_end + journal_indirect_blocks;
 
     // Sanity: every metadata block + journal (if any) must fit in the device.
-    if journal_end >= blocks_count {
+    // `journal_end` is the exclusive end of the used run, so `== blocks_count`
+    // is an exact fit (last used block is blocks_count-1, zero free) — valid;
+    // only `> blocks_count` overflows the device.
+    if journal_end > blocks_count {
         return Err(Error::InvalidArgument(
             "mkfs: device too small for layout (journal won't fit)",
         ));

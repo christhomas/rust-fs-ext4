@@ -32,8 +32,11 @@ fn mkfs_1k(tag: &str) -> Option<String> {
     let n = N.fetch_add(1, Ordering::Relaxed);
     let path = format!("/tmp/fs_ext4_mk1kop_{tag}_{}_{n}.img", std::process::id());
     {
-        let f = std::fs::File::create(&path).ok()?;
-        f.set_len(SIZE).ok()?;
+        // Image setup must not fail silently: a /tmp/disk/permission error here
+        // should fail the test loudly, not make the coverage vanish via an
+        // early `return` in the callers.
+        let f = std::fs::File::create(&path).expect("create 1k image file");
+        f.set_len(SIZE).expect("set 1k image length");
     }
     {
         let dev = FileDevice::open_rw(&path).expect("open_rw");
