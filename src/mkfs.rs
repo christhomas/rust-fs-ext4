@@ -54,9 +54,10 @@ pub fn format_filesystem(
 /// - [`FsFlavor::Ext2`] — legacy direct/indirect block pointers, 32-byte BGDs,
 ///   128-byte inodes, no journal, no metadata_csum. Mounts under both this
 ///   crate and the kernel's single ext4 driver running in ext2-compat mode.
-/// - [`FsFlavor::Ext3`] — not yet supported by this formatter (Phase B).
-///   Returns `Error::InvalidArgument`. Read+write of pre-existing ext3
-///   volumes IS supported via the mount path.
+/// - [`FsFlavor::Ext3`] — ext2 layout plus a journal inode and JBD2 log area.
+///   Formats successfully and mounts read/write under both this crate and the
+///   kernel. NOTE: the produced journal is not yet fully `e2fsck`-clean (a
+///   separate, tracked limitation); the data/bitmap layout itself is correct.
 ///
 /// Arguments:
 /// - `label`     — volume name (truncated to 16 bytes; UTF-8 stored verbatim).
@@ -250,7 +251,11 @@ pub fn format_filesystem_with_flavor(
     // are out of range and must read "used" so the allocator never tries them
     // and the bitmap checksum matches what e2fsck recomputes. blocks_per_group
     // bits cover the bitmap's logical span.
-    set_bitmap_range(&mut block_bitmap, blocks_count - fdb, blocks_per_group as u64);
+    set_bitmap_range(
+        &mut block_bitmap,
+        blocks_count - fdb,
+        blocks_per_group as u64,
+    );
 
     // ----- Inode bitmap (group 0) ------------------------------------------
     // ext4 inode numbers are 1-based; bit i = inode (i+1). e2fsprogs marks
