@@ -17,17 +17,48 @@ branch=$(gh api "repos/$slug" --jq '.default_branch' 2>/dev/null) || {
   echo "github-guard: couldn't read default branch for $slug — skipping" >&2; exit 0; }
 [ -n "$branch" ] || exit 0
 
-# Already protected the way we want (require PR + enforced for admins)? Skip.
-prot=$(gh api "repos/$slug/branches/$branch/protection" 2>/dev/null)
-if printf '%s' "$prot" | grep -q '"required_pull_request_reviews"' \
-   && printf '%s' "$prot" | grep -q '"enforce_admins"[^}]*"enabled":[[:space:]]*true'; then
+# Required status checks: auto-discover the default branch's GitHub Actions
+# check-runs (so third-party app checks like coderabbit are excluded) and
+# require them, strict. Self-healing — re-applied whenever the discovered set
+# drifts, so a renamed/added CI job syncs on the next commit after it runs.
+# Never strips existing checks on a transient empty discovery.
+desired=$(gh api "repos/$slug/commits/$branch/check-runs" \
+  --jq '[.check_runs[] | select(.app.slug=="github-actions") | .name] | unique | tojson' 2>/dev/null)
+
+# Current protection facts in one call: PR reviews present? admins enforced?
+# plus the currently-required contexts (sorted JSON). Empty when unprotected.
+IFS=$'\t' read -r has_reviews has_admins current < <(
+  gh api "repos/$slug/branches/$branch/protection" --jq \
+    '[ (.required_pull_request_reviews != null),
+       (.enforce_admins.enabled // false),
+       ((.required_status_checks.contexts // []) | sort | tojson) ] | @tsv' 2>/dev/null)
+
+# Contexts to require: prefer a fresh discovery; else keep what's already set;
+# never strip checks just because this commit's HEAD has no Actions runs yet.
+if [ -n "$desired" ] && [ "$desired" != "[]" ]; then
+  want="$desired"
+elif [ -n "$current" ] && [ "$current" != "[]" ]; then
+  want="$current"
+else
+  want="[]"
+fi
+
+# Already exactly how we want it (PR-mode + admins + matching checks)? Skip.
+if [ "$has_reviews" = "true" ] && [ "$has_admins" = "true" ] && [ "${current:-[]}" = "$want" ]; then
   exit 0
 fi
 
-echo "github-guard: protecting $slug:$branch (require PR, enforce admins, linear history)…" >&2
-payload=$(cat <<'JSON'
+if [ "$want" = "[]" ]; then
+  rsc='null'
+  echo "github-guard: protecting $slug:$branch (require PR, enforce admins, linear history)…" >&2
+else
+  rsc="{ \"strict\": true, \"contexts\": $want }"
+  echo "github-guard: protecting $slug:$branch (require PR, enforce admins, linear history, required checks $want)…" >&2
+fi
+
+payload=$(cat <<JSON
 {
-  "required_status_checks": null,
+  "required_status_checks": $rsc,
   "enforce_admins": true,
   "required_pull_request_reviews": { "required_approving_review_count": 0, "dismiss_stale_reviews": false, "require_code_owner_reviews": false },
   "restrictions": null,
