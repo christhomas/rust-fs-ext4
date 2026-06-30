@@ -54,9 +54,10 @@ pub fn format_filesystem(
 /// - [`FsFlavor::Ext2`] — legacy direct/indirect block pointers, 32-byte BGDs,
 ///   128-byte inodes, no journal, no metadata_csum. Mounts under both this
 ///   crate and the kernel's single ext4 driver running in ext2-compat mode.
-/// - [`FsFlavor::Ext3`] — not yet supported by this formatter (Phase B).
-///   Returns `Error::InvalidArgument`. Read+write of pre-existing ext3
-///   volumes IS supported via the mount path.
+/// - [`FsFlavor::Ext3`] — ext2 layout plus a journal inode and JBD2 log area.
+///   PARTIAL support: it formats and mounts read/write under this crate, but the
+///   produced journal is not yet `e2fsck`-clean (the `mkfs_ext3_oracle` cases
+///   stay `#[ignore]`d), so it is not yet a fully validated ext3 image.
 ///
 /// Arguments:
 /// - `label`     — volume name (truncated to 16 bytes; UTF-8 stored verbatim).
@@ -144,9 +145,23 @@ pub fn format_filesystem_with_flavor(
     // is then a one-shot call.
     let journal_data_start: u64 = root_dir_block + 1;
     let journal_data_end: u64 = journal_data_start + ext3_journal_blocks as u64;
+    // The ext3 journal inode maps its data run with legacy indirect blocks.
+    // Those mapping blocks are allocated contiguously right after the data run
+    // (see the journal-inode section below), so they must be counted as used —
+    // both in the block bitmap and in the free-block totals. Counting them here
+    // lets the main bitmap loop mark them and keeps free_blocks correct.
+    let journal_indirect_blocks: u64 = if matches!(flavor, FsFlavor::Ext3) {
+        crate::indirect_mut::count_indirect_blocks(ext3_journal_blocks, block_size)
+    } else {
+        0
+    };
+    let journal_end: u64 = journal_data_end + journal_indirect_blocks;
 
     // Sanity: every metadata block + journal (if any) must fit in the device.
-    if journal_data_end >= blocks_count {
+    // `journal_end` is the exclusive end of the used run, so `== blocks_count`
+    // is an exact fit (last used block is blocks_count-1, zero free) — valid;
+    // only `> blocks_count` overflows the device.
+    if journal_end > blocks_count {
         return Err(Error::InvalidArgument(
             "mkfs: device too small for layout (journal won't fit)",
         ));
@@ -159,7 +174,7 @@ pub fn format_filesystem_with_flavor(
     // no flavor-specific bookkeeping is needed for free_inodes.
     const RESERVED_INODES: u32 = 10;
     let used_blocks: u64 = if matches!(flavor, FsFlavor::Ext3) {
-        journal_data_end // blocks 0..journal_data_end
+        journal_end // journal data run + its indirect-tree blocks
     } else {
         root_dir_block + 1
     };
@@ -223,14 +238,27 @@ pub fn format_filesystem_with_flavor(
     // BGD it CRCs over carries stale bitmap-csum slots.)
 
     // ----- Block bitmap (group 0) ------------------------------------------
-    // Bits 0..used_blocks are used (for ext3 this includes the journal
-    // data run; for ext2/ext4 it stops at root_dir_block).
+    // Block-bitmap bit `i` maps to absolute block (first_data_block + i), per
+    // the ext4 convention. For 1 KiB blocks first_data_block is 1, so the whole
+    // bitmap is shifted down one block relative to absolute numbering; indexing
+    // it by absolute block over-marks the tail by one block and skips the
+    // trailing pad bit (e2fsck flags both as "Free blocks count wrong" +
+    // "Padding at end of block bitmap is not set"). Work in bit space.
+    let fdb = first_data_block as u64;
     let mut block_bitmap = vec![0u8; block_size as usize];
-    set_bitmap_range(&mut block_bitmap, 0, used_blocks);
-    // Tail-pad: blocks past `blocks_count` (within the group's bitmap window)
-    // are flagged "used" so the allocator never tries them. blocks_per_group
+    // Metadata occupies absolute blocks [first_data_block, used_blocks) (for
+    // ext3 this includes the journal data run; for ext2/ext4 it stops at
+    // root_dir_block), i.e. bits [0, used_blocks - first_data_block).
+    set_bitmap_range(&mut block_bitmap, 0, used_blocks - fdb);
+    // Tail-pad: bits whose block (first_data_block + bit) is >= blocks_count
+    // are out of range and must read "used" so the allocator never tries them
+    // and the bitmap checksum matches what e2fsck recomputes. blocks_per_group
     // bits cover the bitmap's logical span.
-    set_bitmap_range(&mut block_bitmap, blocks_count, blocks_per_group as u64);
+    set_bitmap_range(
+        &mut block_bitmap,
+        blocks_count - fdb,
+        blocks_per_group as u64,
+    );
 
     // ----- Inode bitmap (group 0) ------------------------------------------
     // ext4 inode numbers are 1-based; bit i = inode (i+1). e2fsprogs marks
@@ -276,10 +304,8 @@ pub fn format_filesystem_with_flavor(
         // tree only needs 1 single-indirect block (12 direct + 256 in single
         // tier covers 268; for 1024 we'll spill into double — count the
         // exact need via `count_indirect_blocks`).
-        let n_indirect =
-            crate::indirect_mut::count_indirect_blocks(ext3_journal_blocks, block_size);
-        let journal_indirect_start: u64 = journal_data_end;
-        let mut next_indirect = journal_indirect_start;
+        let n_indirect = journal_indirect_blocks;
+        let mut next_indirect = journal_data_end;
 
         // Track the indirect-tree blocks so we can mark them allocated in
         // the bitmap a few lines below.
@@ -300,17 +326,10 @@ pub fn format_filesystem_with_flavor(
             &plan.i_block,
         );
         journal_indirect_writes = plan.block_writes;
-
-        // Mark indirect-tree blocks as allocated in the block bitmap so
-        // they don't get reused. Data blocks were already marked above as
-        // part of `used_blocks`.
-        for ib in &plan.indirect_blocks_allocated {
-            let byte = (*ib / 8) as usize;
-            let bit = (*ib % 8) as u8;
-            if byte < block_bitmap.len() {
-                block_bitmap[byte] |= 1 << bit;
-            }
-        }
+        // The indirect-tree blocks sit contiguously right after the journal
+        // data run, so the main block-bitmap loop already marked them used
+        // (used_blocks includes journal_indirect_blocks) — no separate marking
+        // needed, which also keeps the bitmap bit math first_data_block-correct.
     }
 
     let root_dir = build_root_dir(block_size, dir_csum_tail, &csum)?;
