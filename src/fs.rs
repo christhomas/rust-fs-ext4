@@ -1071,6 +1071,7 @@ impl Filesystem {
                 }
             }
         }
+        self.buffer_refresh_bitmap_csum(buf, gi, false)?;
         self.buffer_patch_bgd_counters(buf, gi, len as i32, 0, 0)?;
         Ok(len)
     }
@@ -1101,6 +1102,66 @@ impl Filesystem {
                 bm[byte] |= mask;
             }
         }
+        self.buffer_refresh_bitmap_csum(buf, gi, false)?;
+        Ok(())
+    }
+
+    /// Recompute a group's bitmap checksum (inode or block) after its bitmap
+    /// block changed, then refresh the BGD checksum. metadata_csum stores the
+    /// bitmap crc split lo + hi in the descriptor (inode: 0x1A/0x3A, block:
+    /// 0x18/0x38); a stale value makes e2fsck and the kernel report "bitmap
+    /// does not match checksum". No-op when checksums are disabled.
+    pub(crate) fn buffer_refresh_bitmap_csum(
+        &self,
+        buf: &mut BlockBuffer,
+        gi: usize,
+        inode_bitmap: bool,
+    ) -> Result<()> {
+        if !self.csum.enabled {
+            return Ok(());
+        }
+        let (bitmap_block, coverage, lo_off, hi_off) = if inode_bitmap {
+            (
+                self.groups[gi].inode_bitmap,
+                (self.sb.inodes_per_group as usize).div_ceil(8),
+                0x1A,
+                0x3A,
+            )
+        } else {
+            (
+                self.groups[gi].block_bitmap,
+                (self.sb.blocks_per_group as usize).div_ceil(8),
+                0x18,
+                0x38,
+            )
+        };
+        let csum = {
+            let bm = buf.get_mut(self, bitmap_block)?;
+            let end = coverage.min(bm.len());
+            crate::checksum::linux_crc32c(self.csum.seed, &bm[..end])
+        };
+
+        let bs = self.sb.block_size() as u64;
+        let desc_size = self.sb.desc_size as u64;
+        let bgt_first_block = self.sb.first_data_block as u64 + 1;
+        let byte_in_bgt = gi as u64 * desc_size;
+        let bgt_block = bgt_first_block + byte_in_bgt / bs;
+        let off = (byte_in_bgt % bs) as usize;
+        let has_hi = desc_size >= 0x40;
+        let block = buf.get_mut(self, bgt_block)?;
+        block[off + lo_off..off + lo_off + 2]
+            .copy_from_slice(&((csum & 0xFFFF) as u16).to_le_bytes());
+        if has_hi {
+            block[off + hi_off..off + hi_off + 2]
+                .copy_from_slice(&(((csum >> 16) & 0xFFFF) as u16).to_le_bytes());
+        }
+        // Refresh the BGD checksum (0x1E) so the descriptor stays consistent.
+        let stored_at = off + 0x1E;
+        let end_desc = off + desc_size as usize;
+        block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
+        let mut c = crate::checksum::linux_crc32c(self.csum.seed, &(gi as u32).to_le_bytes());
+        c = crate::checksum::linux_crc32c(c, &block[off..end_desc]);
+        block[stored_at..stored_at + 2].copy_from_slice(&(c as u16).to_le_bytes());
         Ok(())
     }
 
@@ -1125,6 +1186,7 @@ impl Filesystem {
                 bm[byte] &= !mask;
             }
         }
+        self.buffer_refresh_bitmap_csum(buf, gi, true)?;
         self.buffer_patch_bgd_counters(buf, gi, 0, 1, 0)
     }
 
@@ -1145,6 +1207,48 @@ impl Filesystem {
         let mask = 1u8 << (bit % 8);
         if byte < bm.len() {
             bm[byte] |= mask;
+        }
+        self.buffer_refresh_bitmap_csum(buf, gi, true)?;
+
+        // Maintain bg_itable_unused: this inode is now in use, so the count of
+        // never-used inodes at the END of the group's table can be no larger
+        // than the inodes after this one. A stale value makes e2fsck and the
+        // kernel treat freshly-allocated inodes as unused ("references inode
+        // found in unused inodes area" / "invalid unused inodes count"). lo at
+        // 0x1C, hi at 0x32 (desc_size >= 64). The BGD checksum is recomputed so
+        // the change stands alone; the following counter patch recomputes it
+        // again harmlessly.
+        let floor = ipg.saturating_sub(bit as u32 + 1);
+        let bs = self.sb.block_size() as u64;
+        let desc_size = self.sb.desc_size as u64;
+        let bgt_first_block = self.sb.first_data_block as u64 + 1;
+        let byte_in_bgt = gi as u64 * desc_size;
+        let bgt_block = bgt_first_block + byte_in_bgt / bs;
+        let off = (byte_in_bgt % bs) as usize;
+        let has_hi = desc_size >= 0x40;
+        let block = buf.get_mut(self, bgt_block)?;
+        let cur_lo = u16::from_le_bytes(block[off + 0x1C..off + 0x1E].try_into().unwrap()) as u32;
+        let cur_hi = if has_hi {
+            u16::from_le_bytes(block[off + 0x32..off + 0x34].try_into().unwrap()) as u32
+        } else {
+            0
+        };
+        let cur = (cur_hi << 16) | cur_lo;
+        if floor < cur {
+            block[off + 0x1C..off + 0x1E].copy_from_slice(&((floor & 0xFFFF) as u16).to_le_bytes());
+            if has_hi {
+                block[off + 0x32..off + 0x34]
+                    .copy_from_slice(&(((floor >> 16) & 0xFFFF) as u16).to_le_bytes());
+            }
+            if self.csum.enabled {
+                let stored_at = off + 0x1E;
+                let end_desc = off + desc_size as usize;
+                block[stored_at..stored_at + 2].copy_from_slice(&[0, 0]);
+                let seed = self.csum.seed;
+                let mut c = crate::checksum::linux_crc32c(seed, &(gi as u32).to_le_bytes());
+                c = crate::checksum::linux_crc32c(c, &block[off..end_desc]);
+                block[stored_at..stored_at + 2].copy_from_slice(&(c as u16).to_le_bytes());
+            }
         }
         Ok(())
     }

@@ -271,10 +271,18 @@ impl Checksummer {
         if !self.enabled || inode_raw.len() < 128 {
             return None;
         }
+        // i_checksum_hi (0x82) is part of the checksum only when i_extra_isize
+        // (0x80) is large enough to cover it — the kernel's EXT4_FITS_IN_INODE
+        // test, which here means i_extra_isize >= 4. On a zeroed freed inode
+        // (i_extra_isize = 0) the kernel uses ONLY the 16-bit lo checksum and
+        // treats 0x82 as ordinary (zero) data; zeroing hi and storing a full
+        // 32-bit value there mismatches ("checksum does not match inode").
+        let fits_hi = inode_raw.len() >= 0x84
+            && u16::from_le_bytes(inode_raw[0x80..0x82].try_into().unwrap()) >= 4;
         let mut tmp = inode_raw.to_vec();
         tmp[0x7C] = 0;
         tmp[0x7D] = 0;
-        if tmp.len() >= 0x84 {
+        if fits_hi {
             tmp[0x82] = 0;
             tmp[0x83] = 0;
         }
@@ -282,7 +290,11 @@ impl Checksummer {
         c = linux_crc32c(c, &generation.to_le_bytes());
         c = linux_crc32c(c, &tmp);
         let lo = (c & 0xFFFF) as u16;
-        let hi = ((c >> 16) & 0xFFFF) as u16;
+        let hi = if fits_hi {
+            ((c >> 16) & 0xFFFF) as u16
+        } else {
+            0
+        };
         Some((lo, hi))
     }
 }
