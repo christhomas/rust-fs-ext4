@@ -161,3 +161,152 @@ fn op_fallocate_variants() {
     }
     done(&p, "fallocate");
 }
+
+// ── round 2: trickier structural paths ──────────────────────────────────────
+
+#[test]
+fn op_rename_dir_crossdir() {
+    let Some(p) = copy("rename_dir") else { return };
+    {
+        let fs = rw(&p);
+        fs.apply_mkdir("/a", 0o755).expect("mkdir a");
+        fs.apply_mkdir("/b", 0o755).expect("mkdir b");
+        fs.apply_mkdir("/a/m", 0o755).expect("mkdir a/m");
+        // Move a directory across parents: m's ".." must switch a -> b, and the
+        // two parents' link counts must follow.
+        fs.apply_rename("/a/m", "/b/m", false)
+            .expect("rename dir a/m -> b/m");
+    }
+    done(&p, "rename_dir");
+}
+
+#[test]
+fn op_htree_dir_growth() {
+    let Some(p) = copy("htree") else { return };
+    {
+        let fs = rw(&p);
+        fs.apply_mkdir("/h", 0o755).expect("mkdir h");
+        // Enough entries to overflow a single dir block and convert to htree.
+        for i in 0..240 {
+            fs.apply_create(&format!("/h/file{i:04}"), 0o644)
+                .unwrap_or_else(|e| panic!("create /h/file{i:04}: {e:?}"));
+        }
+    }
+    done(&p, "htree");
+}
+
+#[test]
+fn op_dir_multiblock_growth() {
+    let Some(p) = copy("dir_multiblock") else {
+        return;
+    };
+    {
+        let fs = rw(&p);
+        fs.apply_mkdir("/m", 0o755).expect("mkdir m");
+        for i in 0..60 {
+            fs.apply_create(&format!("/m/f{i:03}"), 0o644)
+                .unwrap_or_else(|e| panic!("create /m/f{i:03}: {e:?}"));
+        }
+    }
+    done(&p, "dir_multiblock");
+}
+
+#[test]
+fn op_slow_symlink() {
+    let Some(p) = copy("slow_symlink") else {
+        return;
+    };
+    {
+        let fs = rw(&p);
+        // > 60 bytes → "slow" symlink: target stored in a data block, not i_block.
+        let target = "/a/very/long/symlink/target/path/that/exceeds/sixty/bytes/for/sure/x";
+        fs.apply_symlink(target, "/slink").expect("slow symlink");
+    }
+    done(&p, "slow_symlink");
+}
+
+#[test]
+fn op_large_file_extents() {
+    let Some(p) = copy("large_file") else { return };
+    {
+        let fs = rw(&p);
+        fs.apply_create("/lf", 0o644).expect("create");
+        // 2 MiB — larger than one journal transaction's descriptor capacity
+        // (~255 blocks), so apply_pwrite must split it into block-aligned
+        // chunks that each commit as their own transaction. Pre-fix this
+        // failed with "descriptor block overflow (too many tags)".
+        let data = vec![0xC3u8; 2 * 1024 * 1024];
+        let n = fs.apply_pwrite("/lf", 0, &data).expect("pwrite 2MiB");
+        assert_eq!(n, data.len() as u64, "short write");
+    }
+    done(&p, "large_file");
+}
+
+// ── round 3: free-path + replace + slow-symlink teardown ─────────────────────
+
+#[test]
+fn op_replace_file_content() {
+    let Some(p) = copy("replace") else { return };
+    {
+        let fs = rw(&p);
+        fs.apply_create("/rf", 0o644).expect("create");
+        fs.apply_pwrite("/rf", 0, &vec![0x11u8; 20480])
+            .expect("pwrite");
+        // Full rewrite to a different size frees the old extents + allocs new.
+        fs.apply_replace_file_content("/rf", &vec![0x22u8; 4096])
+            .expect("replace");
+    }
+    done(&p, "replace");
+}
+
+#[test]
+fn op_removexattr_last_frees_block() {
+    let Some(p) = copy("xattr_free") else { return };
+    {
+        let fs = rw(&p);
+        fs.apply_create("/xr", 0o644).expect("create");
+        // Large value → external xattr block; removing the only entry should
+        // free the block and clear i_file_acl (+ recompute the inode checksum).
+        fs.apply_setxattr("/xr", "user.big", &vec![0x7Eu8; 3072])
+            .expect("setxattr big");
+        fs.apply_removexattr("/xr", "user.big")
+            .expect("removexattr last");
+    }
+    done(&p, "xattr_free");
+}
+
+#[test]
+fn op_slow_symlink_unlink() {
+    let Some(p) = copy("slow_symlink_unlink") else {
+        return;
+    };
+    {
+        let fs = rw(&p);
+        let target = "/a/very/long/symlink/target/path/that/exceeds/sixty/bytes/for/sure/x";
+        fs.apply_symlink(target, "/sl").expect("slow symlink");
+        // Unlink the slow symlink → frees its inode AND its data block.
+        fs.apply_unlink("/sl").expect("unlink slow symlink");
+    }
+    done(&p, "slow_symlink_unlink");
+}
+
+#[test]
+fn op_fragmented_extent_tree() {
+    let Some(p) = copy("frag_extents") else {
+        return;
+    };
+    {
+        let fs = rw(&p);
+        fs.apply_create("/frag", 0o644).expect("create");
+        // Logically-gapped single-block writes → many separate extents. >4
+        // extents overflow the 4 inline slots in the inode's i_block and spill
+        // to an external extent block (tree depth >= 1), whose ext4_extent_tail
+        // checksum must be computed on write. All our other files are
+        // single-extent, so this is the only test that exercises that path.
+        for i in 0..16u64 {
+            fs.apply_pwrite("/frag", i * 8192, b"x")
+                .unwrap_or_else(|e| panic!("pwrite gap {i}: {e:?}"));
+        }
+    }
+    done(&p, "frag_extents");
+}

@@ -1681,9 +1681,15 @@ impl Filesystem {
                     return Ok(());
                 }
                 crate::xattr::BlockRemoveOutcome::RemovedNowEmpty => {
-                    // Free the block + clear i_file_acl + decrement i_blocks.
-                    self.free_block_run_and_bgd(block_nr, 1)?;
-                    self.patch_sb_counters(1, 0)?;
+                    // Free the now-empty external block + clear i_file_acl + drop
+                    // i_blocks, all in one journaled transaction. The previous
+                    // direct path used free_block_run_and_bgd, which skipped the
+                    // block-bitmap checksum recompute and wrote a stale BGD —
+                    // corrupting the bitmap csum and the free counters. The
+                    // buffer helpers do it correctly and atomically.
+                    let mut buf = BlockBuffer::new(bs);
+                    self.buffer_free_block_run_and_bgd(&mut buf, block_nr, 1)?;
+                    self.buffer_patch_sb_counters(&mut buf, 1, 0)?;
                     raw[0x68..0x6C].copy_from_slice(&0u32.to_le_bytes());
                     if raw.len() >= 0x76 {
                         raw[0x74..0x76].copy_from_slice(&0u16.to_le_bytes());
@@ -1691,9 +1697,10 @@ impl Filesystem {
                     let sectors_per_block = bs_u64 / 512;
                     let new_blocks = inode.blocks.saturating_sub(sectors_per_block);
                     Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_blocks)?;
-                    self.bump_inode_ctime(ino, inode.generation, &mut raw)?;
-                    self.dev.flush()?;
-                    return Ok(());
+                    raw[0x0C..0x10].copy_from_slice(&now_unix_seconds().to_le_bytes());
+                    self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+                    self.buffer_write_inode(&mut buf, ino, &raw)?;
+                    return self.commit_block_buffer(buf);
                 }
                 crate::xattr::BlockRemoveOutcome::NotFound => { /* fall through */ }
             }
@@ -2858,6 +2865,34 @@ impl Filesystem {
             .ok_or(Error::InvalidArgument("pwrite: offset+len overflow"))?;
         let first_lb = offset / bs;
         let last_lb_excl = end.div_ceil(bs);
+
+        // A single pwrite journals all its data blocks plus the inode/bitmap/
+        // BGD/SB metadata in ONE transaction, whose descriptor block holds only
+        // ~(block_size - 12)/16 tags. A write spanning more than that overflows
+        // it ("descriptor block overflow"). Split large writes into block-
+        // aligned chunks that each fit one transaction; every chunk commits
+        // atomically (POSIX pwrite is not atomic across a large range anyway).
+        let tags_per_desc = (bs_usize.saturating_sub(12)) / 16;
+        // Reserve 8 tag slots for this transaction's own metadata: inode, block
+        // bitmap, BGD, superblock, plus up to ~4 extent-tree node blocks when a
+        // chunk's extents grow the tree. A chunk of (tags_per_desc - 8) data
+        // blocks always lands in a single block group (247 blocks at 4 KiB, well
+        // inside a 128 MiB group), so the real overhead is <= 4 — 8 is a
+        // conservative ~2x bound.
+        let max_data_blocks = tags_per_desc.saturating_sub(8).max(1) as u64;
+        let max_chunk = max_data_blocks * bs;
+        if len > max_chunk {
+            let mut chunk_off = 0u64;
+            while chunk_off < len {
+                let take = max_chunk.min(len - chunk_off);
+                let s = chunk_off as usize;
+                let e = (chunk_off + take) as usize;
+                self.apply_pwrite(path, offset + chunk_off, &data[s..e])?;
+                chunk_off += take;
+            }
+            let (after, _) = self.read_inode_verified(ino)?;
+            return Ok(after.size);
+        }
 
         // Working copy of the 60-byte inline extent root. Updated in place
         // as we insert extents for each unmapped run; patched into `raw`
@@ -4876,6 +4911,19 @@ impl Filesystem {
         self.buffer_patch_bgd_counters(&mut buf, target_gi, 0, 0, -1)?;
         // SB: free_blocks_count += freed, free_inodes_count += 1.
         self.buffer_patch_sb_counters(&mut buf, freed_blocks as i64, 1)?;
+
+        // Zero the freed directory inode body (mode/links -> 0, set dtime, keep
+        // the generation) so the slot no longer reads as a live directory.
+        // Without this the freed inode keeps S_IFDIR + its "." / ".." and
+        // e2fsck reports "unconnected directory inode", a stale ".." and bad
+        // refcounts — the same cleanup apply_unlink already does for files.
+        let inode_size = self.sb.inode_size as usize;
+        let mut target_raw = vec![0u8; inode_size];
+        let dtime = now_unix_seconds();
+        target_raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
+        target_raw[0x64..0x68].copy_from_slice(&target_inode.generation.to_le_bytes());
+        self.finalize_inode_raw(target_ino, target_inode.generation, &mut target_raw)?;
+        self.buffer_write_inode(&mut buf, target_ino, &target_raw)?;
 
         // Remove the entry from the parent directory.
         let parent_blocks = parent_inode.size.div_ceil(bs as u64);

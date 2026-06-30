@@ -291,3 +291,79 @@ fn exhaustive_single_bit_flip_first_sector_never_panics() {
         }
     }
 }
+
+/// Aggressive deep-walk fuzz: for several feature-rich images, flip every byte
+/// across the dense metadata region and run a FULL walk — mount + `fsck::audit`
+/// (traverses every directory + inode) + per-inode extent collection. The
+/// htree/xattr/inline images exercise the more complex parsers under
+/// corruption. `catch_unwind` collects every panic so one doesn't mask the
+/// rest. Marked `#[ignore]` (slow); run with `cargo test -- --ignored`.
+#[test]
+#[ignore = "slow corrupt-input fuzz; run explicitly with --ignored"]
+fn deep_walk_byte_flip_fuzz_never_panics() {
+    use fs_ext4::{extent, fsck};
+
+    let images = [
+        "ext4-htree.img",
+        "ext4-xattr.img",
+        "ext4-csum-seed.img",
+        "ext4-inline.img",
+    ];
+    let prev = std::panic::take_hook();
+    std::panic::set_hook(Box::new(|_| {})); // silence the expected panics during the sweep
+    let mut panics: Vec<String> = Vec::new();
+
+    for img in images {
+        let Ok(bytes) = std::fs::read(format!("test-disks/{img}")) else {
+            continue;
+        };
+        let hi = bytes.len().min(0x2800); // superblock + GDT + first inode-table/dir blocks
+        let mut off = 0x400usize;
+        while off < hi {
+            let mut m = bytes.clone();
+            m[off] ^= 0xFF;
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if let Ok(fs) = Filesystem::mount(MemDevice::new(m)) {
+                    let _ = fsck::audit(&fs, u32::MAX, u32::MAX);
+                    for ino in 1..=24u32 {
+                        if let Ok((inode, _)) = fs.read_inode_verified(ino) {
+                            let _ = extent::collect_all(
+                                &inode.block,
+                                fs.dev.as_ref(),
+                                fs.sb.block_size(),
+                            );
+                        }
+                    }
+                }
+            }));
+            if res.is_err() {
+                panics.push(format!("{img}@{off:#x}"));
+            }
+            off += 2;
+        }
+
+        // Truncation: a short device (read past EOF) must surface Err, never panic.
+        for cut in [256usize, 512, 1024, 1536, 2048, 3072, 4096, 6144, 0x2000] {
+            if cut >= bytes.len() {
+                continue;
+            }
+            let m = bytes[..cut].to_vec();
+            let res = std::panic::catch_unwind(std::panic::AssertUnwindSafe(move || {
+                if let Ok(fs) = Filesystem::mount(MemDevice::new(m)) {
+                    let _ = fsck::audit(&fs, u32::MAX, u32::MAX);
+                }
+            }));
+            if res.is_err() {
+                panics.push(format!("{img}@trunc{cut}"));
+            }
+        }
+    }
+
+    std::panic::set_hook(prev);
+    assert!(
+        panics.is_empty(),
+        "{} panic(s) on malformed input: {:?}",
+        panics.len(),
+        &panics[..panics.len().min(25)]
+    );
+}
