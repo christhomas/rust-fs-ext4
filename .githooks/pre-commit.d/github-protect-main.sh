@@ -22,18 +22,37 @@ branch=$(gh api "repos/$slug" --jq '.default_branch' 2>/dev/null) || {
 # require them, strict. Self-healing — re-applied whenever the discovered set
 # drifts, so a renamed/added CI job syncs on the next commit after it runs.
 # Never strips existing checks on a transient empty discovery.
-desired=$(gh api "repos/$slug/commits/$branch/check-runs" \
-  --jq '[.check_runs[] | select(.app.slug=="github-actions") | .name] | unique | tojson' 2>/dev/null)
+#
+# --paginate so repos with >30 distinct job names on HEAD aren't truncated to
+# the first page; emit the modern `checks` shape ([{context}]) rather than the
+# deprecated flat `contexts` array. Built without a standalone jq dependency:
+# gh's embedded --jq streams the matching names across all pages, and we
+# assemble the JSON here (escaping " and \ so odd job names stay valid JSON).
+desired='[]'
+names=$(gh api --paginate "repos/$slug/commits/$branch/check-runs?per_page=100" \
+  --jq '.check_runs[] | select(.app.slug=="github-actions") | .name' 2>/dev/null | LC_ALL=C sort -u)
+if [ -n "$names" ]; then
+  items=""
+  while IFS= read -r n; do
+    [ -n "$n" ] || continue
+    esc=${n//\\/\\\\}; esc=${esc//\"/\\\"}
+    items="$items,{\"context\":\"$esc\"}"
+  done <<NAMES
+$names
+NAMES
+  desired="[${items#,}]"
+fi
 
 # Current protection facts in one call: PR reviews present? admins enforced?
-# plus the currently-required contexts (sorted JSON). Empty when unprotected.
+# plus the currently-required checks read from the modern `checks` field
+# (normalized to {context}, sorted). Empty when unprotected.
 IFS=$'\t' read -r has_reviews has_admins current < <(
   gh api "repos/$slug/branches/$branch/protection" --jq \
     '[ (.required_pull_request_reviews != null),
        (.enforce_admins.enabled // false),
-       ((.required_status_checks.contexts // []) | sort | tojson) ] | @tsv' 2>/dev/null)
+       ((.required_status_checks.checks // []) | map({context: .context}) | unique | tojson) ] | @tsv' 2>/dev/null)
 
-# Contexts to require: prefer a fresh discovery; else keep what's already set;
+# Checks to require: prefer a fresh discovery; else keep what's already set;
 # never strip checks just because this commit's HEAD has no Actions runs yet.
 if [ -n "$desired" ] && [ "$desired" != "[]" ]; then
   want="$desired"
@@ -52,7 +71,7 @@ if [ "$want" = "[]" ]; then
   rsc='null'
   echo "github-guard: protecting $slug:$branch (require PR, enforce admins, linear history)…" >&2
 else
-  rsc="{ \"strict\": true, \"contexts\": $want }"
+  rsc="{ \"strict\": true, \"checks\": $want }"
   echo "github-guard: protecting $slug:$branch (require PR, enforce admins, linear history, required checks $want)…" >&2
 fi
 
