@@ -2873,6 +2873,12 @@ impl Filesystem {
         // aligned chunks that each fit one transaction; every chunk commits
         // atomically (POSIX pwrite is not atomic across a large range anyway).
         let tags_per_desc = (bs_usize.saturating_sub(12)) / 16;
+        // Reserve 8 tag slots for this transaction's own metadata: inode, block
+        // bitmap, BGD, superblock, plus up to ~4 extent-tree node blocks when a
+        // chunk's extents grow the tree. A chunk of (tags_per_desc - 8) data
+        // blocks always lands in a single block group (247 blocks at 4 KiB, well
+        // inside a 128 MiB group), so the real overhead is <= 4 — 8 is a
+        // conservative ~2x bound.
         let max_data_blocks = tags_per_desc.saturating_sub(8).max(1) as u64;
         let max_chunk = max_data_blocks * bs;
         if len > max_chunk {
