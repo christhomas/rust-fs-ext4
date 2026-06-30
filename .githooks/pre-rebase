@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# github-guard hook: pre-rebase
+#
+# Fires:    Before `git rebase` starts.
+# Use for:  Forbidding rebases of already-published branches.
+# Blocking: yes (non-zero stops the rebase)
+#
+# Dispatcher: runs every executable script in  .githooks/pre-rebase.d/  in lexical
+# order. Add behaviour by dropping a guard script there; remove it by deleting
+# the file (or `chmod -x`). No pre-rebase.d/ (or an empty one) = no-op. Managed by
+# github-guard — edit guards in the .d/ dir, not this file.
+d=$(cd "$(dirname "$0")" && pwd)
+exec "$d/lib/run-guards.sh" "$(basename "$0")" "$@"

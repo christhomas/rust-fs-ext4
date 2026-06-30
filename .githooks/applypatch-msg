@@ -1,0 +1,13 @@
+#!/usr/bin/env bash
+# github-guard hook: applypatch-msg
+#
+# Fires:    During `git am`, before a mailed patch is committed — to check its message.
+# Use for:  Validating/normalizing commit messages of emailed patches.
+# Blocking: yes (non-zero stops `git am`)
+#
+# Dispatcher: runs every executable script in  .githooks/applypatch-msg.d/  in lexical
+# order. Add behaviour by dropping a guard script there; remove it by deleting
+# the file (or `chmod -x`). No applypatch-msg.d/ (or an empty one) = no-op. Managed by
+# github-guard — edit guards in the .d/ dir, not this file.
+d=$(cd "$(dirname "$0")" && pwd)
+exec "$d/lib/run-guards.sh" "$(basename "$0")" "$@"
