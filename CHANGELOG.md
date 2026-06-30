@@ -2,6 +2,8 @@
 
 ## [Unreleased]
 
+## [0.4.0] — 2026-07-01
+
 ### Features
 
 - **Multiple block groups (ext4)** — `format_filesystem` /
@@ -50,6 +52,31 @@
     can detect IMMUTABLE, NODUMP, APPEND_ONLY, CASEFOLD, etc.
   - `generation` — `i_generation` for NFS stale-handle detection.
   - `blocks_512` — `i_blocks` in 512-byte units (matches `st_blocks`).
+
+### Fixes
+
+- **Metadata-checksum & free-count coherency on write** — bitmap, inode, and
+  journal-superblock checksums are now recomputed when the underlying metadata
+  changes; `bg_itable_unused` is maintained on inode allocation; superblock
+  free-block / free-inode counts stay coherent across consecutive allocate/free
+  ops (`patch_sb_counters` was re-reading the immutable mount-time snapshot and
+  clobbering deltas). Fixes `e2fsck` "does not match checksum" / "free … count
+  wrong" reports on written images.
+
+- **Write-path hardening (dir / xattr / pwrite)** — `apply_rmdir` clears the
+  freed directory inode; external xattr blocks compute correct entry/block
+  hashes; `removexattr`'s external-block free is journaled (crash-safe); large
+  pwrites are split into per-transaction chunks so they can't overflow a single
+  journal descriptor block. Directory growth refreshes the block-bitmap
+  checksum alongside the BGD + SB counter updates in one cache-coherent commit.
+
+- **mkfs 1 KiB-block & ext3 correctness** — the group-0 block bitmap is indexed
+  in bit space (accounting for `first_data_block = 1` on 1 KiB blocks), fixing
+  an off-by-one tail and the missing trailing pad bit; the ext3 journal's
+  indirect-map blocks are counted as used. 1 KiB and ext3 images now pass the
+  in-process `fsck::audit`; 2 KiB / 4 KiB output is byte-identical to before.
+  New `mkfs_e2fsck_oracle` / `mkfs_ext3_oracle` oracle test harnesses across
+  block sizes and flavors.
 
 ## [0.2.1] — 2026-05-20
 
