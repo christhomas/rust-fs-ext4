@@ -25,22 +25,18 @@ branch=$(gh api "repos/$slug" --jq '.default_branch' 2>/dev/null) || {
 #
 # --paginate so repos with >30 distinct job names on HEAD aren't truncated to
 # the first page; emit the modern `checks` shape ([{context}]) rather than the
-# deprecated flat `contexts` array. Built without a standalone jq dependency:
-# gh's embedded --jq streams the matching names across all pages, and we
-# assemble the JSON here (escaping " and \ so odd job names stay valid JSON).
+# deprecated flat `contexts` array. We assemble the JSON with jq — the SAME
+# tool the read-back below uses — so JSON string escaping (control chars,
+# quotes, backslashes) and sort order are identical by construction, with no
+# writer/reader drift. gh streams the matching names (one per line) across all
+# pages; jq slurps, wraps each as {context}, dedups + sorts. If jq is absent we
+# leave `desired` empty and preserve whatever's already set (fail-open).
 desired='[]'
-names=$(gh api --paginate "repos/$slug/commits/$branch/check-runs?per_page=100" \
-  --jq '.check_runs[] | select(.app.slug=="github-actions") | .name' 2>/dev/null | LC_ALL=C sort -u)
-if [ -n "$names" ]; then
-  items=""
-  while IFS= read -r n; do
-    [ -n "$n" ] || continue
-    esc=${n//\\/\\\\}; esc=${esc//\"/\\\"}
-    items="$items,{\"context\":\"$esc\"}"
-  done <<NAMES
-$names
-NAMES
-  desired="[${items#,}]"
+if command -v jq >/dev/null 2>&1; then
+  desired=$(gh api --paginate "repos/$slug/commits/$branch/check-runs?per_page=100" \
+    --jq '.check_runs[] | select(.app.slug=="github-actions") | .name' 2>/dev/null \
+    | jq -sRc 'split("\n") | map(select(length > 0)) | map({context: .}) | unique')
+  [ -n "$desired" ] || desired='[]'
 fi
 
 # Current protection facts in one call: PR reviews present? admins enforced?
