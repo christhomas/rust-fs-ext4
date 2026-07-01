@@ -19,18 +19,21 @@ branch=$(gh api "repos/$slug" --jq '.default_branch' 2>/dev/null) || {
 
 # Required status checks: auto-discover the default branch's GitHub Actions
 # check-runs (so third-party app checks like coderabbit are excluded) and
-# require them, strict. Self-healing — re-applied whenever the discovered set
-# drifts, so a renamed/added CI job syncs on the next commit after it runs.
-# Never strips existing checks on a transient empty discovery.
+# require them, strict. Discovery is scoped to the default branch's HEAD, so a
+# newly-added job isn't required until it has run there once: protection lags a
+# new job by one commit cycle (added on the first commit after its CI runs).
+# Self-healing — re-applied whenever the discovered set drifts; never strips
+# existing checks on a transient empty discovery.
 #
 # --paginate so repos with >30 distinct job names on HEAD aren't truncated to
 # the first page; emit the modern `checks` shape ([{context}]) rather than the
-# deprecated flat `contexts` array. We assemble the JSON with jq — the SAME
-# tool the read-back below uses — so JSON string escaping (control chars,
-# quotes, backslashes) and sort order are identical by construction, with no
-# writer/reader drift. gh streams the matching names (one per line) across all
-# pages; jq slurps, wraps each as {context}, dedups + sorts. If jq is absent we
-# leave `desired` empty and preserve whatever's already set (fail-open).
+# deprecated flat `contexts` array. Both `desired` (here) and `current` (the
+# read-back below) end as compact JSON straight from jq's encoder — `desired`
+# via `jq -c`, `current` via `tojson` — so escaping (quotes, backslashes) and
+# sort order match and the equality check below is exact. gh streams the
+# matching names (one per line) across all pages; jq slurps, wraps each as
+# {context}, dedups + sorts. If jq is absent we leave `desired` empty and
+# preserve whatever's already set (fail-open).
 desired='[]'
 if command -v jq >/dev/null 2>&1; then
   desired=$(gh api --paginate "repos/$slug/commits/$branch/check-runs?per_page=100" \
@@ -40,13 +43,18 @@ if command -v jq >/dev/null 2>&1; then
 fi
 
 # Current protection facts in one call: PR reviews present? admins enforced?
-# plus the currently-required checks read from the modern `checks` field
-# (normalized to {context}, sorted). Empty when unprotected.
-IFS=$'\t' read -r has_reviews has_admins current < <(
+# plus the currently-required checks from the modern `checks` field (normalized
+# to {context}, sorted). Each value is emitted on its OWN line, NOT through
+# `@tsv` — `@tsv` adds a second escaping pass on top of `tojson`, so a job name
+# containing `"` or `\` would read back double-escaped and never equal the
+# `jq -c`-encoded `desired`, re-applying protection on every commit. `tojson`
+# output is single-line, so line-reading each field is safe. Empty when unprotected.
+{ IFS= read -r has_reviews; IFS= read -r has_admins; IFS= read -r current; } < <(
   gh api "repos/$slug/branches/$branch/protection" --jq \
-    '[ (.required_pull_request_reviews != null),
-       (.enforce_admins.enabled // false),
-       ((.required_status_checks.checks // []) | map({context: .context}) | unique | tojson) ] | @tsv' 2>/dev/null)
+    '(.required_pull_request_reviews != null),
+     (.enforce_admins.enabled // false),
+     ((.required_status_checks.checks // []) | map({context: .context}) | unique | tojson)' 2>/dev/null)
+[ -n "$current" ] || current='[]'
 
 # Checks to require: prefer a fresh discovery; else keep what's already set;
 # never strip checks just because this commit's HEAD has no Actions runs yet.
