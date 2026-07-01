@@ -17,29 +17,36 @@ branch=$(gh api "repos/$slug" --jq '.default_branch' 2>/dev/null) || {
   echo "github-guard: couldn't read default branch for $slug — skipping" >&2; exit 0; }
 [ -n "$branch" ] || exit 0
 
-# Required status checks: auto-discover the default branch's GitHub Actions
-# check-runs (so third-party app checks like coderabbit are excluded) and
-# require them, strict. Discovery is scoped to the default branch's HEAD, so a
-# newly-added job isn't required until it has run there once: protection lags a
-# new job by one commit cycle (added on the first commit after its CI runs).
-# Self-healing — re-applied whenever the discovered set drifts; never strips
-# existing checks on a transient empty discovery.
+# Required status checks: auto-discover the checks that GATE A PULL REQUEST and
+# require them, strict. The only checks that can gate a PR are the ones that run
+# on `pull_request`, so discover them from recent pull_request workflow runs —
+# NOT from the default branch's HEAD commit. That commit also carries release
+# checks triggered by a tag push OR a `workflow_dispatch` on the branch; those
+# never run on a PR, and requiring them makes every PR wait forever on checks
+# that can't complete. Take the latest pull_request run per workflow and union
+# their check-run names: exactly the PR gate. The github-actions app filter
+# still excludes third-party checks like coderabbit. Self-healing — a renamed or
+# added CI job syncs after the next PR runs it; never strips existing checks on
+# a transient empty discovery. jq required; without it we preserve whatever's
+# already set (fail-open).
 #
-# --paginate so repos with >30 distinct job names on HEAD aren't truncated to
-# the first page; emit the modern `checks` shape ([{context}]) rather than the
-# deprecated flat `contexts` array. Both `desired` (here) and `current` (the
-# read-back below) end as compact JSON straight from jq's encoder — `desired`
-# via `jq -c`, `current` via `tojson` — so escaping (quotes, backslashes) and
-# sort order match and the equality check below is exact. gh streams the
-# matching names (one per line) across all pages; jq slurps, wraps each as
-# {context}, dedups + sorts. If jq is absent we leave `desired` empty and
-# preserve whatever's already set (fail-open).
+# Both `desired` (here) and `current` (the read-back below) end as compact JSON
+# straight from jq (`jq -c` / `tojson`), so escaping (quotes, backslashes) and
+# sort order match and the equality check below is exact.
 desired='[]'
 if command -v jq >/dev/null 2>&1; then
-  desired=$(gh api --paginate "repos/$slug/commits/$branch/check-runs?per_page=100" \
-    --jq '.check_runs[] | select(.app.slug=="github-actions") | .name' 2>/dev/null \
-    | jq -sRc 'split("\n") | map(select(length > 0)) | map({context: .}) | unique')
-  [ -n "$desired" ] || desired='[]'
+  # check-suite of the latest pull_request run of each PR-triggering workflow.
+  suite_ids=$(gh api "repos/$slug/actions/runs?event=pull_request&per_page=50" \
+    --jq '[.workflow_runs[]?] | group_by(.workflow_id)[] | max_by(.created_at) | .check_suite_id' 2>/dev/null)
+  desired=$(
+    for sid in $suite_ids; do
+      gh api --paginate "repos/$slug/check-suites/$sid/check-runs?per_page=100" \
+        --jq '.check_runs[] | select(.app.slug=="github-actions") | .name' 2>/dev/null
+    done | jq -sRc 'split("\n") | map(select(length > 0)) | map({context: .}) | unique'
+  )
+  # Empty stdin yields "[]" here, but guard against a stray "null" too so a
+  # malformed value can never reach the protection PUT payload.
+  case "$desired" in '' | null) desired='[]' ;; esac
 fi
 
 # Current protection facts in one call: PR reviews present? admins enforced?
