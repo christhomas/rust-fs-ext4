@@ -284,6 +284,16 @@ ticked. Numbering follows the plan doc.
 
 Highlights from the last 50 commits, grouped by date.
 
+### 2026-06-30 — 0.4.0 — multiple block groups + write-path/mkfs correctness
+
+- Multiple block groups for ext4 (full GDT + per-group bitmaps/inode tables;
+  sparse-super backups for `e2fsck -b` recovery).
+- Correctness: on-write metadata checksums + SB free-count coherency;
+  dir/xattr/pwrite write-path hardening; 1 KiB-block & ext3 mkfs fixes
+  (validated by the new in-process + `e2fsck` oracle harnesses).
+- (The deep-dir-extents / casefold / `fs_ext4_mknod` / `fs_ext4_set_flags` /
+  extended-`fs_ext4_attr_t` features shipped in 0.3.0 — see `CHANGELOG.md`.)
+
 ### 2026-05-03 — Phase 1+3+5+6 rollup, ext2/3 RW, crash sweeps
 
 - `64d6e6b` crash-safety sweeps for the remaining multi-block ops.
