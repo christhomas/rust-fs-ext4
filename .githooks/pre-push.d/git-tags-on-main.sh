@@ -44,7 +44,7 @@ while read -r local_ref local_sha remote_ref remote_sha; do
   # default branch — block it rather than silently letting it through.
   commit=$(git rev-parse --quiet --verify "${local_sha}^{commit}" 2>/dev/null) || {
     tag=${remote_ref#refs/tags/}
-    printf 'github-guard: BLOCKED — tag %q does not point at a commit object.\n' "$tag" >&2
+    printf 'github-guard: BLOCKED — tag %s does not point at a commit object.\n' "$tag" >&2
     status=1
     continue
   }
@@ -56,11 +56,11 @@ while read -r local_ref local_sha remote_ref remote_sha; do
 
   if [ "$on_main" != 1 ]; then
     tag=${remote_ref#refs/tags/}
-    printf 'github-guard: BLOCKED — tag %q points at %s, which is not on %s.\n' \
+    printf 'github-guard: BLOCKED — tag %s points at %s, which is not on %s.\n' \
       "$tag" "$(git rev-parse --short "$commit")" "$default" >&2
     printf '  Release tags must mark a commit that landed on %s. Re-point it:\n' "$default" >&2
-    printf '    git tag -f %q <commit-on-%s>   # e.g. the squash-merge commit\n' "$tag" "$default" >&2
-    printf '    git push --force %q %q\n' "$remote" "$tag" >&2
+    printf "    git tag -f '%s' <commit-on-%s>   # e.g. the squash-merge commit\n" "$tag" "$default" >&2
+    printf "    git push --force '%s' '%s'\n" "$remote" "$tag" >&2
     status=1
   fi
 done
