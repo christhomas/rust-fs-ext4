@@ -52,9 +52,14 @@ if [ -n "$owner" ] && [ -d .github/workflows ]; then
           # A real pin is an IMMUTABLE ref. Pull out the --branch/-b value: empty
           # means no pin at all, and a well-known MUTABLE branch name (main/master/
           # …) is just as floating as none — block both; anything else (a tag) ok.
-          brval=$(printf '%s' "$logical" | sed -nE 's/.*[[:space:]](--branch[ =]|-b[[:space:]])([^[:space:]]+).*/\2/p')
-          case "$brval" in
-            main | master | develop | trunk | HEAD)
+          brval=$(printf '%s' "$logical" | sed -nE 's/.*(^|[[:space:]])(--branch[ =]|-b[[:space:]]*)([^[:space:]]+).*/\3/p')
+          brval=${brval//\"/}; brval=${brval//\'/}     # strip surrounding quotes
+          # Heuristic blocklist of well-known mutable branch names (not exhaustive
+          # by design — the authoritative reproducibility gate is the Cargo.lock
+          # checks below + CI's --locked; this just catches the common offenders).
+          # Matched case-insensitively so Main/MAIN/Develop are caught too.
+          case "$(printf '%s' "$brval" | tr '[:upper:]' '[:lower:]')" in
+            main | master | develop | dev | trunk | head | next | staging | release | canary)
               echo "[deps] FLOATING git clone — --branch '$brval' is a MUTABLE branch (pin a tag) in $wf:" >&2
               echo "       ${logical#"${logical%%[![:space:]]*}"}" >&2
               fail=1 ;;

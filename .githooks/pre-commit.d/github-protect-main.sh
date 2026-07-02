@@ -74,12 +74,11 @@ fi
 # keep current untouched. (jq required for the union; without it we already
 # fell through with desired='[]' and keep current.)
 if [ -n "$desired" ] && [ "$desired" != "[]" ]; then
-  if command -v jq >/dev/null 2>&1; then
-    want=$(printf '%s\n%s' "$desired" "$current" \
-      | jq -sc 'add | map(select(.context? != null)) | unique')
-  else
-    want="$desired"
-  fi
+  # $desired is only ever non-'[]' when the jq-guarded discovery above populated
+  # it, so jq is guaranteed here — union discovered with existing (additive; never
+  # a bare replace, which is what would drop checks on a partial discovery).
+  want=$(printf '%s\n%s' "$desired" "$current" \
+    | jq -sc 'add | map(select(.context? != null)) | unique')
 elif [ -n "$current" ] && [ "$current" != "[]" ]; then
   want="$current"
 else
