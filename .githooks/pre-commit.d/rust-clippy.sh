@@ -28,7 +28,10 @@ while IFS= read -r toml; do
       echo "             checked out; clippy can't compile without it. CI enforces clippy." >&2
       exit 0
     fi
-  done < <(grep -oE 'path[[:space:]]*=[[:space:]]*"[^"]+"' "$root/$toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')
+    # Anchor `path` to a key boundary (start / space / , / {) so `manifest-path`
+    # and friends don't match; drop full-line comments too.
+  done < <(grep -vE '^[[:space:]]*#' "$root/$toml" 2>/dev/null \
+             | grep -oE '(^|[[:space:],{])path[[:space:]]*=[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
 done < <(git -C "$root" ls-files '*Cargo.toml' 'Cargo.toml')
 
 # Run via gg_cargo (the rustup shim), which honors rust-toolchain.toml so local
