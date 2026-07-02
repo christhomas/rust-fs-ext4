@@ -38,17 +38,39 @@ if [ -n "$owner" ] && [ -d .github/workflows ]; then
   shopt -s nullglob 2>/dev/null || true
   for wf in .github/workflows/*.yml .github/workflows/*.yaml; do
     [ -f "$wf" ] || continue
-    while IFS= read -r line; do
-      case "$line" in
+    # Join shell line-continuations (a trailing '\') into one logical line before
+    # scanning: in a `run: |` block a `git clone …\` and its `--branch vX` land on
+    # two physical lines, and a per-physical-line check would flag the first as
+    # unpinned even though the clone is pinned.
+    logical=""
+    while IFS= read -r line || [ -n "$line" ]; do
+      line=${line%$'\r'}
+      logical="${logical:+$logical }$line"
+      case "$logical" in *\\) logical=${logical%\\}; continue ;; esac   # keep joining
+      case "$logical" in
         *"git clone"*github.com[:/]"$owner"/*)
-          case "$line" in
-            *--branch*|*" -b "*) : ;;                      # pinned to a tag → ok
-            *)
-              echo "[deps] FLOATING git clone of a sibling repo (add --branch v<X>) in $wf:" >&2
-              echo "       ${line#"${line%%[![:space:]]*}"}" >&2
+          # A real pin is an IMMUTABLE ref. Pull out the --branch/-b value: empty
+          # means no pin at all, and a well-known MUTABLE branch name (main/master/
+          # …) is just as floating as none — block both; anything else (a tag) ok.
+          brval=$(printf '%s' "$logical" | sed -nE 's/.*(^|[[:space:]])(--branch[ =]|-b[[:space:]]*)([^[:space:]]+).*/\3/p')
+          brval=${brval//\"/}; brval=${brval//\'/}     # strip surrounding quotes
+          # Heuristic blocklist of well-known mutable branch names (not exhaustive
+          # by design — the authoritative reproducibility gate is the Cargo.lock
+          # checks below + CI's --locked; this just catches the common offenders).
+          # Matched case-insensitively so Main/MAIN/Develop are caught too.
+          case "$(printf '%s' "$brval" | tr '[:upper:]' '[:lower:]')" in
+            main | master | develop | dev | trunk | head | next | staging | release | canary)
+              echo "[deps] FLOATING git clone — --branch '$brval' is a MUTABLE branch (pin a tag) in $wf:" >&2
+              echo "       ${logical#"${logical%%[![:space:]]*}"}" >&2
               fail=1 ;;
+            '')
+              echo "[deps] FLOATING git clone of a sibling repo (add --branch v<X>) in $wf:" >&2
+              echo "       ${logical#"${logical%%[![:space:]]*}"}" >&2
+              fail=1 ;;
+            *) : ;;                                        # pinned to a tag → ok
           esac ;;
       esac
+      logical=""
     done < "$wf"
   done
 
@@ -56,10 +78,21 @@ if [ -n "$owner" ] && [ -d .github/workflows ]; then
   # with ruby's stdlib YAML when available; skipped (never failed) if ruby isn't.
   if command -v ruby >/dev/null 2>&1; then
     ruby -ryaml -e '
+      # aliases: is a ruby >= 2.7 kwarg; on older rubies (e.g. macOS system ruby)
+      # passing it raises ArgumentError, which — if rescued straight to nil — would
+      # silently skip EVERY workflow and disable this check. Fall back to a plain
+      # safe_load there so the ref-pinning check still runs.
+      def load_wf(f)
+        YAML.safe_load(File.read(f), aliases: true)
+      rescue ArgumentError
+        (YAML.safe_load(File.read(f)) rescue nil)
+      rescue
+        nil
+      end
       owner = ARGV[0]
       bad = []
       Dir.glob(".github/workflows/*.{yml,yaml}").each do |wf|
-        doc = (YAML.safe_load(File.read(wf), aliases: true) rescue nil)
+        doc = load_wf(wf)
         next unless doc.is_a?(Hash)
         (doc["jobs"] || {}).each_value do |job|
           next unless job.is_a?(Hash)
@@ -121,7 +154,11 @@ elif [ -f Cargo.lock ]; then
   # crates keep the full check.
   ext_path_dep=0
   while IFS= read -r toml; do
-    if grep -qE 'path[[:space:]]*=[[:space:]]*"\.\.?/' "$toml" 2>/dev/null; then ext_path_dep=1; break; fi
+    # Anchor `path` to a key boundary (start / space / , / {) so it matches the
+    # dependency `path =` key, not a suffix like `manifest-path =`; drop full-line
+    # comments so a commented example doesn't count.
+    if grep -vE '^[[:space:]]*#' "$toml" 2>/dev/null \
+         | grep -qE '(^|[[:space:],{])path[[:space:]]*=[[:space:]]*"\.\.?/'; then ext_path_dep=1; break; fi
   done < <(git ls-files '*Cargo.toml' 'Cargo.toml')
   if [ "$ext_path_dep" = 0 ]; then
     # BLOCK only on the staleness signal; any other failure (empty offline cache,

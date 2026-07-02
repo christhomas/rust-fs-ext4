@@ -21,6 +21,9 @@ root=$(git rev-parse --show-toplevel 2>/dev/null) || exit 0
 while IFS= read -r toml; do
   [ -f "$root/$toml" ] || continue
   tdir=$(cd "$(dirname "$root/$toml")" && pwd) || continue
+  # Feed the loop each `path = "…"` value from this manifest. Anchor `path` to a
+  # key boundary (start / space / , / {) so `manifest-path` & friends don't match,
+  # and drop full-line comments first.
   while IFS= read -r rel; do
     [ -n "$rel" ] || continue
     if [ ! -e "$tdir/$rel" ]; then
@@ -28,7 +31,8 @@ while IFS= read -r toml; do
       echo "             checked out; clippy can't compile without it. CI enforces clippy." >&2
       exit 0
     fi
-  done < <(grep -oE 'path[[:space:]]*=[[:space:]]*"[^"]+"' "$root/$toml" 2>/dev/null | sed -E 's/.*"([^"]+)".*/\1/')
+  done < <(grep -vE '^[[:space:]]*#' "$root/$toml" 2>/dev/null \
+             | grep -oE '(^|[[:space:],{])path[[:space:]]*=[[:space:]]*"[^"]+"' | sed -E 's/.*"([^"]+)".*/\1/')
 done < <(git -C "$root" ls-files '*Cargo.toml' 'Cargo.toml')
 
 # Run via gg_cargo (the rustup shim), which honors rust-toolchain.toml so local

@@ -36,7 +36,9 @@ branch=$(gh api "repos/$slug" --jq '.default_branch' 2>/dev/null) || {
 desired='[]'
 if command -v jq >/dev/null 2>&1; then
   # check-suite of the latest pull_request run of each PR-triggering workflow.
-  suite_ids=$(gh api "repos/$slug/actions/runs?event=pull_request&per_page=50" \
+  # per_page=100 (not 50) widens the window so a workflow whose latest PR run is
+  # a bit older still gets discovered; the union below is the backstop for gaps.
+  suite_ids=$(gh api "repos/$slug/actions/runs?event=pull_request&per_page=100" \
     --jq '[.workflow_runs[]?] | group_by(.workflow_id)[] | max_by(.created_at) | .check_suite_id' 2>/dev/null)
   desired=$(
     for sid in $suite_ids; do
@@ -63,10 +65,20 @@ fi
      ((.required_status_checks.checks // []) | map({context: .context}) | unique | tojson)' 2>/dev/null)
 [ -n "$current" ] || current='[]'
 
-# Checks to require: prefer a fresh discovery; else keep what's already set;
-# never strip checks just because this commit's HEAD has no Actions runs yet.
+# Checks to require: be strictly ADDITIVE — union what we just discovered with
+# what's already required, never a bare replace. A discovery that's non-empty but
+# PARTIAL (a PR-gating workflow whose latest run fell outside the window above)
+# would otherwise overwrite `current` and silently drop the missing workflows'
+# checks — the exact "never strip existing checks" promise, broken. Union keeps
+# every already-required check and adds any newly-seen one. Empty discovery →
+# keep current untouched. (jq required for the union; without it we already
+# fell through with desired='[]' and keep current.)
 if [ -n "$desired" ] && [ "$desired" != "[]" ]; then
-  want="$desired"
+  # $desired is only ever non-'[]' when the jq-guarded discovery above populated
+  # it, so jq is guaranteed here — union discovered with existing (additive; never
+  # a bare replace, which is what would drop checks on a partial discovery).
+  want=$(printf '%s\n%s' "$desired" "$current" \
+    | jq -sc 'add | map(select(.context? != null)) | unique')
 elif [ -n "$current" ] && [ "$current" != "[]" ]; then
   want="$current"
 else
