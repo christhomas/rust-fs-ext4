@@ -58,12 +58,18 @@ fi
 # containing `"` or `\` would read back double-escaped and never equal the
 # `jq -c`-encoded `desired`, re-applying protection on every commit. `tojson`
 # output is single-line, so line-reading each field is safe. Empty when unprotected.
-{ IFS= read -r has_reviews; IFS= read -r has_admins; IFS= read -r current; } < <(
+{ IFS= read -r has_reviews; IFS= read -r has_admins; IFS= read -r current; IFS= read -r review_count; } < <(
   gh api "repos/$slug/branches/$branch/protection" --jq \
     '(.required_pull_request_reviews != null),
      (.enforce_admins.enabled // false),
-     ((.required_status_checks.checks // []) | map({context: .context}) | unique | tojson)' 2>/dev/null)
+     ((.required_status_checks.checks // []) | map({context: .context}) | unique | tojson),
+     (.required_pull_request_reviews.required_approving_review_count // 0)' 2>/dev/null)
 [ -n "$current" ] || current='[]'
+# Preserve any already-configured approval count instead of hardcoding 0: re-applying
+# protection must never silently DOWNGRADE a team's "require N reviews" back to 0.
+# Default 0 (require a PR, no approvals) for the solo case / a fresh unprotected branch.
+# Sanitize to digits so only a number can reach the JSON payload below.
+case "$review_count" in '' | *[!0-9]*) review_count=0 ;; esac
 
 # Checks to require: be strictly ADDITIVE — union what we just discovered with
 # what's already required, never a bare replace. A discovery that's non-empty but
@@ -102,7 +108,7 @@ payload=$(cat <<JSON
 {
   "required_status_checks": $rsc,
   "enforce_admins": true,
-  "required_pull_request_reviews": { "required_approving_review_count": 0, "dismiss_stale_reviews": false, "require_code_owner_reviews": false },
+  "required_pull_request_reviews": { "required_approving_review_count": $review_count, "dismiss_stale_reviews": false, "require_code_owner_reviews": false },
   "restrictions": null,
   "required_linear_history": true,
   "allow_force_pushes": false,

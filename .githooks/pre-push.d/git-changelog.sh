@@ -13,10 +13,64 @@
 # Conventions: the README changelog section is a heading matching
 # changelog/release notes/recent changes/releases/history; version entries
 # inside it are deeper (e.g. `### v0.2.0`) sub-headings. Bypass: git push --no-verify.
+#
+# Also usable as a CLI: `git-changelog.sh notes vX.Y.Z` prints that version's
+# release notes from CHANGELOG.md. A release pipeline can call this, so the
+# changelog this guard enforces is the single source of truth for release bodies.
 set -u
 dir=$(cd "$(dirname "$0")/.." && pwd)   # .githooks/
 # shellcheck source=../lib/common.sh
 . "$dir/lib/common.sh"
+
+# --- changelog extraction (shared by the hook below and a release pipeline) ---
+# Print CHANGELOG.md's body for a version (no heading) — from its "## vX.Y.Z"
+# heading up to the next "## v" heading, with leading blank lines trimmed.
+# Reads the changelog on stdin.
+changelog_section() {  # $1 = version, no leading v
+  awk -v ver="$1" '
+    /^##[[:space:]]+v/ {
+      s=$0; sub(/^##[[:space:]]+v/, "", s); split(s, a, /[[:space:]]/); v=a[1]
+      if (insec) exit
+      if (v == ver) { insec=1; next }
+    }
+    insec {
+      if (!started && $0 ~ /^[[:space:]]*$/) next
+      started=1; print
+    }
+  '
+}
+
+# Print the version of the next-older release (the "## v" heading after $1),
+# for the "Full Changelog" compare link. Empty for the first release.
+changelog_prev_version() {  # $1 = version, no leading v
+  awk -v ver="$1" '
+    /^##[[:space:]]+v/ {
+      s=$0; sub(/^##[[:space:]]+v/, "", s); split(s, a, /[[:space:]]/); v=a[1]
+      if (found) { print v; exit }
+      if (v == ver) found=1
+    }
+  '
+}
+
+# Subcommand `notes <version>`: emit GitHub release notes for a version from the
+# SAME CHANGELOG.md this guard enforces, so the release body can't drift from the
+# changelog. Fails loudly if the section is missing (the guard would have blocked
+# the tag anyway).  Usage: git-changelog.sh notes v0.4.0
+if [ "${1:-}" = "notes" ]; then
+  ver=${2#v}
+  root=$(git rev-parse --show-toplevel 2>/dev/null) || { echo "git-changelog: not a git repo" >&2; exit 1; }
+  cl="$root/CHANGELOG.md"
+  [ -f "$cl" ] || { echo "git-changelog: no CHANGELOG.md" >&2; exit 1; }
+  body=$(changelog_section "$ver" < "$cl")
+  [ -n "$body" ] || { echo "git-changelog: no '## v$ver' section in CHANGELOG.md" >&2; exit 1; }
+  printf "## What's Changed\n\n%s\n" "$body"
+  prev=$(changelog_prev_version "$ver" < "$cl")
+  slug=$(gg_repo_slug)
+  if [ -n "$prev" ] && [ -n "$slug" ]; then
+    printf '\n**Full Changelog**: https://github.com/%s/compare/v%s...v%s\n' "$slug" "$prev" "$ver"
+  fi
+  exit 0
+fi
 
 # Self-gate: repos without a changelog convention are unaffected.
 gg_has_changelog || exit 0
