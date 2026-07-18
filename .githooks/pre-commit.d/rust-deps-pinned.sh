@@ -125,8 +125,21 @@ if [ "$lock_tracked" = 1 ] && [ ! -f Cargo.lock ]; then
   echo "       Restore it: git checkout -- Cargo.lock   (or: cargo generate-lockfile)" >&2
   fail=1
 elif [ -f Cargo.lock ]; then
-  pkg=$(awk -F'"' '/^name[[:space:]]*=/{print $2; exit}' Cargo.toml)
-  ver=$(awk -F'"' '/^version[[:space:]]*=/{print $2; exit}' Cargo.toml)
+  # Read name/version ONLY from the [package] section. A workspace root, or a
+  # manifest carrying [[bin]]/[lib]/[workspace.dependencies] sections, has other
+  # `name =`/`version =` keys; a first-match scan would grab the wrong one (or, in
+  # a virtual workspace root with no [package], nothing meaningful) and either
+  # mis-compare or silently no-op. Section-scoping keeps the drift check honest;
+  # a manifest with no [package] (virtual workspace root) correctly yields empty
+  # and the guarded block below skips.
+  pkg=$(awk -F'"' '
+    /^[[:space:]]*\[/ { inpkg = ($0 ~ /^[[:space:]]*\[package\]/) }
+    inpkg && /^[[:space:]]*name[[:space:]]*=/ { print $2; exit }
+  ' Cargo.toml)
+  ver=$(awk -F'"' '
+    /^[[:space:]]*\[/ { inpkg = ($0 ~ /^[[:space:]]*\[package\]/) }
+    inpkg && /^[[:space:]]*version[[:space:]]*=/ { print $2; exit }
+  ' Cargo.toml)
   if [ -n "$pkg" ] && [ -n "$ver" ]; then
     lockver=$(awk -v p="$pkg" '
       $0 == "name = \"" p "\"" { hit=1; next }
