@@ -9,15 +9,33 @@
 # Echo the GitHub "owner/repo" slug for origin, or nothing if origin is missing
 # or not on github.com.
 gg_repo_slug() {
-  local url
+  local url rest host path
   url=$(git remote get-url origin 2>/dev/null) || return 0
+  url=${url%.git}
   case "$url" in
-    *github.com[:/]*) ;;
+    ssh://*|https://*|http://*)
+      # scheme://[user@]host[:port]/owner/repo (incl. GitHub SSH-over-443,
+      # ssh://git@ssh.github.com:443/owner/repo).
+      rest=${url#*://}; rest=${rest#*@}
+      host=${rest%%/*}; host=${host%%:*}
+      path=${rest#*/}
+      ;;
+    *:*)
+      # scp-style [user@]host:owner/repo (git@github.com:owner/repo).
+      host=${url%%:*}; host=${host#*@}
+      path=${url#*:}
+      ;;
+    *)
+      return 0 ;;
+  esac
+  # Only claim a slug for a real GitHub host — never a substring match like
+  # https://evil.com/github.com/owner/repo or ssh://git@github.com.example.org/…,
+  # which would otherwise let the GitHub guards act on an unrelated repo.
+  case "$host" in
+    github.com|ssh.github.com) ;;
     *) return 0 ;;
   esac
-  url=${url%.git}
-  url=${url#*github.com[:/]}
-  printf '%s' "$url"
+  printf '%s' "$path"
 }
 
 # True if gh is installed and authenticated.
