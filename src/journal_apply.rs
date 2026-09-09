@@ -26,7 +26,7 @@
 //! ```
 //!
 //! Once the writes are flushed, the journal superblock gets `s_start = 0`
-//! and the sequence after the last committed transaction, and the ext4
+//! and the sequence one past the first uncommitted transaction, and the ext4
 //! superblock loses `needs_recovery` (#228). Left dirty, every later mount
 //! replayed the same log again and `e2fsck` reported a journal with data
 //! in it. The order matters: a crash between the two leaves a clean
@@ -68,7 +68,7 @@ pub(crate) fn write_needs_recovery(dev: &dyn crate::block_io::BlockDevice, on: b
 }
 
 /// Record a replayed journal as done: `s_start = 0` and `s_sequence` the one
-/// after `last_commit` (the next transaction's), checksum redone, flushed.
+/// past the first uncommitted transaction, checksum redone, flushed.
 fn mark_journal_clean(fs: &Filesystem, jsb: &JournalSuperblock, plan: &ReplayPlan) -> Result<()> {
     let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
     let jinode = Inode::parse(&raw)?;
@@ -82,12 +82,15 @@ fn mark_journal_clean(fs: &Filesystem, jsb: &JournalSuperblock, plan: &ReplayPla
             "journal_apply: journal superblock lost its magic during replay",
         ));
     }
-    // `last_commit` stays 0 when the walk found no committed transaction.
-    let sequence = if plan.last_commit == 0 {
-        jsb.sequence
-    } else {
-        plan.last_commit.wrapping_add(1)
-    };
+    // Restart the log one past the first transaction the walk did not find
+    // committed, as the kernel's `jbd2_journal_recover` does
+    // (`++info.end_transaction`): a torn tail may already carry that ID, and
+    // reusing it could let a stale block pass as part of the next transaction.
+    // `next_sequence` rather than `last_commit`, whose 0 is also a real ID.
+    let sequence = plan
+        .next_sequence
+        .unwrap_or(jsb.sequence)
+        .wrapping_add(1);
     buf[0x18..0x1C].copy_from_slice(&sequence.to_be_bytes());
     buf[0x1C..0x20].copy_from_slice(&0u32.to_be_bytes());
     if jsb.uses_csum_v2_or_v3() {
