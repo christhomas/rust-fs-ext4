@@ -20,6 +20,175 @@ use crate::error::{Error, Result};
 use crate::extent::{Extent, ExtentHeader};
 use crate::extent_mut::{plan_free_extent, ExtentMutation};
 
+/// Plan a shrink through all supported ext4 extent-tree depths. No allocation
+/// or writes occur while planning. Empty subtrees are reclaimed, including
+/// their index/leaf blocks; nonempty nodes retain their original allocation.
+/// The caller verifies external-node checksums in `read` and patches checksums
+/// on returned writes before committing one inode/bitmap/tree transaction.
+pub fn plan_truncate_shrink_deep(
+    old_size: u64,
+    new_size: u64,
+    root: &[u8],
+    block_size: u32,
+    blocks_count: u64,
+    read: &mut impl FnMut(u64) -> Result<Vec<u8>>,
+) -> Result<(SizeChange, Vec<ExtentMutation>)> {
+    if new_size > old_size || !(1024..=65536).contains(&block_size) || !block_size.is_power_of_two()
+    {
+        return Err(Error::InvalidArgument(
+            "invalid truncate size or block size",
+        ));
+    }
+    let header = ExtentHeader::parse(root)?;
+    if root.len() != 60 || header.depth > crate::extent::EXT4_EXT_MAX_DEPTH {
+        return Err(Error::CorruptExtentTree("invalid inline extent root"));
+    }
+    let mut walk = ShrinkWalk {
+        end: new_size.div_ceil(block_size as u64),
+        block_size,
+        blocks_count,
+        read,
+        visited: std::collections::BTreeSet::new(),
+        physical: Vec::new(),
+        logical_end: 0,
+        mutations: Vec::new(),
+    };
+    let (mut bytes, first) = walk.node(root, header.depth, true)?;
+    if first.is_none() {
+        bytes[6..8].copy_from_slice(&0u16.to_le_bytes());
+    }
+    // Ext4 does not share data/tree blocks between extents. Check before any
+    // bitmap is freed, including data aliases into a node encountered later.
+    walk.physical.sort_unstable();
+    for pair in walk.physical.windows(2) {
+        if pair[0].1 > pair[1].0 {
+            return Err(Error::CorruptExtentTree(
+                "overlapping physical extent ranges",
+            ));
+        }
+    }
+    walk.mutations
+        .insert(0, ExtentMutation::WriteRoot { bytes });
+    Ok((SizeChange { old_size, new_size }, walk.mutations))
+}
+
+struct ShrinkWalk<'a, R> {
+    end: u64,
+    block_size: u32,
+    blocks_count: u64,
+    read: &'a mut R,
+    visited: std::collections::BTreeSet<u64>,
+    physical: Vec<(u64, u64)>,
+    logical_end: u64,
+    mutations: Vec<ExtentMutation>,
+}
+
+impl<R: FnMut(u64) -> Result<Vec<u8>>> ShrinkWalk<'_, R> {
+    fn node(
+        &mut self,
+        original: &[u8],
+        depth: u16,
+        inline: bool,
+    ) -> Result<(Vec<u8>, Option<u32>)> {
+        use crate::extent::{ExtentIdx, EXT4_EXT_NODE_SIZE as N};
+        let header = ExtentHeader::parse(original)?;
+        let body = original.len().saturating_sub(if inline { 0 } else { 4 });
+        if header.depth != depth || header.max == 0 || N * (1 + header.max as usize) > body {
+            return Err(Error::CorruptExtentTree(
+                "invalid extent node depth or capacity",
+            ));
+        }
+        let mut bytes = original.to_vec();
+        // Keep unused bytes untouched: they are covered by the node checksum.
+        let mut kept = 0usize;
+        let mut first = None;
+        let mut previous_index = None;
+        for index in 0..header.entries as usize {
+            let off = N * (index + 1);
+            let mut encoded: [u8; N] = original[off..off + N].try_into().unwrap();
+            if depth == 0 {
+                let extent = Extent::parse(&encoded)?;
+                let begin = extent.logical_block as u64;
+                let end = begin + extent.length as u64;
+                let physical_end = extent.physical_block + extent.length as u64;
+                if extent.length == 0
+                    || begin < self.logical_end
+                    || end > u32::MAX as u64 + 1
+                    || extent.physical_block == 0
+                    || physical_end > self.blocks_count
+                {
+                    return Err(Error::CorruptExtentTree(
+                        "invalid or overlapping leaf extent",
+                    ));
+                }
+                self.logical_end = end;
+                self.physical.push((extent.physical_block, physical_end));
+                let keep = self.end.saturating_sub(begin).min(extent.length as u64);
+                if keep < extent.length as u64 {
+                    self.mutations.push(ExtentMutation::FreePhysicalRun {
+                        start: extent.physical_block + keep,
+                        len: extent.length as u32 - keep as u32,
+                    });
+                }
+                if keep == 0 {
+                    continue;
+                }
+                let encoded_len = keep as u16
+                    + if extent.uninitialized {
+                        crate::extent::EXT_INIT_MAX_LEN
+                    } else {
+                        0
+                    };
+                encoded[4..6].copy_from_slice(&encoded_len.to_le_bytes());
+                first.get_or_insert(extent.logical_block);
+            } else {
+                let child = ExtentIdx::parse(&encoded)?;
+                if previous_index.is_some_and(|prior| prior >= child.logical_block)
+                    || child.leaf_block == 0
+                    || child.leaf_block >= self.blocks_count
+                    || !self.visited.insert(child.leaf_block)
+                {
+                    return Err(Error::CorruptExtentTree("invalid or repeated extent index"));
+                }
+                previous_index = Some(child.logical_block);
+                self.physical.push((child.leaf_block, child.leaf_block + 1));
+                let node = (self.read)(child.leaf_block)?;
+                if node.len() != self.block_size as usize {
+                    return Err(Error::CorruptExtentTree("short extent node read"));
+                }
+                let child_header = ExtentHeader::parse(&node)?;
+                if child_header.entries == 0
+                    || u32::from_le_bytes(node[12..16].try_into().unwrap()) != child.logical_block
+                {
+                    return Err(Error::CorruptExtentTree(
+                        "extent index does not match its child",
+                    ));
+                }
+                let (updated, child_first) = self.node(&node, depth - 1, false)?;
+                let Some(child_first) = child_first else {
+                    self.mutations.push(ExtentMutation::FreePhysicalRun {
+                        start: child.leaf_block,
+                        len: 1,
+                    });
+                    continue;
+                };
+                encoded[..4].copy_from_slice(&child_first.to_le_bytes());
+                if updated != node {
+                    self.mutations.push(ExtentMutation::WriteTreeBlock {
+                        block: child.leaf_block,
+                        bytes: updated,
+                    });
+                }
+                first.get_or_insert(child_first);
+            }
+            bytes[N * (kept + 1)..N * (kept + 2)].copy_from_slice(&encoded);
+            kept += 1;
+        }
+        bytes[2..4].copy_from_slice(&(kept as u16).to_le_bytes());
+        Ok((bytes, first))
+    }
+}
+
 /// One unit of a data-block write. `payload.len() <= block_size`.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct BlockWrite {
@@ -119,9 +288,8 @@ pub fn plan_truncate_grow(old_size: u64, new_size: u64) -> Result<SizeChange> {
 /// `FreePhysicalRun` entries against the bitmap allocator.
 ///
 /// Only handles inline-root (depth 0) trees for now. Multi-level trees
-/// return [`Error::CorruptExtentTree`] with a clear message — E9/E11 will
-/// wire in the deeper traversal when the write path goes through the
-/// journal.
+/// return [`Error::Unsupported`]. Filesystem callers use
+/// [`plan_truncate_shrink_deep`] to traverse external nodes too.
 pub fn plan_truncate_shrink(
     old_size: u64,
     new_size: u64,
@@ -133,8 +301,8 @@ pub fn plan_truncate_shrink(
     }
     let header = ExtentHeader::parse(root_bytes)?;
     if !header.is_leaf() {
-        return Err(Error::CorruptExtentTree(
-            "plan_truncate_shrink: multi-level tree not yet supported",
+        return Err(Error::Unsupported(
+            "inline truncate planner requires an inline extent root",
         ));
     }
 
