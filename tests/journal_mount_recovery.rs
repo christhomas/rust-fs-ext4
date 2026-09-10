@@ -292,6 +292,25 @@ fn committed_plain_journal_matches_linux_and_refreshes_mount_metadata() {
     }
 }
 
+#[test]
+fn live_flush_and_fresh_read_keep_recovery_marker_until_finish() {
+    let fixture = Fixture::new(false);
+    let path = fixture.copy("live-mount");
+    let mut mounted = checked_mount(&path);
+    mounted.apply_pwrite("/oracle", 0, b"first").unwrap();
+    mounted.flush().unwrap();
+    assert_ne!(le(&fs::read(&path).unwrap(), 1024 + 0x60) & RECOVER, 0);
+    mounted.fresh_read().unwrap();
+    assert_ne!(le(&fs::read(&path).unwrap(), 1024 + 0x60) & RECOVER, 0);
+    mounted.apply_pwrite("/oracle", 0, b"second").unwrap();
+    mounted.fresh_read().unwrap();
+    mounted.finish().unwrap();
+    fixture.assert_recovered(&path);
+    fixture.linux_check(&path);
+    let output = successful("debugfs", &["-R", "cat /oracle", path.to_str().unwrap()]);
+    assert_eq!(output, "second");
+}
+
 /// Two device persistence models: acknowledged writes may already be durable,
 /// or all writes since the last completed flush may disappear at power loss.
 struct InterruptedDevice {

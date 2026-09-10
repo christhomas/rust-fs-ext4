@@ -60,6 +60,13 @@ pub trait BlockDevice: Send + Sync {
     /// consistent with disk and can be evicted under normal LRU
     /// pressure. No-op for un-cached devices.
     fn unpin_all(&self) {}
+
+    /// Discard clean read-cache entries. Pinned journal metadata must be
+    /// checkpointed and unpinned first; cached implementations reject otherwise.
+    /// This does not flush writes and requires exclusive filesystem ownership.
+    fn invalidate_cache(&self) -> Result<()> {
+        Ok(())
+    }
 }
 
 /// File-backed device — used for disk images and `/dev/diskN`.

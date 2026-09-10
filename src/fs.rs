@@ -340,6 +340,22 @@ impl Filesystem {
     /// not claim a clean release: the recovery marker remains for the next owner.
     /// After any I/O failure, release ownership and reopen rather than reusing it.
     pub fn finish(mut self) -> Result<()> {
+        self.flush()?;
+        if !self.managed_recovery {
+            return Ok(());
+        }
+        self.refresh_metadata()?;
+        if self.sb.last_orphan != 0 {
+            return Err(Error::Corrupt("orphan recovery remains incomplete"));
+        }
+        self.set_recovery_marker(false)?;
+        Ok(())
+    }
+
+    /// Flush a live mount without clearing its recovery marker or releasing it.
+    /// Checked journal transactions must already be fully checkpointed. After an
+    /// error the owner must retire the mount, just as for a failed mutation.
+    pub fn flush(&mut self) -> Result<()> {
         if let Some(writer) = &self.journal {
             if !writer
                 .lock()
@@ -356,16 +372,29 @@ impl Filesystem {
             return Ok(());
         }
         let jsb =
-            crate::jbd2::read_superblock(&self)?.ok_or(Error::Corrupt("journal disappeared"))?;
+            crate::jbd2::read_superblock(self)?.ok_or(Error::Corrupt("journal disappeared"))?;
         if !jsb.is_clean() || jsb.errno != 0 {
             return Err(Error::Corrupt("journal is not checkpointed"));
         }
-        self.refresh_metadata()?;
-        if self.sb.last_orphan != 0 {
-            return Err(Error::Corrupt("orphan recovery remains incomplete"));
-        }
-        self.set_recovery_marker(false)?;
         Ok(())
+    }
+
+    /// Flush and discard checkpointed read caches before physical readback.
+    /// The mount remains owned and usable. This is not concurrent-writer support:
+    /// callers must serialize all filesystem access and retire on I/O failure.
+    pub fn fresh_read(&mut self) -> Result<()> {
+        self.flush()?;
+        // Unmanaged writable mounts also use the immediate-checkpoint writer.
+        if self.journal.is_some() {
+            let jsb =
+                crate::jbd2::read_superblock(self)?.ok_or(Error::Corrupt("journal disappeared"))?;
+            if !jsb.is_clean() || jsb.errno != 0 {
+                return Err(Error::Corrupt("journal is not checkpointed"));
+            }
+        }
+        self.dev.unpin_all();
+        self.dev.invalidate_cache()?;
+        self.refresh_metadata()
     }
 
     fn refresh_metadata(&mut self) -> Result<()> {
