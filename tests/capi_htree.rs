@@ -37,7 +37,7 @@ fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
         let entry = unsafe { &*e };
         let bytes: Vec<u8> = entry.name[..entry.name_len as usize]
             .iter()
-            .map(|b| *b as u8)
+            .map(|b| b.to_ne_bytes()[0])
             .collect();
         names.push(String::from_utf8_lossy(&bytes).into_owned());
     }

@@ -63,7 +63,7 @@ fn scratch_path(stem: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("rust-fs-ext4-{stem}-{pid}-{nanos}.img"))
+    fs_ext4_test_support::temp_dir().join(format!("rust-fs-ext4-{stem}-{pid}-{nanos}.img"))
 }
 
 #[test]

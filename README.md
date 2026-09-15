@@ -509,8 +509,17 @@ let attrs = fs.stat("/hello.txt")?;
 ### Testing
 
 ```sh
-cargo test --release
+./scripts/test.sh --release
 ```
+
+The runner gives every invocation its own scratch directory and cleans it on
+exit. It uses `/tmp` on macOS and GitHub Actions. On Raspberry Pi it uses
+`./tmp` so fixture-copy churn stays on the checkout's storage (for example,
+an NVMe volume) instead of the SD card backing system `/tmp`. Set
+`FS_EXT4_TEST_TMP_BASE` to choose another managed base, or
+`FS_EXT4_TEST_TMPDIR` to supply an exact caller-managed directory. Direct
+`cargo test` also follows the same platform policy, but cannot clean files
+left behind by an interrupted process.
 
 Integration tests use ext4 image fixtures under `test-disks/`.
 Fixtures are gitignored — regenerate them with:
@@ -519,11 +528,18 @@ Fixtures are gitignored — regenerate them with:
 bash test-disks/build-ext4-feature-images.sh
 ```
 
-The generator runs standard formatter tools inside a short-lived
-Alpine Linux VM booted under `qemu-system-x86_64`, so the same
-script works on macOS, Linux, and in CI (no Docker required).
+The local generator runs standard formatter tools inside a short-lived
+Alpine Linux VM booted under QEMU, so the same script works on macOS and
+Linux without Docker. It selects an x86_64 guest on Intel/AMD hosts and an
+aarch64 guest on Apple Silicon/ARM Linux hosts. Native guests require KVM on
+Linux or HVF on macOS; the generator fails rather than silently falling back
+to slow emulation. Set `EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64` together
+with `EXT4_VM_ALLOW_TCG=1` only for a deliberate cross-architecture diagnostic.
 First run downloads the Alpine virt ISO + kernel (~75 MB, cached
-under `test-disks/.vm-cache/`).
+under `test-disks/.vm-cache/`); cached VM assets are separated by
+architecture. CI needs no nested VM: both x86_64 and ARM64 jobs are already
+real Linux, so they use `build-ext4-feature-images-native-linux.sh` and run the
+full fixture and Rust gate directly on their native kernels.
 
 ### Git hooks
 

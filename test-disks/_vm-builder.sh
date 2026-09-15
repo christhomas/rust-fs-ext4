@@ -32,7 +32,8 @@ esac
 mkdir -p "$OUTPUT_DIR"
 cd "$OUTPUT_DIR"
 
-mkdir -p /mnt/img
+MOUNT_DIR="${EXT4_MOUNT_DIR:-/mnt/img}"
+mkdir -p "$MOUNT_DIR"
 
 # --- image builders -------------------------------------------------------
 
@@ -43,16 +44,16 @@ build_basic() {
     truncate -s 16M $img
     mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
         -L testvolume $img
-    mount -t ext4 -o loop $img /mnt/img
-    printf 'hello from ext4\n' > /mnt/img/test.txt
-    mkdir -p /mnt/img/subdir
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
+    printf 'hello from ext4\n' > "$MOUNT_DIR/test.txt"
+    mkdir -p "$MOUNT_DIR/subdir"
     # /subdir needs at least one entry so rmdir-on-nonempty-dir
     # tests actually hit ENOTEMPTY. Without this, /subdir has only
     # `.` and `..` and the rmdir would succeed.
-    echo 'nested' > /mnt/img/subdir/nested.txt
-    ln -s test.txt /mnt/img/link.txt
+    echo 'nested' > "$MOUNT_DIR/subdir/nested.txt"
+    ln -s test.txt "$MOUNT_DIR/link.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_htree() {
@@ -65,16 +66,16 @@ build_htree() {
     mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum \
         -E hash_seed=a1b2c3d4-e5f6-7890-abcd-ef1234567890 \
         -L htree-vol $img
-    mount -t ext4 -o loop $img /mnt/img
-    mkdir -p /mnt/img/bigdir
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
+    mkdir -p "$MOUNT_DIR/bigdir"
     i=1
     while [ $i -le 256 ]; do
-        printf 'content of file %03d\n' $i > /mnt/img/bigdir/file_$i.txt
+        printf 'content of file %03d\n' $i > "$MOUNT_DIR/bigdir/file_$i.txt"
         i=$((i + 1))
     done
-    echo 'small file content' > /mnt/img/small.txt
+    echo 'small file content' > "$MOUNT_DIR/small.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_csum_seed() {
@@ -84,12 +85,12 @@ build_csum_seed() {
     truncate -s 16M $img
     mkfs.ext4 -q -F -b 4096 -O has_journal,extent,64bit,flex_bg,metadata_csum,metadata_csum_seed \
         -L csum-seed-vol $img
-    mount -t ext4 -o loop $img /mnt/img
-    echo 'pi-style file' > /mnt/img/hello.txt
-    mkdir -p /mnt/img/etc
-    echo 'fake fstab' > /mnt/img/etc/fstab
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
+    echo 'pi-style file' > "$MOUNT_DIR/hello.txt"
+    mkdir -p "$MOUNT_DIR/etc"
+    echo 'fake fstab' > "$MOUNT_DIR/etc/fstab"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_no_csum() {
@@ -99,10 +100,10 @@ build_no_csum() {
     truncate -s 8M $img
     mkfs.ext4 -q -F -b 4096 -O ^metadata_csum,extent,64bit,filetype,dir_index,sparse_super \
         -L no-csum-vol $img
-    mount -t ext4 -o loop $img /mnt/img
-    echo 'no checksum here' > /mnt/img/file.txt
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
+    echo 'no checksum here' > "$MOUNT_DIR/file.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_deep_extents() {
@@ -111,18 +112,18 @@ build_deep_extents() {
     rm -f $img
     truncate -s 64M $img
     mkfs.ext4 -q -F -b 4096 -O extent,64bit,flex_bg,metadata_csum -L deep-vol $img
-    mount -t ext4 -o loop $img /mnt/img
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
     # Sparse file with 1-byte 'X' writes every 64 KB up to 16 MB —
     # ~245 extents force multi-level extent tree.
-    dd if=/dev/zero of=/mnt/img/sparse.bin bs=1 count=0 seek=16M status=none
+    dd if=/dev/zero of="$MOUNT_DIR/sparse.bin" bs=1 count=0 seek=16M status=none
     off=0
     while [ $off -lt 16000000 ]; do
-        printf 'X' | dd of=/mnt/img/sparse.bin bs=1 count=1 seek=$off conv=notrunc status=none
+        printf 'X' | dd of="$MOUNT_DIR/sparse.bin" bs=1 count=1 seek=$off conv=notrunc status=none
         off=$((off + 65536))
     done
-    echo 'control file' > /mnt/img/dense.txt
+    echo 'control file' > "$MOUNT_DIR/dense.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_inline() {
@@ -132,12 +133,12 @@ build_inline() {
     truncate -s 8M $img
     mkfs.ext4 -q -F -b 4096 -I 256 -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data \
         -L inline-vol $img
-    mount -t ext4 -o loop $img /mnt/img
-    echo 'tiny inline' > /mnt/img/tiny.txt
-    printf 'A%.0s' $(seq 1 100) > /mnt/img/medium.txt
-    ln -s 'target/path/here' /mnt/img/symlink
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
+    echo 'tiny inline' > "$MOUNT_DIR/tiny.txt"
+    printf 'A%.0s' $(seq 1 100) > "$MOUNT_DIR/medium.txt"
+    ln -s 'target/path/here' "$MOUNT_DIR/symlink"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_xattr() {
@@ -147,15 +148,15 @@ build_xattr() {
     truncate -s 8M $img
     mkfs.ext4 -q -F -b 4096 -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum,inline_data \
         -L xattr-vol $img
-    mount -t ext4 -o loop $img /mnt/img
-    echo 'has xattrs' > /mnt/img/tagged.txt
-    setfattr -n user.color -v 'red' /mnt/img/tagged.txt
-    setfattr -n user.com.apple.FinderInfo -v '0xDEADBEEF' /mnt/img/tagged.txt
-    mkdir /mnt/img/tagged_dir
-    setfattr -n user.purpose -v 'documents' /mnt/img/tagged_dir
-    echo 'no xattrs here' > /mnt/img/plain.txt
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
+    echo 'has xattrs' > "$MOUNT_DIR/tagged.txt"
+    setfattr -n user.color -v 'red' "$MOUNT_DIR/tagged.txt"
+    setfattr -n user.com.apple.FinderInfo -v '0xDEADBEEF' "$MOUNT_DIR/tagged.txt"
+    mkdir "$MOUNT_DIR/tagged_dir"
+    setfattr -n user.purpose -v 'documents' "$MOUNT_DIR/tagged_dir"
+    echo 'no xattrs here' > "$MOUNT_DIR/plain.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_acl() {
@@ -165,16 +166,16 @@ build_acl() {
     truncate -s 8M $img
     mkfs.ext4 -q -F -b 4096 -O ext_attr,extent,64bit,filetype,dir_index,metadata_csum -L acl-vol $img
     tune2fs -o acl,user_xattr $img >/dev/null
-    mount -t ext4 -o loop,acl,user_xattr $img /mnt/img
-    echo 'minimal acl' > /mnt/img/mode_only.txt
-    setfacl -m u::rwx,g::r-x,o::r-- /mnt/img/mode_only.txt
-    echo 'named entries' > /mnt/img/named.txt
-    setfacl -m u:1000:rw-,g:2000:r--,m::rwx /mnt/img/named.txt
-    mkdir /mnt/img/acl_dir
-    setfacl -m u::rwx,g::r-x,o::--x,d:u::rwx,d:g::r-x,d:o::--- /mnt/img/acl_dir
-    echo 'no acl' > /mnt/img/plain.txt
+    mount -t ext4 -o loop,acl,user_xattr $img "$MOUNT_DIR"
+    echo 'minimal acl' > "$MOUNT_DIR/mode_only.txt"
+    setfacl -m u::rwx,g::r-x,o::r-- "$MOUNT_DIR/mode_only.txt"
+    echo 'named entries' > "$MOUNT_DIR/named.txt"
+    setfacl -m u:1000:rw-,g:2000:r--,m::rwx "$MOUNT_DIR/named.txt"
+    mkdir "$MOUNT_DIR/acl_dir"
+    setfacl -m u::rwx,g::r-x,o::--x,d:u::rwx,d:g::r-x,d:o::--- "$MOUNT_DIR/acl_dir"
+    echo 'no acl' > "$MOUNT_DIR/plain.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_largedir() {
@@ -185,14 +186,14 @@ build_largedir() {
     mkfs.ext4 -q -F -b 4096 -N 80000 \
         -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,large_file,huge_file,uninit_bg,metadata_csum,large_dir \
         -L largedir-vol $img
-    mount -t ext4 -o loop $img /mnt/img
-    mkdir -p /mnt/img/huge
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
+    mkdir -p "$MOUNT_DIR/huge"
     seq -w 1 70000 | while read -r i; do
-        : > /mnt/img/huge/file_$i.txt
+        : > "$MOUNT_DIR/huge/file_$i.txt"
     done
-    echo 'control' > /mnt/img/small.txt
+    echo 'control' > "$MOUNT_DIR/small.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_manyfiles() {
@@ -202,14 +203,14 @@ build_manyfiles() {
     truncate -s 16M $img
     mkfs.ext4 -q -F -b 4096 -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
         -L many-vol $img
-    mount -t ext4 -o loop $img /mnt/img
+    mount -t ext4 -o loop $img "$MOUNT_DIR"
     i=1
     while [ $i -le 512 ]; do
-        printf 'f%04d\n' $i > /mnt/img/file_$i.txt
+        printf 'f%04d\n' $i > "$MOUNT_DIR/file_$i.txt"
         i=$((i + 1))
     done
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
 }
 
 build_whole_disk() {
@@ -224,20 +225,20 @@ build_whole_disk() {
     printf 'label: gpt\nstart=2048, size=32768, type=L\n' | sfdisk $img >/dev/null
     # Use --offset/--sizelimit to map the partition area directly, avoiding
     # the need for kernel partition device support (-P / /dev/loopNpM).
-    trap 'umount /mnt/img 2>/dev/null || true; [ -n "$loop" ] && losetup -d "$loop" 2>/dev/null || true' EXIT HUP INT TERM
+    trap 'umount "$MOUNT_DIR" 2>/dev/null || true; [ -n "$loop" ] && losetup -d "$loop" 2>/dev/null || true' EXIT HUP INT TERM
     offset=$((2048 * 512))
     sizelimit=$((32768 * 512))
     loop=$(losetup -f --show --offset "$offset" --sizelimit "$sizelimit" "$img")
     mkfs.ext4 -q -F -b 4096 \
         -O has_journal,ext_attr,dir_index,filetype,extent,64bit,flex_bg,sparse_super,metadata_csum \
         -L wholedisk "$loop"
-    mount -t ext4 "$loop" /mnt/img
-    echo 'whole disk test' > /mnt/img/test.txt
-    mkdir -p /mnt/img/subdir
-    echo 'nested' > /mnt/img/subdir/nested.txt
-    ln -s test.txt /mnt/img/link.txt
+    mount -t ext4 "$loop" "$MOUNT_DIR"
+    echo 'whole disk test' > "$MOUNT_DIR/test.txt"
+    mkdir -p "$MOUNT_DIR/subdir"
+    echo 'nested' > "$MOUNT_DIR/subdir/nested.txt"
+    ln -s test.txt "$MOUNT_DIR/link.txt"
     sync
-    umount /mnt/img
+    umount "$MOUNT_DIR"
     losetup -d "$loop"
     trap - EXIT HUP INT TERM
 }

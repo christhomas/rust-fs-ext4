@@ -39,6 +39,7 @@ am-fs-core = { path = "../rust-fs-core", version = "0.2.10" }
 
 [dev-dependencies]
 hex = "0.4"
+fs-ext4-test-support = { path = "tests/support" }
 # YAML parser for tests/ci_profile.rs, which reads .github/workflows/ci.yml
 # and refuses if the debug run that lets the PR gate see an arithmetic
 # overflow has been removed or disabled. That guard hand-rolled its own

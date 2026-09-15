@@ -22,10 +22,17 @@ It points at the existing docs rather than duplicating them:
 ## Running tests
 
 ```sh
-cargo test                  # full suite (lib + integration). ~700 tests.
-cargo test --test <name>    # one integration binary, e.g. repro_wants_dir_symlinks
+./scripts/test.sh            # full suite (lib + integration). ~700 tests.
+./scripts/test.sh --test <name> # one integration binary, e.g. repro_wants_dir_symlinks
 cargo clippy --all-targets -- -D warnings   # what the pre-commit hook runs
 ```
+
+Use `scripts/test.sh` for local runs: it selects a platform-aware, per-run
+scratch directory and cleans it afterward. In particular, Raspberry Pi runs
+use this worktree's `./tmp` (normally the NVMe checkout) rather than the SD
+card-backed system `/tmp`; macOS and GitHub Actions use `/tmp`. Override the
+managed base with `FS_EXT4_TEST_TMP_BASE`, or provide a caller-managed exact
+directory with `FS_EXT4_TEST_TMPDIR`.
 
 Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
 `cargo fmt --check` + `cargo clippy -D warnings` on every commit).
@@ -38,7 +45,7 @@ read-only and assert. Canonical templates:
 `tests/repro_wants_dir_symlinks.rs`.
 
 ```rust
-let path = copy_to_tmp("ext4-csum-seed.img", "tag");      // fixture → unique /tmp copy
+let path = copy_to_tmp("ext4-csum-seed.img", "tag"); // fixture → unique scratch copy
 {
     let dev = FileDevice::open_rw(&path)?;
     let fs = Filesystem::mount(Arc::new(dev))?;           // replays journal if dirty
@@ -97,7 +104,11 @@ A **real Linux `e2fsck`** can. The repo's verification options:
 - **Alpine QEMU VM** (`test-disks/build-ext4-feature-images.sh`, `_vm-builder.sh`,
   cached under `.vm-cache/`) — real Linux `mke2fs` + `e2fsprogs`. **This is the
   oracle.** It builds the fixtures and can `e2fsck` any image. No host
-  `e2fsprogs` needed; no Docker.
+  `e2fsprogs` needed; no Docker. The guest follows the host ISA by default
+  (x86_64 or aarch64) and requires KVM/HVF; slow TCG needs the explicit
+  `EXT4_VM_ALLOW_TCG=1` diagnostic override. CI is already Linux, so its x86_64
+  and ARM64 jobs run `_vm-builder.sh` directly through
+  `build-ext4-feature-images-native-linux.sh`, without nested virtualisation.
 - `scripts/cross-validate-lwext4.sh` + `tests/lwext4_cross_validate.rs` —
   independent C impl, opt-in (`LWEXT4_DIR`); currently a **read-only skeleton**.
 - `tests/{qemu,vagrant}/freebsd/` — a real kernel, but FreeBSD's ext4 validates

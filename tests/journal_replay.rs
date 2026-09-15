@@ -35,11 +35,8 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     }
     // Unique-per-call: cargo runs test fns in parallel threads; a shared name
     // would race on create/delete.
-    let dst = format!(
-        "/tmp/fs_ext4_replay_{}_{n}_{}.img",
-        std::process::id(),
-        name
-    );
+    let dst =
+        fs_ext4_test_support::temp_path!("fs_ext4_replay_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
 }

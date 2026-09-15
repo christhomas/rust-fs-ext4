@@ -20,8 +20,8 @@ const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.im
 fn scratch(label: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dst = PathBuf::from(format!(
-        "/tmp/fs_ext4_capi_wf_csum_{label}_{}_{n}.img",
+    let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "fs_ext4_capi_wf_csum_{label}_{}_{n}.img",
         std::process::id()
     ));
     let mut out = fs::File::create(&dst).unwrap();
@@ -178,7 +178,7 @@ fn unlink_result_survives_csum_verification_on_remount() {
             let ent = unsafe { &*e };
             let bytes: Vec<u8> = ent.name[..ent.name_len as usize]
                 .iter()
-                .map(|b| *b as u8)
+                .map(|b| b.to_ne_bytes()[0])
                 .collect();
             names.push(String::from_utf8_lossy(&bytes).into_owned());
         }

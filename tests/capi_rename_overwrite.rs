@@ -32,8 +32,8 @@ fn last_err_str() -> String {
 fn scratch_image(tag: &str) -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dst = PathBuf::from(format!(
-        "/tmp/fs_ext4_capi_rename_overwrite_{tag}_{}_{n}.img",
+    let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "fs_ext4_capi_rename_overwrite_{tag}_{}_{n}.img",
         std::process::id()
     ));
     let bytes = fs::read(SRC_IMAGE).expect("read src image");

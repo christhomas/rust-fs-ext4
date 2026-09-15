@@ -338,6 +338,10 @@ fn runs_on_pull_request(wf: &Workflow) -> bool {
 /// Keys whose presence on a step or job means its result does not gate.
 const NON_GATING_KEYS: [&str; 2] = ["if", "continue-on-error"];
 
+fn carries_a_non_gating_key(keys: &[String]) -> bool {
+    keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()))
+}
+
 /// Walk a workflow's steps and collect what `select` finds in each
 /// `run:`.
 ///
@@ -359,9 +363,6 @@ fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> 
     if gating && !runs_on_pull_request(&wf) {
         return Vec::new();
     }
-    let carries_a_non_gating_key =
-        |keys: &[String]| keys.iter().any(|k| NON_GATING_KEYS.contains(&k.as_str()));
-
     let mut out = Vec::new();
     for job in &wf.jobs {
         if gating && carries_a_non_gating_key(&job.keys) {
@@ -415,6 +416,132 @@ fn the_pr_gate_still_tests_in_a_profile_that_can_see_an_overflow() {
          has merged. If the debug step in ci.yml looked redundant beside \
          the release one, it is not -- see the comment above it.",
         path.display()
+    );
+}
+
+/// Both supported host architectures must run the real fixture generator and
+/// the complete Rust gate natively. The GitHub runner is already real Linux,
+/// so fixture generation there must use its native kernel rather than require
+/// nested virtualisation. Local macOS development still uses the matching VM.
+#[test]
+fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
+    let path = manifest_dir()
+        .join(".github")
+        .join("workflows")
+        .join("ci.yml");
+    let workflow = read_or_panic(&path);
+    let documents = Yaml::load_from_str(&workflow)
+        .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
+    let document = documents
+        .first()
+        .unwrap_or_else(|| panic!("{} is empty", path.display()));
+    let test_job = field(document, "jobs")
+        .and_then(|jobs| field(jobs, "test"))
+        .unwrap_or_else(|| panic!("{} has no jobs.test", path.display()));
+
+    assert_eq!(
+        field(test_job, "runs-on").and_then(Yaml::as_str),
+        Some("${{ matrix.os }}"),
+        "jobs.test must run each matrix row on its native runner"
+    );
+
+    let rows = field(test_job, "strategy")
+        .and_then(|strategy| field(strategy, "matrix"))
+        .and_then(|matrix| field(matrix, "include"))
+        .and_then(Yaml::as_sequence)
+        .unwrap_or_else(|| panic!("jobs.test must use an explicit strategy.matrix.include"));
+    let actual: Vec<(&str, &str)> = rows
+        .iter()
+        .map(|row| {
+            (
+                field(row, "arch").and_then(Yaml::as_str).unwrap_or(""),
+                field(row, "os").and_then(Yaml::as_str).unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![("x86_64", "ubuntu-24.04"), ("aarch64", "ubuntu-24.04-arm"),],
+        "the test job must cover both native standard Linux runner architectures"
+    );
+
+    let steps = field(test_job, "steps")
+        .and_then(Yaml::as_sequence)
+        .unwrap_or_else(|| panic!("jobs.test has no steps"));
+    assert!(
+        !carries_a_non_gating_key(&keys_of(test_job)),
+        "jobs.test must not be conditional or allowed to fail"
+    );
+    for required in [
+        "build-ext4-feature-images-native-linux.sh",
+        "cargo clippy --locked --all-targets -- -D warnings",
+        "cargo test --locked --release",
+        "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
+        "tests/scripts/*.sh",
+    ] {
+        assert!(
+            steps.iter().any(|step| {
+                field(step, "run")
+                    .and_then(Yaml::as_str)
+                    .is_some_and(|script| script.contains(required))
+                    && !carries_a_non_gating_key(&keys_of(step))
+            }),
+            "jobs.test does not run `{required}` unconditionally on every native matrix row"
+        );
+    }
+
+    assert!(
+        steps
+            .iter()
+            .filter_map(|step| field(step, "run").and_then(Yaml::as_str))
+            .all(|script| !script.contains("qemu-system-")),
+        "a standard GitHub ARM runner must not depend on unavailable nested VM acceleration"
+    );
+}
+
+/// A tag release runs on real Linux too, so it must not regain an implicit
+/// `/dev/kvm` dependency after the pull-request gate has proved the native
+/// fixture path. This is a shipping gate, not a slower second VM oracle.
+#[test]
+fn the_release_gate_generates_fixtures_natively_without_kvm() {
+    let path = manifest_dir()
+        .join(".github")
+        .join("workflows")
+        .join("release.yml");
+    let workflow = read_or_panic(&path);
+    let documents = Yaml::load_from_str(&workflow)
+        .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
+    let document = documents
+        .first()
+        .unwrap_or_else(|| panic!("{} is empty", path.display()));
+    let test_job = field(document, "jobs")
+        .and_then(|jobs| field(jobs, "test"))
+        .unwrap_or_else(|| panic!("{} has no jobs.test", path.display()));
+    let steps = field(test_job, "steps")
+        .and_then(Yaml::as_sequence)
+        .unwrap_or_else(|| panic!("jobs.test has no steps"));
+
+    assert!(
+        !carries_a_non_gating_key(&keys_of(test_job)),
+        "release jobs.test must not be conditional or allowed to fail"
+    );
+    assert!(
+        steps.iter().any(|step| {
+            field(step, "run")
+                .and_then(Yaml::as_str)
+                .is_some_and(|run| {
+                    run.contains("sudo bash test-disks/build-ext4-feature-images-native-linux.sh")
+                })
+                && !carries_a_non_gating_key(&keys_of(step))
+        }),
+        "release jobs.test must generate fixtures natively in an unconditional step"
+    );
+    assert!(
+        steps
+            .iter()
+            .filter_map(|step| field(step, "run").and_then(Yaml::as_str))
+            .all(|run| !run.contains("build-ext4-feature-images.sh")),
+        "release jobs.test must not depend on a QEMU VM without guaranteed KVM"
     );
 }
 
