@@ -833,16 +833,13 @@ impl Filesystem {
         Ok(())
     }
 
-    /// Patch fields in a raw inode image: size, blocks_count. Leaves all
-    /// other bytes (including the extent tree header + entries in `i_block`)
-    /// intact. `new_block_count` is in 512-byte sectors per spec (same
-    /// convention as `Inode::blocks`).
     /// Write `i_file_acl` — the external xattr block pointer — into a raw
     /// inode. `block_nr` of 0 clears it.
     ///
     /// THE HIGH HALF IS AT 0x76, NOT 0x74. `Inode::parse` reads
-    /// `i_file_acl_hi` from `0x76..0x78`; both writers here put it at
-    /// `0x74..0x76`, which is `l_i_blocks_hi`. And
+    /// `i_file_acl_hi` from `0x76..0x78`; both writers used to put it at
+    /// `0x74..0x76`, which is `l_i_blocks_hi`. This function now writes it
+    /// once at `0x76..0x78`. Previously,
     /// `patch_inode_size_and_blocks` — which owns that field — ran six
     /// lines later at both sites and overwrote it. So the high half was
     /// never written and never cleared, by either of the two functions
@@ -860,12 +857,10 @@ impl Filesystem {
     /// survived: the offset was written out by hand at each site and
     /// nothing made the two agree with the reader.
     ///
-    /// The length guard is `>= 0x78`, not `>= 0x76`: the old one admitted
-    /// a buffer ending exactly where the field it was about to write
-    /// begins. An inode too short to hold the high half is REFUSED when
-    /// the block number needs one, rather than silently storing a pointer
-    /// to somewhere else — that truncation is what this function exists
-    /// to end.
+    /// The capacity check uses `0x78`, not `0x76`: the old guard admitted a
+    /// buffer ending exactly where the field it was about to write begins.
+    /// It runs before either half is written, so an inode too short to hold
+    /// the high half is REFUSED without leaving a truncated pointer behind.
     pub(crate) fn write_file_acl(raw: &mut [u8], block_nr: u64) -> Result<()> {
         if raw.len() < 0x6C {
             return Err(Error::Corrupt(
@@ -873,18 +868,23 @@ impl Filesystem {
             ));
         }
         let (hi, lo) = crate::extent_mut::split_phys_block(block_nr);
-        raw[0x68..0x6C].copy_from_slice(&lo.to_le_bytes());
-        if raw.len() >= 0x78 {
-            raw[0x76..0x78].copy_from_slice(&hi.to_le_bytes());
-        } else if hi != 0 {
+        if raw.len() < 0x78 && hi != 0 {
             return Err(Error::Corrupt(
                 "write_file_acl: this inode is too small to hold i_file_acl_hi and the \
                  external xattr block needs it",
             ));
         }
+        raw[0x68..0x6C].copy_from_slice(&lo.to_le_bytes());
+        if raw.len() >= 0x78 {
+            raw[0x76..0x78].copy_from_slice(&hi.to_le_bytes());
+        }
         Ok(())
     }
 
+    /// Patch fields in a raw inode image: size, blocks_count. Leaves all
+    /// other bytes (including the extent tree header + entries in `i_block`)
+    /// intact. `new_block_count` is in 512-byte sectors per spec (same
+    /// convention as `Inode::blocks`).
     pub fn patch_inode_size_and_blocks(
         raw: &mut [u8],
         new_size: u64,
@@ -6378,6 +6378,11 @@ mod tests {
         assert!(
             Filesystem::write_file_acl(&mut short, 0x0003_1234_5678).is_err(),
             "a 0x76-byte inode has no room for 0x76..0x78 and must not truncate"
+        );
+        assert_eq!(
+            read_le32(&short, 0x68),
+            0,
+            "a refused write must not leave the truncated low half behind"
         );
 
         // ...but a block number that fits in 32 bits is fine there, which
