@@ -30,9 +30,10 @@ cargo clippy --all-targets -- -D warnings   # what the pre-commit hook runs
 Use `scripts/test.sh` for local runs: it selects a platform-aware, per-run
 scratch directory and cleans it afterward. In particular, Raspberry Pi runs
 use this worktree's `./tmp` (normally the NVMe checkout) rather than the SD
-card-backed system `/tmp`; macOS and GitHub Actions use `/tmp`. Override the
-managed base with `FS_EXT4_TEST_TMP_BASE`, or provide a caller-managed exact
-directory with `FS_EXT4_TEST_TMPDIR`.
+card-backed system temporary directory. GitHub Actions uses `RUNNER_TEMP` when
+available; macOS and ordinary hosts use their environment-provided temporary root.
+Override the managed base with `FS_EXT4_TEST_TMP_BASE`, or provide a
+caller-managed exact directory with `FS_EXT4_TEST_TMPDIR`.
 
 Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
 `cargo fmt --check` + `cargo clippy -D warnings` on every commit).
