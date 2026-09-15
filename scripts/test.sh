@@ -21,15 +21,21 @@ elif [[ -n "${FS_EXT4_TEST_TMP_BASE:-}" ]]; then
     mkdir -p "$FS_EXT4_TEST_TMP_BASE"
     RUN_DIR="$(mktemp -d "$FS_EXT4_TEST_TMP_BASE/fs-ext4-tests.XXXXXX")"
     export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
-elif [[ "${GITHUB_ACTIONS:-}" == "true" || "$(uname -s)" == "Darwin" ]]; then
-    RUN_DIR="$(mktemp -d /tmp/fs-ext4-tests.XXXXXX)"
+elif [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${RUNNER_TEMP:-}" ]]; then
+    mkdir -p "$RUNNER_TEMP"
+    RUN_DIR="$(mktemp -d "$RUNNER_TEMP/fs-ext4-tests.XXXXXX")"
     export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
 elif [[ -r /proc/device-tree/model ]] && grep -aq 'Raspberry Pi' /proc/device-tree/model; then
     mkdir -p "$REPO/tmp"
     RUN_DIR="$(mktemp -d "$REPO/tmp/fs-ext4-tests.XXXXXX")"
     export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
 else
-    RUN_DIR="$(mktemp -d "${TMPDIR:-/tmp}/fs-ext4-tests.XXXXXX")"
+    if [[ -n "${TMPDIR:-}" ]]; then
+        mkdir -p "$TMPDIR"
+        RUN_DIR="$(mktemp -d "$TMPDIR/fs-ext4-tests.XXXXXX")"
+    else
+        RUN_DIR="$(mktemp -d -t fs-ext4-tests.XXXXXX)"
+    fi
     export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
 fi
 

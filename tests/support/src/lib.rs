@@ -9,7 +9,7 @@ static TEST_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 pub fn select_temp_dir(
     explicit: Option<&OsStr>,
     github_actions: bool,
-    target_os: &str,
+    runner_temp: Option<&OsStr>,
     device_model: Option<&[u8]>,
     worktree: &Path,
     platform_temp: &Path,
@@ -17,8 +17,10 @@ pub fn select_temp_dir(
     if let Some(path) = explicit.filter(|path| !path.is_empty()) {
         return PathBuf::from(path);
     }
-    if github_actions || target_os == "macos" {
-        return PathBuf::from("/tmp");
+    if github_actions {
+        if let Some(path) = runner_temp.filter(|path| !path.is_empty()) {
+            return PathBuf::from(path);
+        }
     }
     if device_model
         .map(|model| String::from_utf8_lossy(model).contains("Raspberry Pi"))
@@ -41,7 +43,7 @@ pub fn temp_dir() -> &'static Path {
             let selected = select_temp_dir(
                 std::env::var_os("FS_EXT4_TEST_TMPDIR").as_deref(),
                 std::env::var_os("GITHUB_ACTIONS").as_deref() == Some(OsStr::new("true")),
-                std::env::consts::OS,
+                std::env::var_os("RUNNER_TEMP").as_deref(),
                 model.as_deref(),
                 worktree,
                 &std::env::temp_dir(),

@@ -9,6 +9,13 @@ matches="$(rg -U -n 'format!\(\s*"/tmp/|"/tmp/(fs_ext4|rust-fs-ext4|ext4rs-)|std
     --glob '!**/support/src/lib.rs' \
     --glob '!**/test_temp_policy.rs' || true)"
 
+selector_matches="$(rg -n 'mktemp[^#]*[[:space:]]/tmp|TMPDIR:-/tmp' \
+    "$REPO/scripts/test.sh" || true)"
+
+if [[ -n "$selector_matches" ]]; then
+    matches="${matches:+$matches$'\n'}$selector_matches"
+fi
+
 if [[ -n "$matches" ]]; then
     echo "FAIL  writable host test paths bypass the scratch selector:" >&2
     printf '%s\n' "$matches" >&2

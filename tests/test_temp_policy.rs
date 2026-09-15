@@ -3,7 +3,7 @@ use std::ffi::OsStr;
 use std::path::Path;
 
 #[test]
-fn scratch_location_follows_explicit_ci_mac_pi_then_platform_policy() {
+fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
     let worktree = Path::new("/worktree");
     let platform = Path::new("/platform/tmp");
 
@@ -11,7 +11,7 @@ fn scratch_location_follows_explicit_ci_mac_pi_then_platform_policy() {
         select_temp_dir(
             Some(OsStr::new("/explicit/nvme")),
             true,
-            "macos",
+            Some(OsStr::new("/runner/tmp")),
             Some(b"Raspberry Pi 5 Model B"),
             worktree,
             platform,
@@ -22,22 +22,22 @@ fn scratch_location_follows_explicit_ci_mac_pi_then_platform_policy() {
         select_temp_dir(
             None,
             true,
-            "linux",
-            Some(b"Raspberry Pi 5"),
+            Some(OsStr::new("/runner/tmp")),
+            Some(b"Generic ARM Server"),
             worktree,
             platform
         ),
-        Path::new("/tmp")
+        Path::new("/runner/tmp")
     );
     assert_eq!(
-        select_temp_dir(None, false, "macos", None, worktree, platform),
-        Path::new("/tmp")
+        select_temp_dir(None, true, None, None, worktree, platform),
+        platform
     );
     assert_eq!(
         select_temp_dir(
             None,
             false,
-            "linux",
+            None,
             Some(b"Raspberry Pi 5 Model B Rev 1.1\0"),
             worktree,
             platform,
@@ -48,7 +48,7 @@ fn scratch_location_follows_explicit_ci_mac_pi_then_platform_policy() {
         select_temp_dir(
             None,
             false,
-            "linux",
+            None,
             Some(b"Generic ARM Server"),
             worktree,
             platform
