@@ -45,7 +45,7 @@ fn enumerate_root(fs_h: *mut fs_ext4_fs_t) -> Vec<String> {
         let ent = unsafe { &*e };
         let b: Vec<u8> = ent.name[..ent.name_len as usize]
             .iter()
-            .map(|b| *b as u8)
+            .map(|b| b.to_ne_bytes()[0])
             .collect();
         names.push(String::from_utf8_lossy(&b).into_owned());
     }

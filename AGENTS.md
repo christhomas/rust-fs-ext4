@@ -97,7 +97,9 @@ A **real Linux `e2fsck`** can. The repo's verification options:
 - **Alpine QEMU VM** (`test-disks/build-ext4-feature-images.sh`, `_vm-builder.sh`,
   cached under `.vm-cache/`) — real Linux `mke2fs` + `e2fsprogs`. **This is the
   oracle.** It builds the fixtures and can `e2fsck` any image. No host
-  `e2fsprogs` needed; no Docker.
+  `e2fsprogs` needed; no Docker. The guest follows the host ISA by default
+  (x86_64 or aarch64), with `EXT4_VM_ARCH` as an explicit diagnostic override;
+  CI runs the complete gate on native Linux runners for both architectures.
 - `scripts/cross-validate-lwext4.sh` + `tests/lwext4_cross_validate.rs` —
   independent C impl, opt-in (`LWEXT4_DIR`); currently a **read-only skeleton**.
 - `tests/{qemu,vagrant}/freebsd/` — a real kernel, but FreeBSD's ext4 validates

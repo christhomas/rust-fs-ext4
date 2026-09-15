@@ -520,10 +520,15 @@ bash test-disks/build-ext4-feature-images.sh
 ```
 
 The generator runs standard formatter tools inside a short-lived
-Alpine Linux VM booted under `qemu-system-x86_64`, so the same
-script works on macOS, Linux, and in CI (no Docker required).
+Alpine Linux VM booted under QEMU, so the same script works on macOS,
+Linux, and in CI (no Docker required). It selects an x86_64 guest on
+Intel/AMD hosts and an aarch64 guest on Apple Silicon/ARM Linux hosts.
+Set `EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64` to override that
+selection for diagnosis.
 First run downloads the Alpine virt ISO + kernel (~75 MB, cached
-under `test-disks/.vm-cache/`).
+under `test-disks/.vm-cache/`); cached VM assets are separated by
+architecture. CI runs the full fixture and Rust gate natively on both
+x86_64 and ARM64 Linux runners.
 
 ### Git hooks
 

@@ -418,6 +418,94 @@ fn the_pr_gate_still_tests_in_a_profile_that_can_see_an_overflow() {
     );
 }
 
+/// Both supported host architectures must run the real fixture generator and
+/// the complete Rust gate natively. A cross-target `cargo check` proves that
+/// types compile; it cannot boot the Linux oracle VM, run clippy with the
+/// target's `c_char` definition, or exercise filesystem reads and writes on
+/// that architecture.
+#[test]
+fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
+    let path = manifest_dir()
+        .join(".github")
+        .join("workflows")
+        .join("ci.yml");
+    let workflow = read_or_panic(&path);
+    let documents = Yaml::load_from_str(&workflow)
+        .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
+    let document = documents
+        .first()
+        .unwrap_or_else(|| panic!("{} is empty", path.display()));
+    let test_job = field(document, "jobs")
+        .and_then(|jobs| field(jobs, "test"))
+        .unwrap_or_else(|| panic!("{} has no jobs.test", path.display()));
+
+    assert_eq!(
+        field(test_job, "runs-on").and_then(Yaml::as_str),
+        Some("${{ matrix.os }}"),
+        "jobs.test must run each matrix row on its native runner"
+    );
+
+    let rows = field(test_job, "strategy")
+        .and_then(|strategy| field(strategy, "matrix"))
+        .and_then(|matrix| field(matrix, "include"))
+        .and_then(Yaml::as_sequence)
+        .unwrap_or_else(|| panic!("jobs.test must use an explicit strategy.matrix.include"));
+    let actual: Vec<(&str, &str, &str)> = rows
+        .iter()
+        .map(|row| {
+            (
+                field(row, "arch").and_then(Yaml::as_str).unwrap_or(""),
+                field(row, "os").and_then(Yaml::as_str).unwrap_or(""),
+                field(row, "qemu-package")
+                    .and_then(Yaml::as_str)
+                    .unwrap_or(""),
+            )
+        })
+        .collect();
+    assert_eq!(
+        actual,
+        vec![
+            ("x86_64", "ubuntu-24.04", "qemu-system-x86"),
+            ("aarch64", "ubuntu-24.04-arm", "qemu-system-arm"),
+        ],
+        "the test job must cover both native standard Linux runner architectures"
+    );
+
+    let steps = field(test_job, "steps")
+        .and_then(Yaml::as_sequence)
+        .unwrap_or_else(|| panic!("jobs.test has no steps"));
+    let scripts: Vec<&str> = steps
+        .iter()
+        .filter_map(|step| field(step, "run").and_then(Yaml::as_str))
+        .collect();
+    for required in [
+        "${{ matrix.qemu-package }}",
+        "build-ext4-feature-images.sh",
+        "cargo clippy --locked --all-targets -- -D warnings",
+        "cargo test --locked --release",
+        "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
+        "tests/scripts/*.sh",
+    ] {
+        assert!(
+            scripts.iter().any(|script| script.contains(required)),
+            "jobs.test does not run `{required}` on every native matrix row"
+        );
+    }
+
+    let cache_keys: Vec<&str> = steps
+        .iter()
+        .filter_map(|step| field(step, "with"))
+        .filter_map(|with| field(with, "key"))
+        .filter_map(Yaml::as_str)
+        .collect();
+    assert!(
+        cache_keys
+            .iter()
+            .any(|key| key.contains("${{ matrix.arch }}")),
+        "at least one test-job cache key must include matrix.arch so incompatible VM assets cannot alias"
+    );
+}
+
 /// THE DISTINCTION THIS REPOSITORY NEEDS THAT A PORTED COPY WOULD MISS.
 ///
 /// A workflow carrying a checking debug run under a name other than

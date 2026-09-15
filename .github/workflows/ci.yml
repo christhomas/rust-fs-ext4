@@ -9,11 +9,17 @@ on:
 
 jobs:
   test:
-    name: test-${{ matrix.os }}
+    name: test-${{ matrix.arch }}
     runs-on: ${{ matrix.os }}
     strategy:
       matrix:
-        os: [ubuntu-latest]
+        include:
+          - arch: x86_64
+            os: ubuntu-24.04
+            qemu-package: qemu-system-x86
+          - arch: aarch64
+            os: ubuntu-24.04-arm
+            qemu-package: qemu-system-arm
     steps:
       - uses: actions/checkout@v4
       # The crate has a path dep on am-fs-core (../rust-fs-core).
@@ -28,7 +34,7 @@ jobs:
       - name: Install qemu (for test-disk generator)
         run: |
           sudo apt-get update -qq
-          sudo apt-get install -y -qq qemu-system-x86 libarchive-tools
+          sudo apt-get install -y -qq ${{ matrix.qemu-package }} libarchive-tools
       - name: Cache cargo registry
         uses: actions/cache@v4
         with:
@@ -36,13 +42,15 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
       - name: Cache alpine VM assets
         uses: actions/cache@v4
         with:
           path: test-disks/.vm-cache
-          key: vm-cache-alpine-3.21.4
+          key: vm-cache-alpine-3.21.4-${{ matrix.arch }}
       - name: Generate test disks
+        env:
+          EXT4_VM_ARCH: ${{ matrix.arch }}
         run: bash test-disks/build-ext4-feature-images.sh
       - run: cargo fmt --check
       - run: cargo clippy --locked --all-targets -- -D warnings
@@ -90,18 +98,10 @@ jobs:
             echo "::endgroup::"
           done
 
-      # `c_char` is signed on x86_64 and on Apple Silicon, and UNSIGNED on
-      # aarch64-linux — so a `[0i8; N]` that builds everywhere we test can
-      # still fail to compile for a real target. That is exactly what got
-      # through: the runner above is the only thing gating this crate, and it
-      # is x86_64, so nothing here could see it.
-      #
-      # Compile-only, and no aarch64 runner needed: the type mismatch is a
-      # build error, so `cargo check` against the target is the whole test.
-      - name: Check aarch64-linux (c_char is unsigned there)
-        run: |
-          rustup target add aarch64-unknown-linux-gnu
-          cargo check --locked --all-targets --target aarch64-unknown-linux-gnu
+      # This whole job runs natively on both standard Linux architectures.
+      # Cross-target `cargo check` caught type errors, but it could not run
+      # clippy with aarch64's unsigned c_char, boot the matching Linux oracle,
+      # or exercise any filesystem I/O on the architecture DiskJockey ships.
 
   # Validate the mkfs_ext4 CLI binary's output by running the kernel's own
   # fsck.ext4 (from e2fsprogs) against an image we generated. This is the

@@ -178,7 +178,7 @@ fn unlink_result_survives_csum_verification_on_remount() {
             let ent = unsafe { &*e };
             let bytes: Vec<u8> = ent.name[..ent.name_len as usize]
                 .iter()
-                .map(|b| *b as u8)
+                .map(|b| b.to_ne_bytes()[0])
                 .collect();
             names.push(String::from_utf8_lossy(&bytes).into_owned());
         }

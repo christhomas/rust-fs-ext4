@@ -31,7 +31,7 @@ fn main() {
             .volume_name
             .iter()
             .take_while(|&&b| b != 0)
-            .map(|&b| b as u8)
+            .map(|&b| b.to_ne_bytes()[0])
             .collect();
         let name = String::from_utf8_lossy(&name_bytes);
         println!(
@@ -59,7 +59,7 @@ fn main() {
             let entry = unsafe { &*e };
             let name_bytes: Vec<u8> = entry.name[..entry.name_len as usize]
                 .iter()
-                .map(|b| *b as u8)
+                .map(|b| b.to_ne_bytes()[0])
                 .collect();
             println!(
                 "  ino={:<8} ft={} {}",

@@ -1298,7 +1298,7 @@ pub unsafe extern "C" fn fs_ext4_readlink(
 
             // Copy to output buffer with null terminator, truncating if needed.
             let copy_len = target.len().min(bufsize - 1);
-            let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
+            let out = std::slice::from_raw_parts_mut(buf.cast::<u8>(), bufsize);
             out[..copy_len].copy_from_slice(&target[..copy_len]);
             out[copy_len] = 0;
 
@@ -1357,7 +1357,7 @@ pub unsafe extern "C" fn fs_ext4_listxattr(
             let required: usize = entries.iter().map(|e| e.name.len() + 1).sum();
 
             if !buf.is_null() && bufsize > 0 {
-                let out = std::slice::from_raw_parts_mut(buf as *mut u8, bufsize);
+                let out = std::slice::from_raw_parts_mut(buf.cast::<u8>(), bufsize);
                 let mut pos = 0;
                 for e in &entries {
                     let name_bytes = e.name.as_bytes();

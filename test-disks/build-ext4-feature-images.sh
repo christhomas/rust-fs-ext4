@@ -7,7 +7,9 @@
 # specifics; this is just a build-time convenience.
 #
 # First run downloads Alpine's netboot kernel + initramfs + ISO
-# (~40 MB total) into .vm-cache/. Subsequent runs reuse the cache.
+# (~40 MB total) into .vm-cache/. Subsequent runs reuse the cache. The guest
+# follows the host architecture by default; set EXT4_VM_ARCH=x86_64 or
+# EXT4_VM_ARCH=aarch64 to exercise the other supported path deliberately.
 #
 # Usage:
 #   bash build-ext4-feature-images.sh              # build all images
@@ -20,13 +22,16 @@
 #     Stop the VM by sourcing server.env and killing EXT4_BUILDER_PID,
 #     or by SSH-ing in and running `poweroff`.
 #
-# Requires: qemu-system-x86_64, ssh-keygen, bsdtar, curl.
+# Requires: the host-matching qemu-system binary, ssh-keygen, bsdtar, curl.
 # All available on macOS (brew install qemu) and ubuntu-latest.
 
 set -euo pipefail
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 cd "$SCRIPT_DIR"
+
+# shellcheck source=vm-architecture.sh
+. "$SCRIPT_DIR/vm-architecture.sh"
 
 CACHE="$SCRIPT_DIR/.vm-cache"
 mkdir -p "$CACHE"
@@ -35,21 +40,37 @@ mkdir -p "$CACHE"
 # Parse flags.
 # ---------------------------------------------------------------------------
 SERVER_MODE=0
+PRINT_VM_CONFIG=0
 BATCH_ARGS=()
 for arg in "$@"; do
     case "$arg" in
         --server) SERVER_MODE=1 ;;
+        --print-vm-config) PRINT_VM_CONFIG=1 ;;
         *) BATCH_ARGS+=("$arg") ;;
     esac
 done
+
+if [[ "$PRINT_VM_CONFIG" == "1" ]]; then
+    printf 'EXT4_VM_ARCH=%s\n' "$EXT4_VM_ARCH"
+    printf 'ALPINE_ARCH=%s\n' "$ALPINE_ARCH"
+    printf 'QEMU_SYSTEM=%s\n' "$QEMU_SYSTEM"
+    printf 'QEMU_DRIVE_IF=%s\n' "$QEMU_DRIVE_IF"
+    printf 'QEMU_CONSOLE=%s\n' "$QEMU_CONSOLE"
+    exit 0
+fi
+
+if ! command -v "$QEMU_SYSTEM" >/dev/null 2>&1; then
+    echo "missing fixture VM emulator: $QEMU_SYSTEM" >&2
+    exit 1
+fi
 
 # ---------------------------------------------------------------------------
 # Step 1 — pin Alpine version + download netboot assets on first run.
 # ---------------------------------------------------------------------------
 ALPINE_VER=3.21.4
 ALPINE_REL="${ALPINE_VER%.*}"
-ALPINE_ISO="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/releases/x86_64/alpine-virt-${ALPINE_VER}-x86_64.iso"
-ALPINE_MAIN="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main/x86_64"
+ALPINE_ISO="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/releases/${ALPINE_ARCH}/alpine-virt-${ALPINE_VER}-${ALPINE_ARCH}.iso"
+ALPINE_MAIN="https://dl-cdn.alpinelinux.org/alpine/v${ALPINE_REL}/main/${ALPINE_ARCH}"
 
 # Pinned package versions for extra tools not in the virt ISO's
 # embedded apk cache; downloaded separately and extracted in-place.
@@ -79,31 +100,37 @@ download_if_missing() {
         curl -fsSL -o "$out" "$url"
     fi
 }
-download_if_missing "$ALPINE_ISO" "$CACHE/alpine-virt.iso"
+ALPINE_ISO_PATH="$CACHE/alpine-virt-${ALPINE_ARCH}.iso"
+VMLINUX_PATH="$CACHE/vmlinuz-virt-${ALPINE_ARCH}"
+INITRAMFS_PATH="$CACHE/initramfs-virt-${ALPINE_ARCH}"
+EXTRA_APKS="$CACHE/extra-apks/${ALPINE_ARCH}"
+
+download_if_missing "$ALPINE_ISO" "$ALPINE_ISO_PATH"
 
 # Extract the ISO's kernel + initramfs.
-if [ ! -s "$CACHE/vmlinuz-virt" ] || [ ! -s "$CACHE/initramfs-virt" ]; then
+if [ ! -s "$VMLINUX_PATH" ] || [ ! -s "$INITRAMFS_PATH" ]; then
     echo "[host] extracting kernel + initramfs from alpine-virt ISO..."
-    bsdtar -xf "$CACHE/alpine-virt.iso" -C "$CACHE" \
+    bsdtar -xf "$ALPINE_ISO_PATH" -C "$CACHE" \
         boot/vmlinuz-virt boot/initramfs-virt
-    cp "$CACHE/boot/vmlinuz-virt"   "$CACHE/vmlinuz-virt"
-    cp "$CACHE/boot/initramfs-virt" "$CACHE/initramfs-virt"
+    cp "$CACHE/boot/vmlinuz-virt"   "$VMLINUX_PATH"
+    cp "$CACHE/boot/initramfs-virt" "$INITRAMFS_PATH"
 fi
 
-mkdir -p "$CACHE/extra-apks"
-download_if_missing "$ALPINE_MAIN/$ATTR_APK"          "$CACHE/extra-apks/$ATTR_APK"
-download_if_missing "$ALPINE_MAIN/$LIBATTR_APK"       "$CACHE/extra-apks/$LIBATTR_APK"
-download_if_missing "$ALPINE_MAIN/$ACL_APK"           "$CACHE/extra-apks/$ACL_APK"
-download_if_missing "$ALPINE_MAIN/$ACL_LIBS_APK"      "$CACHE/extra-apks/$ACL_LIBS_APK"
-download_if_missing "$ALPINE_MAIN/$SFDISK_APK"        "$CACHE/extra-apks/$SFDISK_APK"
-download_if_missing "$ALPINE_MAIN/$LOSETUP_APK"       "$CACHE/extra-apks/$LOSETUP_APK"
-download_if_missing "$ALPINE_MAIN/$LIBFDISK_APK"      "$CACHE/extra-apks/$LIBFDISK_APK"
-download_if_missing "$ALPINE_MAIN/$LIBSMARTCOLS_APK"  "$CACHE/extra-apks/$LIBSMARTCOLS_APK"
-download_if_missing "$ALPINE_MAIN/$LIBNCURSESW_APK"   "$CACHE/extra-apks/$LIBNCURSESW_APK"
-download_if_missing "$ALPINE_MAIN/$NCURSES_TERMINFO_APK" "$CACHE/extra-apks/$NCURSES_TERMINFO_APK"
-download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_APK"        "$CACHE/extra-apks/$OPENSSH_SERVER_APK"
-download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_COMMON_APK" "$CACHE/extra-apks/$OPENSSH_SERVER_COMMON_APK"
-download_if_missing "$ALPINE_MAIN/$OPENSSH_KEYGEN_APK"        "$CACHE/extra-apks/$OPENSSH_KEYGEN_APK"
+mkdir -p "$EXTRA_APKS"
+download_if_missing "$ALPINE_MAIN/$ATTR_APK"          "$EXTRA_APKS/$ATTR_APK"
+download_if_missing "$ALPINE_MAIN/$LIBATTR_APK"       "$EXTRA_APKS/$LIBATTR_APK"
+download_if_missing "$ALPINE_MAIN/$ACL_APK"           "$EXTRA_APKS/$ACL_APK"
+download_if_missing "$ALPINE_MAIN/$ACL_LIBS_APK"      "$EXTRA_APKS/$ACL_LIBS_APK"
+download_if_missing "$ALPINE_MAIN/$SFDISK_APK"        "$EXTRA_APKS/$SFDISK_APK"
+download_if_missing "$ALPINE_MAIN/$LOSETUP_APK"       "$EXTRA_APKS/$LOSETUP_APK"
+download_if_missing "$ALPINE_MAIN/$LIBFDISK_APK"      "$EXTRA_APKS/$LIBFDISK_APK"
+download_if_missing "$ALPINE_MAIN/$LIBSMARTCOLS_APK"  "$EXTRA_APKS/$LIBSMARTCOLS_APK"
+download_if_missing "$ALPINE_MAIN/$LIBNCURSESW_APK"   "$EXTRA_APKS/$LIBNCURSESW_APK"
+download_if_missing "$ALPINE_MAIN/$NCURSES_TERMINFO_APK" "$EXTRA_APKS/$NCURSES_TERMINFO_APK"
+download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_APK"        "$EXTRA_APKS/$OPENSSH_SERVER_APK"
+download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_COMMON_APK" "$EXTRA_APKS/$OPENSSH_SERVER_COMMON_APK"
+download_if_missing "$ALPINE_MAIN/$OPENSSH_KEYGEN_APK"        "$EXTRA_APKS/$OPENSSH_KEYGEN_APK"
+printf '%s\n' "$ALPINE_ARCH" > "$CACHE/vm-arch"
 
 # ---------------------------------------------------------------------------
 # Step 2 (server mode only) — generate SSH keypair for builder VM access.
@@ -170,7 +197,7 @@ fi
 echo "=== [vm] /host mounted ==="
 
 # Extract all extra-apks: attr, acl, sfdisk, losetup, openssh, etc.
-for pkg in /cache/extra-apks/*.apk; do
+for pkg in /cache/extra-apks/$(cat /cache/vm-arch)/*.apk; do
     tar -xzf "$pkg" -C / --exclude=.PKGINFO --exclude='.SIGN.*' \
         --exclude=.pre-install --exclude=.post-install \
         --exclude=.pre-upgrade --exclude=.post-upgrade 2>/dev/null || true
@@ -214,7 +241,7 @@ if ! mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host; then
 fi
 echo "=== [vm] /host mounted ==="
 
-for pkg in /host/.vm-cache/extra-apks/*.apk; do
+for pkg in /host/.vm-cache/extra-apks/$(cat /host/.vm-cache/vm-arch)/*.apk; do
     echo "=== [vm] extracting $(basename "$pkg") ==="
     tar -xzf "$pkg" -C / --exclude=.PKGINFO --exclude='.SIGN.*' \
         --exclude=.pre-install --exclude=.post-install \
@@ -249,6 +276,18 @@ bsdtar -c -f "$CACHE/ovl.iso" --format=iso9660 -C "$OVL_STAGE" .
 # ---------------------------------------------------------------------------
 # Step 4 — boot Alpine under qemu.
 # ---------------------------------------------------------------------------
+if [[ "$QEMU_DRIVE_IF" == "ide" ]]; then
+    QEMU_BOOT_DRIVES=(
+        -drive "file=$ALPINE_ISO_PATH,media=cdrom,readonly=on,if=ide,index=0"
+        -drive "file=$CACHE/ovl.iso,media=cdrom,readonly=on,if=ide,index=1"
+    )
+else
+    QEMU_BOOT_DRIVES=(
+        -drive "file=$ALPINE_ISO_PATH,format=raw,readonly=on,if=virtio,index=0"
+        -drive "file=$CACHE/ovl.iso,format=raw,readonly=on,if=virtio,index=1"
+    )
+fi
+
 if [[ "$SERVER_MODE" == "1" ]]; then
     # Pick a free port.
     EXT4_BUILDER_PORT="${EXT4_BUILDER_PORT:-2222}"
@@ -265,12 +304,12 @@ if [[ "$SERVER_MODE" == "1" ]]; then
     cp "$SCRIPT_DIR/_vm-builder.sh" "$SERVER_IMAGE_DIR/_vm-builder.sh"
 
     echo "[host] starting Alpine builder VM (SSH on localhost:${EXT4_BUILDER_PORT})..."
-    qemu-system-x86_64 \
-        -kernel "$CACHE/vmlinuz-virt" \
-        -initrd "$CACHE/initramfs-virt" \
-        -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
-        -drive file="$CACHE/alpine-virt.iso",media=cdrom,readonly=on,if=ide,index=0 \
-        -drive file="$CACHE/ovl.iso",media=cdrom,readonly=on,if=ide,index=1 \
+    "$QEMU_SYSTEM" \
+        "${QEMU_MACHINE_ARGS[@]}" \
+        -kernel "$VMLINUX_PATH" \
+        -initrd "$INITRAMFS_PATH" \
+        -append "console=$QEMU_CONSOLE modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
+        "${QEMU_BOOT_DRIVES[@]}" \
         -virtfs local,path="$SERVER_IMAGE_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
         -virtfs local,path="$CACHE",mount_tag=cache,security_model=mapped-xattr,id=cache \
         -netdev "user,id=net0,hostfwd=tcp:127.0.0.1:${EXT4_BUILDER_PORT}-:22" \
@@ -318,13 +357,13 @@ else
     rm -f "$CACHE/vm-build.done" "$CACHE/vm-build.failed" "$CACHE/vm-build.log"
     printf '%s\n' "${BATCH_ARGS[@]+"${BATCH_ARGS[@]}"}" > "$CACHE/vm-args"
 
-    echo "[host] booting Alpine under qemu (serial -> stdout)..."
-    qemu-system-x86_64 \
-        -kernel "$CACHE/vmlinuz-virt" \
-        -initrd "$CACHE/initramfs-virt" \
-        -append "console=ttyS0 modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
-        -drive file="$CACHE/alpine-virt.iso",media=cdrom,readonly=on,if=ide,index=0 \
-        -drive file="$CACHE/ovl.iso",media=cdrom,readonly=on,if=ide,index=1 \
+    echo "[host] booting Alpine $ALPINE_ARCH under $QEMU_SYSTEM (serial -> stdout)..."
+    "$QEMU_SYSTEM" \
+        "${QEMU_MACHINE_ARGS[@]}" \
+        -kernel "$VMLINUX_PATH" \
+        -initrd "$INITRAMFS_PATH" \
+        -append "console=$QEMU_CONSOLE modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
+        "${QEMU_BOOT_DRIVES[@]}" \
         -virtfs local,path="$SCRIPT_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
         -m 1024 \
         -smp 2 \
