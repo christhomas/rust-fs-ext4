@@ -56,15 +56,32 @@ esac
 check_line "$host" "EXT4_VM_ARCH=$expected_host" "no override follows the local host architecture"
 
 case "$(uname -s):$(uname -m)" in
-    Linux:aarch64|Linux:arm64)
+    Linux:x86_64|Linux:amd64|Linux:aarch64|Linux:arm64)
         if [ -r /dev/kvm ] && [ -w /dev/kvm ]; then
-            check_line "$host" 'QEMU_ACCEL=kvm' "native ARM Linux uses KVM acceleration"
+            check_line "$host" 'QEMU_ACCEL=kvm' "native Linux uses KVM acceleration"
+        else
+            check_line "$host" 'QEMU_ACCEL=tcg' "configuration inspection explicitly permits TCG without KVM"
         fi
         ;;
     Darwin:arm64)
         check_line "$host" 'QEMU_ACCEL=hvf' "Apple Silicon uses HVF acceleration"
         ;;
 esac
+
+if grep -Fq '.vm-cache/vm-arch' "$GENERATOR"; then
+    echo "FAIL  fixture generators share a mutable architecture selector" >&2
+    fails=$((fails + 1))
+else
+    echo "ok    fixture architecture is embedded rather than shared through mutable state"
+fi
+for per_arch_state in 'ovl-$ALPINE_ARCH.iso' 'vm-args-$ALPINE_ARCH' 'vm-build-$ALPINE_ARCH.done'; do
+    if grep -Fq "$per_arch_state" "$GENERATOR"; then
+        printf 'ok    per-architecture state includes %s\n' "$per_arch_state"
+    else
+        printf 'FAIL  generator state is not architecture-specific: %s\n' "$per_arch_state" >&2
+        fails=$((fails + 1))
+    fi
+done
 
 if EXT4_VM_ARCH=mips64 bash "$GENERATOR" --print-vm-config > /dev/null 2>&1; then
     echo "FAIL  an unsupported architecture was accepted" >&2

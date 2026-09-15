@@ -138,8 +138,6 @@ download_if_missing "$ALPINE_MAIN/$NCURSES_TERMINFO_APK" "$EXTRA_APKS/$NCURSES_T
 download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_APK"        "$EXTRA_APKS/$OPENSSH_SERVER_APK"
 download_if_missing "$ALPINE_MAIN/$OPENSSH_SERVER_COMMON_APK" "$EXTRA_APKS/$OPENSSH_SERVER_COMMON_APK"
 download_if_missing "$ALPINE_MAIN/$OPENSSH_KEYGEN_APK"        "$EXTRA_APKS/$OPENSSH_KEYGEN_APK"
-printf '%s\n' "$ALPINE_ARCH" > "$CACHE/vm-arch"
-
 # ---------------------------------------------------------------------------
 # Step 2 (server mode only) — generate SSH keypair for builder VM access.
 # ---------------------------------------------------------------------------
@@ -153,7 +151,7 @@ fi
 # ---------------------------------------------------------------------------
 # Step 3 — assemble the apkovl (Alpine overlay).
 # ---------------------------------------------------------------------------
-OVL_TMP="$CACHE/ovl"
+OVL_TMP="$CACHE/ovl-$ALPINE_ARCH"
 rm -rf "$OVL_TMP"
 mkdir -p \
     "$OVL_TMP/etc/local.d" \
@@ -205,7 +203,7 @@ fi
 echo "=== [vm] /host mounted ==="
 
 # Extract all extra-apks: attr, acl, sfdisk, losetup, openssh, etc.
-for pkg in /cache/extra-apks/$(cat /cache/vm-arch)/*.apk; do
+for pkg in /cache/extra-apks/__ALPINE_ARCH__/*.apk; do
     tar -xzf "$pkg" -C / --exclude=.PKGINFO --exclude='.SIGN.*' \
         --exclude=.pre-install --exclude=.post-install \
         --exclude=.pre-upgrade --exclude=.post-upgrade 2>/dev/null || true
@@ -231,7 +229,7 @@ if [ ! -x /usr/sbin/sshd ]; then
 fi
 /usr/sbin/sshd
 echo "=== [vm] sshd ready ==="
-touch /cache/server-ready
+touch /cache/server-ready-__ALPINE_ARCH__
 WRAPPER_EOF
 else
     # Batch mode: run builder then power off (original behaviour).
@@ -249,7 +247,7 @@ if ! mount -t 9p -o trans=virtio,version=9p2000.L,msize=131072 host /host; then
 fi
 echo "=== [vm] /host mounted ==="
 
-for pkg in /host/.vm-cache/extra-apks/$(cat /host/.vm-cache/vm-arch)/*.apk; do
+for pkg in /host/.vm-cache/extra-apks/__ALPINE_ARCH__/*.apk; do
     echo "=== [vm] extracting $(basename "$pkg") ==="
     tar -xzf "$pkg" -C / --exclude=.PKGINFO --exclude='.SIGN.*' \
         --exclude=.pre-install --exclude=.post-install \
@@ -257,14 +255,14 @@ for pkg in /host/.vm-cache/extra-apks/$(cat /host/.vm-cache/vm-arch)/*.apk; do
 done
 
 echo "=== [vm] running _vm-builder.sh ==="
-if sh /host/_vm-builder.sh /host $(cat /host/.vm-cache/vm-args 2>/dev/null) \
-        > /host/.vm-cache/vm-build.log 2>&1; then
-    touch /host/.vm-cache/vm-build.done
+if sh /host/_vm-builder.sh /host $(cat /host/.vm-cache/vm-args-__ALPINE_ARCH__ 2>/dev/null) \
+        > /host/.vm-cache/vm-build-__ALPINE_ARCH__.log 2>&1; then
+    touch /host/.vm-cache/vm-build-__ALPINE_ARCH__.done
     echo "=== [vm] builder succeeded ==="
 else
-    touch /host/.vm-cache/vm-build.failed
+    touch /host/.vm-cache/vm-build-__ALPINE_ARCH__.failed
     echo "=== [vm] builder FAILED ==="
-    tail -n 20 /host/.vm-cache/vm-build.log
+    tail -n 20 /host/.vm-cache/vm-build-__ALPINE_ARCH__.log
 fi
 
 sync
@@ -272,14 +270,16 @@ poweroff -f
 WRAPPER_EOF
 fi
 
+sed -i "s/__ALPINE_ARCH__/$ALPINE_ARCH/g" "$OVL_TMP/etc/local.d/99-ext4.start"
 chmod +x "$OVL_TMP/etc/local.d/99-ext4.start"
 ln -sf /etc/init.d/local "$OVL_TMP/etc/runlevels/default/local"
 
-OVL_STAGE="$CACHE/ovl-iso-stage"
-rm -rf "$OVL_STAGE" "$CACHE/ovl.iso"
+OVL_STAGE="$CACHE/ovl-iso-stage-$ALPINE_ARCH"
+OVL_ISO="$CACHE/ovl-$ALPINE_ARCH.iso"
+rm -rf "$OVL_STAGE" "$OVL_ISO"
 mkdir -p "$OVL_STAGE"
 (cd "$OVL_TMP" && tar -czf "$OVL_STAGE/localhost.apkovl.tar.gz" etc)
-bsdtar -c -f "$CACHE/ovl.iso" --format=iso9660 -C "$OVL_STAGE" .
+bsdtar -c -f "$OVL_ISO" --format=iso9660 -C "$OVL_STAGE" .
 
 # ---------------------------------------------------------------------------
 # Step 4 — boot Alpine under qemu.
@@ -287,12 +287,12 @@ bsdtar -c -f "$CACHE/ovl.iso" --format=iso9660 -C "$OVL_STAGE" .
 if [[ "$QEMU_DRIVE_IF" == "ide" ]]; then
     QEMU_BOOT_DRIVES=(
         -drive "file=$ALPINE_ISO_PATH,media=cdrom,readonly=on,if=ide,index=0"
-        -drive "file=$CACHE/ovl.iso,media=cdrom,readonly=on,if=ide,index=1"
+        -drive "file=$OVL_ISO,media=cdrom,readonly=on,if=ide,index=1"
     )
 else
     QEMU_BOOT_DRIVES=(
         -drive "file=$ALPINE_ISO_PATH,format=raw,readonly=on,if=virtio,index=0"
-        -drive "file=$CACHE/ovl.iso,format=raw,readonly=on,if=virtio,index=1"
+        -drive "file=$OVL_ISO,format=raw,readonly=on,if=virtio,index=1"
     )
 fi
 
@@ -309,7 +309,8 @@ fi
 if [[ "$SERVER_MODE" == "1" ]]; then
     # Pick a free port.
     EXT4_BUILDER_PORT="${EXT4_BUILDER_PORT:-2222}"
-    rm -f "$CACHE/server-ready" "$CACHE/server.env"
+    SERVER_READY="$CACHE/server-ready-$ALPINE_ARCH"
+    rm -f "$SERVER_READY" "$CACHE/server.env"
 
     # In server mode the 9p share must point at HOST_IMAGE_DIR (where the
     # harness expects to find finished images) rather than SCRIPT_DIR.
@@ -342,7 +343,7 @@ if [[ "$SERVER_MODE" == "1" ]]; then
     echo "[host] waiting for sshd (up to 120s)..."
     timeout=120
     while [[ $timeout -gt 0 ]]; do
-        if [[ -f "$CACHE/server-ready" ]]; then
+        if [[ -f "$SERVER_READY" ]]; then
             break
         fi
         if ! kill -0 "$QEMU_PID" 2>/dev/null; then
@@ -353,7 +354,7 @@ if [[ "$SERVER_MODE" == "1" ]]; then
         timeout=$((timeout - 1))
     done
 
-    if [[ ! -f "$CACHE/server-ready" ]]; then
+    if [[ ! -f "$SERVER_READY" ]]; then
         echo "[host] timed out waiting for sshd" >&2
         kill "$QEMU_PID" 2>/dev/null || true
         exit 1
@@ -370,8 +371,12 @@ EOF
 
 else
     # Batch mode — existing behaviour.
-    rm -f "$CACHE/vm-build.done" "$CACHE/vm-build.failed" "$CACHE/vm-build.log"
-    printf '%s\n' "${BATCH_ARGS[@]+"${BATCH_ARGS[@]}"}" > "$CACHE/vm-args"
+    VM_BUILD_DONE="$CACHE/vm-build-$ALPINE_ARCH.done"
+    VM_BUILD_FAILED="$CACHE/vm-build-$ALPINE_ARCH.failed"
+    VM_BUILD_LOG="$CACHE/vm-build-$ALPINE_ARCH.log"
+    VM_ARGS="$CACHE/vm-args-$ALPINE_ARCH"
+    rm -f "$VM_BUILD_DONE" "$VM_BUILD_FAILED" "$VM_BUILD_LOG"
+    printf '%s\n' "${BATCH_ARGS[@]+"${BATCH_ARGS[@]}"}" > "$VM_ARGS"
 
     echo "[host] booting Alpine $ALPINE_ARCH under $QEMU_SYSTEM (serial -> stdout)..."
     "$QEMU_SYSTEM" \
@@ -387,12 +392,12 @@ else
     # ---------------------------------------------------------------------------
     # Step 5 — inspect the done-marker the guest left behind.
     # ---------------------------------------------------------------------------
-    if [ -f "$CACHE/vm-build.done" ]; then
+    if [ -f "$VM_BUILD_DONE" ]; then
         echo "[host] guest reported success."
         exit 0
-    elif [ -f "$CACHE/vm-build.failed" ]; then
-        echo "[host] guest reported failure. Last 50 lines of vm-build.log:" >&2
-        tail -n 50 "$CACHE/vm-build.log" >&2 || true
+    elif [ -f "$VM_BUILD_FAILED" ]; then
+        echo "[host] guest reported failure. Last 50 lines of $VM_BUILD_LOG:" >&2
+        tail -n 50 "$VM_BUILD_LOG" >&2 || true
         exit 1
     else
         echo "[host] guest exited without writing a done marker — something" >&2
