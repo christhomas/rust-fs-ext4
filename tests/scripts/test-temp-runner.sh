@@ -28,7 +28,8 @@ if [[ -e "$SELECTED" ]]; then
     exit 1
 fi
 
-GITHUB_ACTIONS=true RUNNER_TEMP="$TEST_BASE" TMPDIR=/must-not-be-used \
+FS_EXT4_TEST_TMPDIR= FS_EXT4_TEST_TMP_BASE= \
+    GITHUB_ACTIONS=true RUNNER_TEMP="$TEST_BASE" TMPDIR=/must-not-be-used \
     "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
 SELECTED="$(cat "$OUTPUT")"
 

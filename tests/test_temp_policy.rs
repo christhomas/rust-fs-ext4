@@ -1,4 +1,4 @@
-use fs_ext4_test_support::select_temp_dir;
+use fs_ext4_test_support::{create_unique_temp_dir, select_temp_dir};
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -10,6 +10,7 @@ fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
     assert_eq!(
         select_temp_dir(
             Some(OsStr::new("/explicit/nvme")),
+            Some(OsStr::new("/managed/base")),
             true,
             Some(OsStr::new("/runner/tmp")),
             Some(b"Raspberry Pi 5 Model B"),
@@ -21,6 +22,19 @@ fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
     assert_eq!(
         select_temp_dir(
             None,
+            Some(OsStr::new("/managed/base")),
+            true,
+            Some(OsStr::new("/runner/tmp")),
+            None,
+            worktree,
+            platform
+        ),
+        Path::new("/managed/base")
+    );
+    assert_eq!(
+        select_temp_dir(
+            None,
+            None,
             true,
             Some(OsStr::new("/runner/tmp")),
             Some(b"Generic ARM Server"),
@@ -30,11 +44,12 @@ fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
         Path::new("/runner/tmp")
     );
     assert_eq!(
-        select_temp_dir(None, true, None, None, worktree, platform),
+        select_temp_dir(None, None, true, None, None, worktree, platform),
         platform
     );
     assert_eq!(
         select_temp_dir(
+            None,
             None,
             false,
             None,
@@ -47,6 +62,7 @@ fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
     assert_eq!(
         select_temp_dir(
             None,
+            None,
             false,
             None,
             Some(b"Generic ARM Server"),
@@ -55,4 +71,20 @@ fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
         ),
         platform
     );
+}
+
+#[test]
+fn managed_base_creates_a_unique_child() {
+    let base =
+        std::env::temp_dir().join(format!("fs-ext4-temp-policy-test.{}", std::process::id()));
+    let first = create_unique_temp_dir(&base).expect("first managed child");
+    let second = create_unique_temp_dir(&base).expect("second managed child");
+
+    assert_eq!(first.parent(), Some(base.as_path()));
+    assert_eq!(second.parent(), Some(base.as_path()));
+    assert_ne!(first, second);
+
+    std::fs::remove_dir_all(&first).expect("remove first managed child");
+    std::fs::remove_dir_all(&second).expect("remove second managed child");
+    std::fs::remove_dir(&base).expect("remove test base");
 }
