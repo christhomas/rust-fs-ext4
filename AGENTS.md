@@ -98,8 +98,10 @@ A **real Linux `e2fsck`** can. The repo's verification options:
   cached under `.vm-cache/`) — real Linux `mke2fs` + `e2fsprogs`. **This is the
   oracle.** It builds the fixtures and can `e2fsck` any image. No host
   `e2fsprogs` needed; no Docker. The guest follows the host ISA by default
-  (x86_64 or aarch64), with `EXT4_VM_ARCH` as an explicit diagnostic override;
-  CI runs the complete gate on native Linux runners for both architectures.
+  (x86_64 or aarch64) and requires KVM/HVF; slow TCG needs the explicit
+  `EXT4_VM_ALLOW_TCG=1` diagnostic override. CI is already Linux, so its x86_64
+  and ARM64 jobs run `_vm-builder.sh` directly through
+  `build-ext4-feature-images-native-linux.sh`, without nested virtualisation.
 - `scripts/cross-validate-lwext4.sh` + `tests/lwext4_cross_validate.rs` —
   independent C impl, opt-in (`LWEXT4_DIR`); currently a **read-only skeleton**.
 - `tests/{qemu,vagrant}/freebsd/` — a real kernel, but FreeBSD's ext4 validates

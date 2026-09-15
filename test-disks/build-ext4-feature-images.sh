@@ -56,11 +56,19 @@ if [[ "$PRINT_VM_CONFIG" == "1" ]]; then
     printf 'QEMU_SYSTEM=%s\n' "$QEMU_SYSTEM"
     printf 'QEMU_DRIVE_IF=%s\n' "$QEMU_DRIVE_IF"
     printf 'QEMU_CONSOLE=%s\n' "$QEMU_CONSOLE"
+    printf 'QEMU_ACCEL=%s\n' "$QEMU_ACCEL"
+    printf 'QEMU_BOOT_MODE=%s\n' "$QEMU_BOOT_MODE"
+    printf 'QEMU_FIRMWARE=%s\n' "$QEMU_FIRMWARE"
     exit 0
 fi
 
 if ! command -v "$QEMU_SYSTEM" >/dev/null 2>&1; then
     echo "missing fixture VM emulator: $QEMU_SYSTEM" >&2
+    exit 1
+fi
+if [[ "$QEMU_BOOT_MODE" == "uefi" && ! -f "$QEMU_FIRMWARE" ]]; then
+    echo "missing AArch64 UEFI firmware for the fixture VM" >&2
+    echo "install qemu-efi-aarch64, or set EXT4_QEMU_EFI to its firmware file" >&2
     exit 1
 fi
 
@@ -288,6 +296,16 @@ else
     )
 fi
 
+if [[ "$QEMU_BOOT_MODE" == "direct" ]]; then
+    QEMU_BOOT_ARGS=(
+        -kernel "$VMLINUX_PATH"
+        -initrd "$INITRAMFS_PATH"
+        -append "console=$QEMU_CONSOLE modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio"
+    )
+else
+    QEMU_BOOT_ARGS=(-bios "$QEMU_FIRMWARE")
+fi
+
 if [[ "$SERVER_MODE" == "1" ]]; then
     # Pick a free port.
     EXT4_BUILDER_PORT="${EXT4_BUILDER_PORT:-2222}"
@@ -306,9 +324,7 @@ if [[ "$SERVER_MODE" == "1" ]]; then
     echo "[host] starting Alpine builder VM (SSH on localhost:${EXT4_BUILDER_PORT})..."
     "$QEMU_SYSTEM" \
         "${QEMU_MACHINE_ARGS[@]}" \
-        -kernel "$VMLINUX_PATH" \
-        -initrd "$INITRAMFS_PATH" \
-        -append "console=$QEMU_CONSOLE modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
+        "${QEMU_BOOT_ARGS[@]}" \
         "${QEMU_BOOT_DRIVES[@]}" \
         -virtfs local,path="$SERVER_IMAGE_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
         -virtfs local,path="$CACHE",mount_tag=cache,security_model=mapped-xattr,id=cache \
@@ -360,9 +376,7 @@ else
     echo "[host] booting Alpine $ALPINE_ARCH under $QEMU_SYSTEM (serial -> stdout)..."
     "$QEMU_SYSTEM" \
         "${QEMU_MACHINE_ARGS[@]}" \
-        -kernel "$VMLINUX_PATH" \
-        -initrd "$INITRAMFS_PATH" \
-        -append "console=$QEMU_CONSOLE modules=loop,squashfs,sd-mod,usb-storage,virtio_blk,virtio_net,virtio_pci,9p,9pnet_virtio" \
+        "${QEMU_BOOT_ARGS[@]}" \
         "${QEMU_BOOT_DRIVES[@]}" \
         -virtfs local,path="$SCRIPT_DIR",mount_tag=host,security_model=mapped-xattr,id=host \
         -m 1024 \

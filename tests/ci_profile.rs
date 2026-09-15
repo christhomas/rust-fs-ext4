@@ -419,10 +419,9 @@ fn the_pr_gate_still_tests_in_a_profile_that_can_see_an_overflow() {
 }
 
 /// Both supported host architectures must run the real fixture generator and
-/// the complete Rust gate natively. A cross-target `cargo check` proves that
-/// types compile; it cannot boot the Linux oracle VM, run clippy with the
-/// target's `c_char` definition, or exercise filesystem reads and writes on
-/// that architecture.
+/// the complete Rust gate natively. The GitHub runner is already real Linux,
+/// so fixture generation there must use its native kernel rather than require
+/// nested virtualisation. Local macOS development still uses the matching VM.
 #[test]
 fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
     let path = manifest_dir()
@@ -450,24 +449,18 @@ fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
         .and_then(|matrix| field(matrix, "include"))
         .and_then(Yaml::as_sequence)
         .unwrap_or_else(|| panic!("jobs.test must use an explicit strategy.matrix.include"));
-    let actual: Vec<(&str, &str, &str)> = rows
+    let actual: Vec<(&str, &str)> = rows
         .iter()
         .map(|row| {
             (
                 field(row, "arch").and_then(Yaml::as_str).unwrap_or(""),
                 field(row, "os").and_then(Yaml::as_str).unwrap_or(""),
-                field(row, "qemu-package")
-                    .and_then(Yaml::as_str)
-                    .unwrap_or(""),
             )
         })
         .collect();
     assert_eq!(
         actual,
-        vec![
-            ("x86_64", "ubuntu-24.04", "qemu-system-x86"),
-            ("aarch64", "ubuntu-24.04-arm", "qemu-system-arm"),
-        ],
+        vec![("x86_64", "ubuntu-24.04"), ("aarch64", "ubuntu-24.04-arm"),],
         "the test job must cover both native standard Linux runner architectures"
     );
 
@@ -479,8 +472,7 @@ fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
         .filter_map(|step| field(step, "run").and_then(Yaml::as_str))
         .collect();
     for required in [
-        "${{ matrix.qemu-package }}",
-        "build-ext4-feature-images.sh",
+        "build-ext4-feature-images-native-linux.sh",
         "cargo clippy --locked --all-targets -- -D warnings",
         "cargo test --locked --release",
         "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
@@ -492,17 +484,11 @@ fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
         );
     }
 
-    let cache_keys: Vec<&str> = steps
-        .iter()
-        .filter_map(|step| field(step, "with"))
-        .filter_map(|with| field(with, "key"))
-        .filter_map(Yaml::as_str)
-        .collect();
     assert!(
-        cache_keys
+        scripts
             .iter()
-            .any(|key| key.contains("${{ matrix.arch }}")),
-        "at least one test-job cache key must include matrix.arch so incompatible VM assets cannot alias"
+            .all(|script| !script.contains("qemu-system-")),
+        "a standard GitHub ARM runner must not depend on unavailable nested VM acceleration"
     );
 }
 

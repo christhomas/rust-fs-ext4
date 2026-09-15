@@ -7,10 +7,16 @@ self-describing — no external key needed.
 Regenerate them with `bash test-disks/build-ext4-feature-images.sh`. The
 short-lived Alpine Linux oracle follows the local host architecture by
 default: x86_64 on Intel/AMD and aarch64 on Apple Silicon/ARM Linux. Use
-`EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64` only when deliberately
-exercising the other configuration. VM downloads live under `.vm-cache/` in
-architecture-specific paths, so one host or CI cache cannot reuse another
-architecture's kernel, initramfs, ISO, or APKs.
+KVM on Linux or HVF on macOS; the script fails clearly when native hardware
+acceleration is unavailable. `EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64`
+with `EXT4_VM_ALLOW_TCG=1` is the explicit, slow cross-architecture fallback.
+VM downloads live under `.vm-cache/` in architecture-specific paths, so one
+host cannot reuse another architecture's kernel, initramfs, ISO, or APKs.
+
+GitHub's x86_64 and ARM64 jobs are themselves real Linux environments. They
+run `sudo bash test-disks/build-ext4-feature-images-native-linux.sh` so fixture
+generation uses the native kernel and external `e2fsprogs` tools without
+depending on nested virtualisation.
 
 | Image | Exercises |
 |---|---|

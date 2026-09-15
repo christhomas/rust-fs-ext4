@@ -519,16 +519,18 @@ Fixtures are gitignored — regenerate them with:
 bash test-disks/build-ext4-feature-images.sh
 ```
 
-The generator runs standard formatter tools inside a short-lived
-Alpine Linux VM booted under QEMU, so the same script works on macOS,
-Linux, and in CI (no Docker required). It selects an x86_64 guest on
-Intel/AMD hosts and an aarch64 guest on Apple Silicon/ARM Linux hosts.
-Set `EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64` to override that
-selection for diagnosis.
+The local generator runs standard formatter tools inside a short-lived
+Alpine Linux VM booted under QEMU, so the same script works on macOS and
+Linux without Docker. It selects an x86_64 guest on Intel/AMD hosts and an
+aarch64 guest on Apple Silicon/ARM Linux hosts. Native guests require KVM on
+Linux or HVF on macOS; the generator fails rather than silently falling back
+to slow emulation. Set `EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64` together
+with `EXT4_VM_ALLOW_TCG=1` only for a deliberate cross-architecture diagnostic.
 First run downloads the Alpine virt ISO + kernel (~75 MB, cached
 under `test-disks/.vm-cache/`); cached VM assets are separated by
-architecture. CI runs the full fixture and Rust gate natively on both
-x86_64 and ARM64 Linux runners.
+architecture. CI needs no nested VM: both x86_64 and ARM64 jobs are already
+real Linux, so they use `build-ext4-feature-images-native-linux.sh` and run the
+full fixture and Rust gate directly on their native kernels.
 
 ### Git hooks
 
