@@ -1,4 +1,4 @@
-use fs_ext4_test_support::{create_unique_temp_dir, select_temp_dir};
+use fs_ext4_test_support::{materialize_temp_dir, select_temp_dir};
 use std::ffi::OsStr;
 use std::path::Path;
 
@@ -74,11 +74,11 @@ fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
 }
 
 #[test]
-fn managed_base_creates_a_unique_child() {
+fn every_non_explicit_root_creates_a_unique_child() {
     let base =
         std::env::temp_dir().join(format!("fs-ext4-temp-policy-test.{}", std::process::id()));
-    let first = create_unique_temp_dir(&base).expect("first managed child");
-    let second = create_unique_temp_dir(&base).expect("second managed child");
+    let first = materialize_temp_dir(None, &base).expect("first managed child");
+    let second = materialize_temp_dir(None, &base).expect("second managed child");
 
     assert_eq!(first.parent(), Some(base.as_path()));
     assert_eq!(second.parent(), Some(base.as_path()));
@@ -87,4 +87,17 @@ fn managed_base_creates_a_unique_child() {
     std::fs::remove_dir_all(&first).expect("remove first managed child");
     std::fs::remove_dir_all(&second).expect("remove second managed child");
     std::fs::remove_dir(&base).expect("remove test base");
+}
+
+#[test]
+fn explicit_directory_is_preserved_exactly() {
+    let exact = std::env::temp_dir().join(format!(
+        "fs-ext4-explicit-policy-test.{}",
+        std::process::id()
+    ));
+    let selected = materialize_temp_dir(Some(OsStr::new("configured")), &exact)
+        .expect("create exact directory");
+
+    assert_eq!(selected, exact);
+    std::fs::remove_dir(&selected).expect("remove exact directory");
 }

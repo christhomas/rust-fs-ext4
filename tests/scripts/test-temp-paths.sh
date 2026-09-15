@@ -10,7 +10,9 @@ matches="$(rg -U -n 'format!\(\s*"/tmp/|"/tmp/(fs_ext4|rust-fs-ext4|ext4rs-)|std
     --glob '!**/test_temp_policy.rs' || true)"
 
 selector_matches="$({
-    rg -n '/tmp' "$REPO/scripts/test.sh" | rg -v -F '$REPO/tmp'
+    rg -n '/tmp' "$REPO/scripts/test.sh" \
+        | sed 's/\$REPO\/tmp//g' \
+        | rg -n '/tmp'
     rg -n 'PathBuf::from\("/tmp|Path::new\("/tmp' \
         "$REPO/tests/support/src/lib.rs"
 } || true)"

@@ -520,9 +520,9 @@ Raspberry Pi it uses
 an NVMe volume) instead of the SD card backing system temporary directory. Set
 `FS_EXT4_TEST_TMP_BASE` to choose another managed base, or
 `FS_EXT4_TEST_TMPDIR` to supply an exact caller-managed directory. Direct
-`cargo test` also follows the same location policy, including a unique child
-for `FS_EXT4_TEST_TMP_BASE`, but has no wrapper lifecycle to clean its scratch
-directory afterward.
+`cargo test` also follows the same location policy and isolates every process
+beneath the selected root, but has no wrapper lifecycle to clean its scratch
+directory afterward. Use the wrapper for normal development and CI runs.
 
 Integration tests use ext4 image fixtures under `test-disks/`.
 Fixtures are gitignored — regenerate them with:

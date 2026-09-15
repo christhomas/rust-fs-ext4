@@ -3,8 +3,8 @@ use std::fmt;
 use std::fs;
 use std::io;
 use std::path::{Path, PathBuf};
-use std::time::{SystemTime, UNIX_EPOCH};
 use std::sync::OnceLock;
+use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEST_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
@@ -61,8 +61,22 @@ pub fn create_unique_temp_dir(base: &Path) -> io::Result<PathBuf> {
     }
     Err(io::Error::new(
         io::ErrorKind::AlreadyExists,
-        format!("cannot allocate unique scratch directory below {}", base.display()),
+        format!(
+            "cannot allocate unique scratch directory below {}",
+            base.display()
+        ),
     ))
+}
+
+/// Preserve an explicit directory or isolate a process beneath a selected root.
+#[doc(hidden)]
+pub fn materialize_temp_dir(explicit: Option<&OsStr>, root: &Path) -> io::Result<PathBuf> {
+    if explicit.filter(|path| !path.is_empty()).is_some() {
+        fs::create_dir_all(root)?;
+        Ok(root.to_path_buf())
+    } else {
+        create_unique_temp_dir(root)
+    }
 }
 
 /// Return the shared scratch directory for this integration-test process.
@@ -86,27 +100,13 @@ pub fn temp_dir() -> &'static Path {
                 worktree,
                 &std::env::temp_dir(),
             );
-            let selected = if explicit.as_deref().filter(|path| !path.is_empty()).is_none()
-                && managed_base
-                    .as_deref()
-                    .filter(|path| !path.is_empty())
-                    .is_some()
-            {
-                create_unique_temp_dir(&selected_root).unwrap_or_else(|error| {
+            let selected = materialize_temp_dir(explicit.as_deref(), &selected_root)
+                .unwrap_or_else(|error| {
                     panic!(
                         "cannot create ext4 test scratch directory below {}: {error}",
                         selected_root.display()
                     )
-                })
-            } else {
-                selected_root
-            };
-            fs::create_dir_all(&selected).unwrap_or_else(|error| {
-                panic!(
-                    "cannot create ext4 test scratch directory {}: {error}",
-                    selected.display()
-                )
-            });
+                });
             selected
         })
         .as_path()
