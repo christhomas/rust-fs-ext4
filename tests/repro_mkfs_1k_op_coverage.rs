@@ -10,9 +10,9 @@
 //! journal, and 1 KiB blocks use the first_data_block=1 layout (see the mkfs
 //! bitmap fix). So this stresses the checksum write paths at the small block
 //! size, journal-less. Each test formats its own fresh image and leaves it in
-//! /tmp for the real-Linux oracle:
+//! the selected scratch directory for the real-Linux oracle:
 //!
-//!   scripts/vm-e2fsck.sh /tmp/fs_ext4_mk1kop_*.img
+//!   FS_EXT4_TEST_TMPDIR="$PWD/tmp/oracle" ./scripts/test.sh --test repro_mkfs_1k_op_coverage
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::fs::Filesystem;
@@ -30,9 +30,10 @@ const UUID: [u8; 16] = [
 fn mkfs_1k(tag: &str) -> Option<String> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = format!("/tmp/fs_ext4_mk1kop_{tag}_{}_{n}.img", std::process::id());
+    let path =
+        fs_ext4_test_support::temp_path!("fs_ext4_mk1kop_{tag}_{}_{n}.img", std::process::id());
     {
-        // Image setup must not fail silently: a /tmp/disk/permission error here
+        // Image setup must not fail silently: a scratch-disk/permission error here
         // should fail the test loudly, not make the coverage vanish via an
         // early `return` in the callers.
         let f = std::fs::File::create(&path).expect("create 1k image file");

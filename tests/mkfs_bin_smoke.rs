@@ -30,7 +30,7 @@ fn unique_tmp_path(suffix: &str) -> std::path::PathBuf {
         .duration_since(std::time::UNIX_EPOCH)
         .map(|d| d.as_nanos())
         .unwrap_or(0);
-    std::env::temp_dir().join(format!("fs-ext4-mkfs-bin-{pid}-{nanos}-{suffix}"))
+    fs_ext4_test_support::temp_dir().join(format!("fs-ext4-mkfs-bin-{pid}-{nanos}-{suffix}"))
 }
 
 #[test]

@@ -11,7 +11,8 @@
 //! `ext4-csum-seed.img` (metadata_csum_seed — "the flag that broke lwext4 on
 //! the Pi SD card"); `ext4-basic.img` is the control.
 //!
-//! The mutated image is intentionally left in /tmp (path is printed) so the
+//! The mutated image is intentionally left in the selected scratch directory
+//! (path is printed) so the
 //! Alpine-VM `e2fsck` pass can validate it against a real Linux ext4 — the
 //! in-process `is_clean()` check cannot catch a bad-checksum-but-marked-clean
 //! journal, which is exactly the field symptom.
@@ -33,8 +34,8 @@ fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
     if !std::path::Path::new(&src).exists() {
         return None;
     }
-    let dst = format!(
-        "/tmp/fs_ext4_repro_wants_{}_{tag}_{n}.img",
+    let dst = fs_ext4_test_support::temp_path!(
+        "fs_ext4_repro_wants_{}_{tag}_{n}.img",
         std::process::id()
     );
     fs::copy(&src, &dst).ok()?;

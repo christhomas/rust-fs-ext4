@@ -20,8 +20,11 @@ fn copy_image_to_temp(tag: &str) -> Option<std::path::PathBuf> {
         Ok(f) => f,
         Err(_) => return None,
     };
-    let tmp_path =
-        std::env::temp_dir().join(format!("ext4rs-corrupt-{}-{}.img", std::process::id(), tag));
+    let tmp_path = fs_ext4_test_support::temp_dir().join(format!(
+        "ext4rs-corrupt-{}-{}.img",
+        std::process::id(),
+        tag
+    ));
     let mut dst = std::fs::File::create(&tmp_path).expect("create temp image");
     let mut buf = Vec::new();
     src.read_to_end(&mut buf).expect("read src");

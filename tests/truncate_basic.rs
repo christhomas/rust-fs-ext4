@@ -28,7 +28,8 @@ fn copy_to_tmp(name: &str) -> Option<String> {
     if !std::path::Path::new(&src).exists() {
         return None;
     }
-    let dst = format!("/tmp/fs_ext4_trunc_{}_{n}_{}.img", std::process::id(), name);
+    let dst =
+        fs_ext4_test_support::temp_path!("fs_ext4_trunc_{}_{n}_{}.img", std::process::id(), name);
     fs::copy(&src, &dst).ok()?;
     Some(dst)
 }

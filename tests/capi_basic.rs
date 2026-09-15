@@ -71,7 +71,7 @@ fn volume_info_flags_dirty_image() {
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
     let src = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-no-csum.img");
-    let tmp = std::env::temp_dir().join("fs_ext4-dirty-fixture.img");
+    let tmp = fs_ext4_test_support::temp_dir().join("fs_ext4-dirty-fixture.img");
     fs::copy(src, &tmp).expect("copy no-csum image");
 
     // `s_state` lives at superblock byte offset 0x3A → file offset 1024+0x3A.

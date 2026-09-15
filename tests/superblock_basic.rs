@@ -46,7 +46,7 @@ fn superblock_parses_basic_image() {
 #[test]
 fn rejects_non_ext4_data() {
     use std::io::Write;
-    let mut tmp = std::env::temp_dir();
+    let mut tmp = fs_ext4_test_support::temp_dir().to_path_buf();
     tmp.push("fs_ext4_bad_magic.img");
     {
         let mut f = std::fs::File::create(&tmp).unwrap();

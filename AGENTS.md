@@ -22,10 +22,17 @@ It points at the existing docs rather than duplicating them:
 ## Running tests
 
 ```sh
-cargo test                  # full suite (lib + integration). ~700 tests.
-cargo test --test <name>    # one integration binary, e.g. repro_wants_dir_symlinks
+./scripts/test.sh            # full suite (lib + integration). ~700 tests.
+./scripts/test.sh --test <name> # one integration binary, e.g. repro_wants_dir_symlinks
 cargo clippy --all-targets -- -D warnings   # what the pre-commit hook runs
 ```
+
+Use `scripts/test.sh` for local runs: it selects a platform-aware, per-run
+scratch directory and cleans it afterward. In particular, Raspberry Pi runs
+use this worktree's `./tmp` (normally the NVMe checkout) rather than the SD
+card-backed system `/tmp`; macOS and GitHub Actions use `/tmp`. Override the
+managed base with `FS_EXT4_TEST_TMP_BASE`, or provide a caller-managed exact
+directory with `FS_EXT4_TEST_TMPDIR`.
 
 Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
 `cargo fmt --check` + `cargo clippy -D warnings` on every commit).
@@ -38,7 +45,7 @@ read-only and assert. Canonical templates:
 `tests/repro_wants_dir_symlinks.rs`.
 
 ```rust
-let path = copy_to_tmp("ext4-csum-seed.img", "tag");      // fixture → unique /tmp copy
+let path = copy_to_tmp("ext4-csum-seed.img", "tag"); // fixture → unique scratch copy
 {
     let dev = FileDevice::open_rw(&path)?;
     let fs = Filesystem::mount(Arc::new(dev))?;           // replays journal if dirty

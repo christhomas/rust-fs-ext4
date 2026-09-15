@@ -15,7 +15,7 @@ fi
 
 SCRIPT_DIR="$(cd "$(dirname "$0")" && pwd)"
 OUTPUT_DIR="${EXT4_FIXTURE_OUTPUT_DIR:-$SCRIPT_DIR}"
-MOUNT_DIR="$(mktemp -d /tmp/ext4-fixture-mount.XXXXXX)"
+MOUNT_DIR="$(mktemp -d "${TMPDIR:-/tmp}/ext4-fixture-mount.XXXXXX")"
 
 cleanup() {
     umount "$MOUNT_DIR" 2>/dev/null || true

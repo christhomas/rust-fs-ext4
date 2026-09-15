@@ -1,7 +1,7 @@
 //! Format ext3 (and ext2) volumes with the driver's own mkfs and leave them in
-//! /tmp for a real Linux e2fsck pass:
+//! the selected scratch directory for a real Linux e2fsck pass:
 //!
-//!   scripts/vm-e2fsck.sh /tmp/fs_ext4_mkfsflav_*.img
+//!   FS_EXT4_TEST_TMPDIR="$PWD/tmp/oracle" ./scripts/test.sh --test mkfs_ext3_oracle
 //!
 //! `mkfs_e2fsck_oracle` covers the default Ext4 flavor; this covers the legacy
 //! flavors, which take materially different code paths:
@@ -31,7 +31,8 @@ const UUID: [u8; 16] = [
 fn format(tag: &str, size: u64, block_size: u32, flavor: FsFlavor) -> Option<String> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = format!("/tmp/fs_ext4_mkfsflav_{tag}_{}_{n}.img", std::process::id());
+    let path =
+        fs_ext4_test_support::temp_path!("fs_ext4_mkfsflav_{tag}_{}_{n}.img", std::process::id());
     {
         let f = std::fs::File::create(&path).ok()?;
         f.set_len(size).ok()?;

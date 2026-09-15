@@ -34,7 +34,7 @@ fn last_err() -> String {
 fn corrupted_copy(label: &str, mutate: impl FnOnce(&mut Vec<u8>)) -> PathBuf {
     let mut bytes = fs::read(GOOD_IMAGE).expect("read source image");
     mutate(&mut bytes);
-    let mut p = std::env::temp_dir();
+    let mut p = fs_ext4_test_support::temp_dir().to_path_buf();
     p.push(format!(
         "ext4rs-resilience-{label}-{}.img",
         std::process::id()

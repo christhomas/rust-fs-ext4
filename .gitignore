@@ -12,6 +12,7 @@ Cargo.lock.bak
 *.swp
 
 # Test artifacts
+tmp/
 test-disks/*.img
 test-disks/[0-9]*/
 test-disks/test-run/

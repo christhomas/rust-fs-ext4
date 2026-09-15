@@ -1,7 +1,7 @@
 //! Format a fresh filesystem with the driver's own `mkfs::format_filesystem`
-//! and leave it in /tmp for a real Linux e2fsck pass:
+//! and leave it in the selected scratch directory for a real Linux e2fsck pass:
 //!
-//!   scripts/vm-e2fsck.sh /tmp/fs_ext4_mkfs_*.img
+//!   FS_EXT4_TEST_TMPDIR="$PWD/tmp/oracle" ./scripts/test.sh --test mkfs_e2fsck_oracle
 //!
 //! `mkfs_roundtrip` and `mkfs_bin_smoke` already format + re-mount through the
 //! driver's OWN reader, but that reader can't see a wrong checksum (the exact
@@ -31,8 +31,8 @@
 //! unnoticed until the day it is needed. `-b` makes it open a backup instead,
 //! and at 4 KiB blocks group 1 starts at block 32768 and group 3 at 98304:
 //!
-//!   e2fsck -fn -b 32768 -B 4096 /tmp/fs_ext4_mkfs_mg5_*.img
-//!   e2fsck -fn -b 98304 -B 4096 /tmp/fs_ext4_mkfs_mg5_*.img
+//!   e2fsck -fn -b 32768 -B 4096 tmp/oracle/fs_ext4_mkfs_mg5_*.img
+//!   e2fsck -fn -b 98304 -B 4096 tmp/oracle/fs_ext4_mkfs_mg5_*.img
 //!
 //! The `validate-mkfs-bin` CI job runs both forms against both multi-group
 //! sizes on every push, so this is a gate rather than a recipe.
@@ -54,7 +54,8 @@ const UUID: [u8; 16] = [
 fn format_to_tmp(tag: &str, size: u64, block_size: u32) -> Option<String> {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let path = format!("/tmp/fs_ext4_mkfs_{tag}_{}_{n}.img", std::process::id());
+    let path =
+        fs_ext4_test_support::temp_path!("fs_ext4_mkfs_{tag}_{}_{n}.img", std::process::id());
     {
         let f = std::fs::File::create(&path).ok()?;
         f.set_len(size).ok()?;

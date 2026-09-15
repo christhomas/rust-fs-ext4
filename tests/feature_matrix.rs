@@ -48,7 +48,8 @@ fn mke2fs() -> Option<String> {
 /// Build a 16 MiB image with the given `mke2fs` options.
 fn build(name: &str, opts: &[&str]) -> Option<PathBuf> {
     let mke2fs = mke2fs()?;
-    let path = std::env::temp_dir().join(format!("fs-ext4-fm-{}-{name}", std::process::id()));
+    let path =
+        fs_ext4_test_support::temp_dir().join(format!("fs-ext4-fm-{}-{name}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, vec![0u8; 16 * 1024 * 1024]).expect("allocate image");
     let out = Command::new(&mke2fs)

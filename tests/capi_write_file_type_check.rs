@@ -15,8 +15,8 @@ const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.im
 fn scratch() -> PathBuf {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let dst = PathBuf::from(format!(
-        "/tmp/fs_ext4_capi_write_file_type_{}_{n}.img",
+    let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "fs_ext4_capi_write_file_type_{}_{n}.img",
         std::process::id()
     ));
     let mut out = fs::File::create(&dst).unwrap();
