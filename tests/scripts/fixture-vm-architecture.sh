@@ -43,7 +43,11 @@ check_line "$arm" 'QEMU_DRIVE_IF=virtio' "ARM uses boot media supported by the v
 check_line "$arm" 'QEMU_CONSOLE=ttyAMA0' "ARM selects its serial console"
 check_line "$arm" 'QEMU_BOOT_MODE=uefi' "ARM enters its EFI kernel through firmware"
 
-host="$(bash "$GENERATOR" --print-vm-config)"
+# Standard GitHub ARM runners intentionally build fixtures with the native
+# Linux host tools and do not expose /dev/kvm. Permit TCG while inspecting the
+# default architecture choice; the separate conditional below still requires
+# KVM when this host actually exposes it.
+host="$(EXT4_VM_ALLOW_TCG=1 bash "$GENERATOR" --print-vm-config)"
 case "$(uname -m)" in
     x86_64|amd64) expected_host=x86_64 ;;
     aarch64|arm64) expected_host=aarch64 ;;
