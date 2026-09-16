@@ -1892,8 +1892,16 @@ impl Filesystem {
         if block.len() < 24 {
             return Err(Error::Corrupt("buffer_update_dotdot: dir block too small"));
         }
+        let block_dotdot_before: [u8; 4] = block[12..16].try_into().unwrap();
         block[12..16].copy_from_slice(&new_parent_ino.to_le_bytes());
         if dir_inode.flags & crate::inode::InodeFlags::INDEX.bits() != 0 {
+            // Checked before it is changed: a fresh checksum over a root
+            // that was already corrupt would hide the corruption.
+            {
+                let mut original = block.to_vec();
+                original[12..16].copy_from_slice(&block_dotdot_before);
+                self.check_dx_block(dir_ino, dir_inode, &original, true)?;
+            }
             // A dx_root's checksum is its dx_tail's, over a different range
             // by a different rule. It can end in bytes that look like a
             // dirent tail, and writing one there corrupted the index.
@@ -2006,13 +2014,21 @@ impl Filesystem {
                 .ok_or(Error::CorruptDirEntry("htree block is not mapped"))?;
             Ok(buf.get_mut(self, phys)?.to_vec())
         };
+        // Every index block that routes this write is checked before it
+        // is believed: a corrupt root or node sends the entry to the
+        // wrong leaf, which then reads as a name the index cannot find.
         let root = read_logical(0)?;
+        self.check_dx_block(parent_ino, parent_inode, &root, true)?;
         let leaf = crate::htree::lookup_leaf_with(
             name,
             &root,
             &self.sb.hash_seed,
             self.sb.unsigned_hash(),
-            |logical| read_logical(u64::from(logical)),
+            |logical| {
+                let node = read_logical(u64::from(logical))?;
+                self.check_dx_block(parent_ino, parent_inode, &node, false)?;
+                Ok(node)
+            },
         )?
         .ok_or(Error::CorruptDirEntry("htree root has no entries"))?;
         if leaf == 0 {
@@ -2035,6 +2051,30 @@ impl Filesystem {
                 .patch_dir_entry_tail(parent_ino, parent_inode.generation, block);
         }
         Ok(())
+    }
+
+    /// Refuse an htree root (`root`) or interior node whose `dx_tail`
+    /// checksum does not match, before it is used or rewritten.
+    ///
+    /// Restamping a block, or routing a write by it, without this blessed
+    /// whatever corruption it held with a fresh checksum (Greptile on #196).
+    /// No-op without metadata_csum, or for a block with no tail to check.
+    fn check_dx_block(&self, dir_ino: u32, dir: &Inode, block: &[u8], root: bool) -> Result<()> {
+        let count_offset = if root {
+            // `dx_root_info` starts at 24; its length is the byte at 29.
+            24 + usize::from(*block.get(29).unwrap_or(&8))
+        } else {
+            8
+        };
+        match self
+            .csum
+            .verify_dx_tail(dir_ino, dir.generation, block, count_offset)
+        {
+            Some(false) => Err(Error::BadChecksum {
+                what: "htree index block",
+            }),
+            _ => Ok(()),
+        }
     }
 
     /// Turn an indexed directory back into a linear one, which is what the
@@ -2066,9 +2106,11 @@ impl Filesystem {
                 .ok_or(Error::CorruptDirEntry("htree block is not mapped"))
         };
 
-        // The root and every interior node, by physical block.
+        // The root and every interior node, by physical block, each
+        // checked before it is converted and re-tailed.
         let root_phys = physical(0)?;
         let root = self.read_block(root_phys)?;
+        self.check_dx_block(dir_ino, &inode, &root, true)?;
         let mut nodes = Vec::new();
         if let (Ok(info), Ok((_, entries))) = (
             crate::htree::parse_root_info(&root),
@@ -2080,6 +2122,7 @@ impl Filesystem {
                 for logical in level {
                     let phys = physical(u64::from(logical))?;
                     let block = self.read_block(phys)?;
+                    self.check_dx_block(dir_ino, &inode, &block, false)?;
                     let (_, entries) = crate::htree::parse_node_entries(&block)?;
                     next.extend(entries.iter().map(|e| e.block));
                     nodes.push(phys);

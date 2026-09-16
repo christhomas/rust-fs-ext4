@@ -210,3 +210,58 @@ fn a_full_leaf_drops_the_index_without_metadata_csum() {
 fn a_full_leaf_drops_the_index_with_metadata_csum() {
     fill_a_leaf("fill_csum", "metadata_csum");
 }
+
+/// Flip one byte of `path`'s dx_root `dx_tail` checksum, on the device.
+fn corrupt_dx_root_checksum(image: &str, path: &str) {
+    let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(image).unwrap())).unwrap();
+    let ino = resolve(&fs, path).expect("resolve");
+    let (inode, _) = fs.read_inode_verified(ino).expect("inode");
+    let phys = fs.map_inode_logical(&inode, 0).unwrap().unwrap();
+    let bs = u64::from(fs.sb.block_size());
+    let mut root = fs.read_block(phys).unwrap();
+    let count_offset = 24 + usize::from(root[29]);
+    let limit = usize::from(u16::from_le_bytes([
+        root[count_offset],
+        root[count_offset + 1],
+    ]));
+    let checksum_at = count_offset + limit * 8 + 4;
+    root[checksum_at] ^= 0xFF;
+    fs.dev.write_at(phys * bs, &root).unwrap();
+    fs.dev.flush().unwrap();
+}
+
+/// An index block whose checksum is wrong is not used to route a write or
+/// restamped over (Greptile on #196): a create into the directory, and a
+/// move of the directory, are both refused with a checksum error, and the
+/// damage is left for e2fsck to see rather than hidden under a fresh
+/// checksum.
+#[test]
+fn a_corrupt_index_root_is_neither_routed_through_nor_restamped() {
+    let Some(image) = indexed_volume("corrupt_root", "metadata_csum", 600) else {
+        return;
+    };
+    corrupt_dx_root_checksum(&image, "/bigdir");
+    corrupt_dx_root_checksum(&image, "/elsewhere/bigsub");
+    let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+    match fs.apply_create("/bigdir/routed_by_a_corrupt_root", 0o644) {
+        Err(fs_ext4::Error::BadChecksum { .. }) => {}
+        other => panic!(
+            "a create was routed through a corrupt root: {:?}",
+            other.map(|_| ())
+        ),
+    }
+    match fs.apply_rename("/elsewhere/bigsub", "/bigdir2", false) {
+        Err(fs_ext4::Error::BadChecksum { .. }) => {}
+        other => panic!(
+            "a corrupt root was restamped by a move: {:?}",
+            other.map(|_| ())
+        ),
+    }
+    drop(fs);
+    let (_, report) = run("e2fsck", &["-fn", &image]);
+    assert!(
+        report.contains("HTREE") || report.contains("checksum"),
+        "the corruption must still be visible to e2fsck:\n{report}"
+    );
+    let _ = std::fs::remove_file(&image);
+}

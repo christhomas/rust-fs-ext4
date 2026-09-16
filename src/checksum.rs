@@ -259,6 +259,26 @@ impl Checksummer {
         true
     }
 
+    /// Whether an htree block's `dx_tail` checksum is the one its contents
+    /// give: `Some(true)` or `Some(false)`, or `None` when checksums are off
+    /// or the count/limit pair leaves no room for a tail to check.
+    ///
+    /// The same computation as [`Checksummer::patch_dx_tail`], compared
+    /// rather than written.
+    pub fn verify_dx_tail(
+        &self,
+        ino: u32,
+        generation: u32,
+        block: &[u8],
+        count_offset: usize,
+    ) -> Option<bool> {
+        let mut copy = block.to_vec();
+        if !self.patch_dx_tail(ino, generation, &mut copy, count_offset) {
+            return None;
+        }
+        Some(copy == block)
+    }
+
     /// Recompute the checksum in an htree block's `dx_tail`.
     ///
     /// The kernel's `ext4_dx_csum`: crc32c over the inode number and
