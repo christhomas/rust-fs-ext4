@@ -1466,61 +1466,6 @@ impl Filesystem {
         Cow::Owned(groups)
     }
 
-    /// The blocks group `gi` owns that physically live inside it, as
-    /// `(first_bit, count)` runs relative to the group's first block.
-    ///
-    /// Used when a BLOCK_UNINIT group's bitmap is zeroed for the first time:
-    /// everything here has to go straight back in, or the group's own
-    /// metadata becomes allocatable free space. Reading it off the descriptor
-    /// rather than deriving it from the feature flags means an unusual layout
-    /// is handled by inspection instead of by assumption.
-    fn group_owned_metadata_blocks(
-        &self,
-        gi: usize,
-        group_start: u64,
-        bpg: u64,
-    ) -> Vec<(u64, u64)> {
-        let bs = self.sb.block_size() as u64;
-        let mut runs = Vec::new();
-
-        // Superblock, group-descriptor-table backup and the blocks held
-        // back for growing the table, at the head of every group that
-        // carries a backup.
-        //
-        // Which groups those are is the filesystem's decision, not a
-        // constant: `SPARSE_SUPER2` puts backups in two named groups and
-        // no others, and a filesystem without `SPARSE_SUPER` puts one in
-        // every group. Assuming the classic rule reports "no backup
-        // here" for groups that have one, and a rebuilt bitmap then
-        // offers a live backup superblock as free space.
-        //
-        // `s_reserved_gdt_blocks` belongs in the same run. It sits
-        // between the descriptor table and the block bitmap, and it is
-        // the room the filesystem keeps to grow into — free-looking, and
-        // not free.
-        if self.sb.group_has_super(gi as u64) {
-            let gdt_blocks = (self.groups.len() as u64 * self.sb.desc_size as u64).div_ceil(bs);
-            let reserved = u64::from(self.sb.reserved_gdt_blocks);
-            runs.push((0, 1 + gdt_blocks + reserved));
-        }
-
-        // The group's own bitmaps and inode table, wherever the descriptor
-        // says they are — included only when that is inside this group.
-        let itable_blocks =
-            (self.sb.inodes_per_group as u64 * self.sb.inode_size as u64).div_ceil(bs);
-        let g = &self.groups[gi];
-        for (block, count) in [
-            (g.block_bitmap, 1),
-            (g.inode_bitmap, 1),
-            (g.inode_table, itable_blocks),
-        ] {
-            if block >= group_start && block < group_start + bpg {
-                runs.push((block - group_start, count));
-            }
-        }
-        runs
-    }
-
     pub(crate) fn buffer_mark_block_run_used(
         &self,
         buf: &mut BlockBuffer,
@@ -1565,7 +1510,7 @@ impl Filesystem {
         // this group.
         let was_uninit = self.clear_bgd_uninit_flag_if_set(buf, gi, BgdUninitFlag::Block)?;
         let reserved_runs = if was_uninit {
-            self.group_owned_metadata_blocks(gi, group_start, bpg)
+            crate::alloc::group_owned_metadata_runs(&self.sb, &self.groups, gi)
         } else {
             Vec::new()
         };
