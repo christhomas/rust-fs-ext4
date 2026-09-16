@@ -850,6 +850,26 @@ pub fn read_all_resolved(
     Ok(entries)
 }
 
+/// The fully-qualified names of an inode's attributes, and nothing else.
+///
+/// What `fs_ext4_listxattr` needs (#122). It used [`read_all_resolved`],
+/// which reads every EA-inode-backed VALUE from disk only for the caller to
+/// discard it -- and fails the whole listing when one of those values
+/// cannot be read, though every name was right there. A names-only listing
+/// does not depend on any value being readable.
+pub fn list_names(fs: &Filesystem, inode: &Inode, inode_raw: &[u8]) -> Result<Vec<String>> {
+    Ok(read_all(
+        fs.dev.as_ref(),
+        inode,
+        inode_raw,
+        fs.sb.inode_size,
+        fs.sb.block_size(),
+    )?
+    .into_iter()
+    .map(|e| e.name)
+    .collect())
+}
+
 /// One xattr by fully-qualified name, with an EA-inode value followed.
 /// See [`read_all_resolved`].
 pub fn get_resolved(
