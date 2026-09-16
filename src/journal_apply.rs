@@ -184,6 +184,13 @@ pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
     if jsb.is_clean() {
         return Ok(0);
     }
+    // Replay writes to the volume, so it refuses what every other write
+    // refuses. The mount checks these bits too, but a lazy mount checked
+    // while it was read-only and calls this once it is writable (#117).
+    let write_breaking = crate::features::write_breaking_incompat(fs.sb.feature_incompat);
+    if write_breaking != 0 {
+        return Err(crate::Error::UnsupportedIncompat(write_breaking));
+    }
     let plan = crate::journal::walk(fs, &jsb)?;
     apply(fs, &plan)
 }

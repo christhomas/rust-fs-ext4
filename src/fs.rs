@@ -6034,6 +6034,42 @@ mod tests {
         );
     }
 
+    /// A lazy mount that turns writable does not replay a dirty journal
+    /// into a write-breaking INCOMPAT volume either (#117): replay is a
+    /// write, and it did not go through `refuse_write`. The control
+    /// replays the same journal once the bit is gone.
+    #[test]
+    fn a_lazy_mount_that_becomes_writable_does_not_replay_into_a_write_breaking_volume() {
+        for bit in [0, crate::features::Incompat::MMP.bits()] {
+            let (dev, payload) = ext3_with_a_dirty_journal();
+            if bit != 0 {
+                set_incompat_bit(&dev, bit);
+            }
+            let later = std::sync::Arc::new(LaterWritable {
+                inner: dev.clone(),
+                writable: std::sync::atomic::AtomicBool::new(false),
+            });
+            let fs = Filesystem::mount_lazy(later.clone()).expect("a read-only lazy mount");
+            later
+                .writable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = fs.replay_journal_if_dirty();
+            if bit == 0 {
+                assert_eq!(result.expect("the control replays"), 1);
+                assert!(destination_holds_the_payload(&dev, &payload));
+            } else {
+                match result {
+                    Err(Error::UnsupportedIncompat(b)) => assert_eq!(b, bit),
+                    other => panic!("replay was not refused: {other:?}"),
+                }
+                assert!(
+                    !destination_holds_the_payload(&dev, &payload),
+                    "the journal was replayed into an MMP volume"
+                );
+            }
+        }
+    }
+
     // ---------------------------------------------------------------
     // EA_INODE: an attribute whose value lives in another inode
     // ---------------------------------------------------------------
