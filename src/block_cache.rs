@@ -277,12 +277,51 @@ impl BlockDevice for CachedDevice {
         let mut state = self.state.lock().expect("cache mutex poisoned");
         state.unpin_all();
     }
+
+    fn invalidate_cache(&self) -> Result<()> {
+        let mut state = self.state.lock().expect("cache mutex poisoned");
+        if !state.pinned.is_empty() {
+            return Err(crate::error::Error::Corrupt(
+                "cache contains uncheckpointed journal metadata",
+            ));
+        }
+        self.inner.invalidate_cache()?;
+        state.entries.clear();
+        Ok(())
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
     use std::sync::Arc;
+
+    #[test]
+    fn invalidation_requires_checkpoint_and_then_reads_physical_bytes() {
+        let raw = CountingDevice::new(8192, true);
+        let cache = CachedDevice::new(raw.clone(), 4096, 8);
+        let mut bytes = vec![0; 4096];
+        cache.read_at(0, &mut bytes).unwrap();
+        raw.write_at(0, &vec![7; 4096]).unwrap();
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 0);
+        cache.invalidate_cache().unwrap();
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 7);
+        cache.populate_cache(0, vec![9; 4096]);
+        assert!(
+            cache.invalidate_cache().is_err(),
+            "uncheckpointed metadata cannot be discarded"
+        );
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 9);
+        raw.write_at(0, &vec![9; 4096]).unwrap();
+        cache.unpin_all();
+        cache.invalidate_cache().unwrap();
+        cache.read_at(0, &mut bytes).unwrap();
+        assert_eq!(bytes[0], 9);
+        assert_eq!(raw.reads(), 3);
+    }
 
     /// Counts every read/write so we can prove the cache eliminates them.
     struct CountingDevice {
