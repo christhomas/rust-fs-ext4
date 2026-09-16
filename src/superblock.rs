@@ -575,10 +575,18 @@ mod geometry_tests {
         }
     }
 
-    /// And a 1 KiB-block filesystem that starts its groups at block 0.
+    /// And a 1 KiB-block filesystem that starts its groups at block 0 --
+    /// unless it is bigalloc, whose clusters are larger than a block and
+    /// may start at 0.
     #[test]
     fn a_one_kib_filesystem_starting_at_block_zero_is_refused() {
         assert!(refusal(raw(16384, 0, 0)).contains("first data block is 0"));
+
+        let mut bigalloc = raw(16384, 0, 0);
+        bigalloc[0x64..0x68]
+            .copy_from_slice(&crate::features::RoCompat::BIGALLOC.bits().to_le_bytes());
+        Superblock::parse(bigalloc)
+            .expect("a 1 KiB bigalloc filesystem may start its groups at block 0");
     }
 
     /// The geometries mke2fs writes still parse: 1 KiB from block 1, and
