@@ -777,11 +777,18 @@ where
     P: FnMut(FsckPhase, u64, u64),
     F: FnMut(&Anomaly),
 {
-    // Refuse repair on read-only mounts before any scanning. The full
-    // walk is expensive, and a refused repair shouldn't look like a
-    // partially-successful audit to the caller.
-    if repair && !fs.dev.is_writable() {
-        return Err(Error::ReadOnly);
+    // Refuse repair before any scanning. The full walk is expensive, and
+    // a refused repair shouldn't look like a partially-successful audit
+    // to the caller.
+    //
+    // THE SAME GUARD AS EVERY OTHER WRITE. This used to check only that
+    // the device was writable, so a volume with a feature this driver
+    // does not maintain -- which refuses a create -- was repaired, and
+    // unjournaled, because the mount opens no journal writer on such a
+    // volume (#119). `refuse_write` still answers a read-only device with
+    // `ReadOnly`.
+    if repair {
+        fs.refuse_write()?;
     }
 
     let mut report = AuditReport::default();
