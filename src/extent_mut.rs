@@ -57,6 +57,9 @@ pub(crate) fn split_phys_block(block: u64) -> (u16, u32) {
 pub enum ExtentMutation {
     /// Overwrite the inline root (60 bytes of `i_block`) with these bytes.
     WriteRoot { bytes: Vec<u8> },
+    /// Rewrite an existing external extent node. The filesystem patches its
+    /// checksum and journals this together with the inode and bitmap updates.
+    WriteTreeBlock { block: u64, bytes: Vec<u8> },
     /// Allocate a fresh leaf block and write these bytes to it. Returned for
     /// future multi-level operations; not produced by the current plan fns.
     AllocLeafBlock { bytes: Vec<u8> },
