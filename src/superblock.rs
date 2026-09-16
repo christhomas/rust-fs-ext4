@@ -407,6 +407,15 @@ impl Superblock {
         classic_sparse_super(g)
     }
 
+    /// Whether directory names are hashed as unsigned bytes: `s_flags`
+    /// (0x160) carries `EXT2_FLAGS_UNSIGNED_HASH` (0x2). See
+    /// [`crate::hash::effective_version`].
+    pub fn unsigned_hash(&self) -> bool {
+        self.raw
+            .get(0x160..0x164)
+            .is_some_and(|f| u32::from_le_bytes(f.try_into().unwrap()) & 0x2 != 0)
+    }
+
     /// Block size in bytes: 1024 << log_block_size.
     pub fn block_size(&self) -> u32 {
         1024u32 << self.log_block_size
