@@ -149,7 +149,10 @@ pub fn read_all<D: BlockDevice + ?Sized>(
     for i in 0..(group_count as usize) {
         let off = i * sb.desc_size as usize;
         let raw = &buf[off..off + sb.desc_size as usize];
-        if csum.enabled && !csum.verify_bgd(i as u32, raw, sb.desc_size) {
+        let stored = u16::from_le_bytes([raw[0x1E], raw[0x1F]]);
+        if crate::checksum::group_desc_csum(sb, csum, i as u32, raw)
+            .is_some_and(|want| want != stored)
+        {
             return Err(Error::BadChecksum {
                 what: "block group descriptor",
             });
