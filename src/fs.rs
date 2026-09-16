@@ -925,9 +925,12 @@ impl Filesystem {
     /// (extent-tree updates + freed-block ranges) with actual disk writes —
     /// rewrites the inode and zeros the freed bitmap bits.
     ///
-    /// Journaled. The inode write, the bitmap writes, the BGD and the
-    /// superblock accumulate into one `BlockBuffer` and commit as a
-    /// single transaction, so they are atomic with respect to a crash.
+    /// The inode write, the bitmap writes, the BGD and the superblock
+    /// accumulate into one `BlockBuffer` and commit together. On a mount
+    /// with a journal that commit is one transaction, atomic with respect
+    /// to a crash. Without one (an ext2 volume, or ext4 formatted without
+    /// a journal) `commit_block_buffer` writes the blocks in turn, and a
+    /// crash part-way leaves some written and some not (#179).
     ///
     /// This said "Not journaled … safe only in a test scratch image", and
     /// promised the transaction as future work. The future work landed;
@@ -3044,11 +3047,16 @@ impl Filesystem {
     /// This is the "Finder just saved a document" path — complete rewrite of
     /// a file. Piecewise writes / appends / sparse writes come later.
     ///
-    /// Journaled, and atomic across the whole replace: freeing the old
-    /// data, allocating the new run, the bitmap, BGD and superblock
-    /// updates, the new block contents and the inode all commit as one
-    /// transaction — as the comment twenty-eight lines into the body
-    /// already said.
+    /// For an extent-mapped inode on a mount with a journal, atomic across
+    /// the whole replace: freeing the old data, allocating the new run, the
+    /// bitmap, BGD and superblock updates, the new block contents and the
+    /// inode all commit as one transaction. Two cases are not (#179):
+    ///
+    /// - without a journal, the same blocks are written in turn, and a
+    ///   crash part-way leaves some written and some not;
+    /// - an inode that is not extent-mapped goes to
+    ///   `apply_replace_file_content_indirect`, which builds no transaction
+    ///   at all, on ext3 with a journal too.
     ///
     /// Returns the new file size on success.
     pub fn apply_replace_file_content(&self, path: &str, data: &[u8]) -> Result<u64> {
@@ -3180,11 +3188,12 @@ impl Filesystem {
     /// metadata blocks, builds the new tree via `indirect_mut::plan_contiguous`,
     /// then persists everything (data → indirect blocks → inode).
     ///
-    /// No journal interaction: ext2 has no journal at all, and the user's
-    /// `JournalWriter` returns `None` for those mounts so `self.journal` is
-    /// already None at this point. ext3 mounts (Phase B) will plumb writes
-    /// through the journal once the writer can address indirect-block
-    /// journal inodes.
+    /// No journal interaction, on any mount. The writer can address an
+    /// indirect-mapped journal inode (see `mount_inner`), so an ext3 mount
+    /// has one, but this path frees, allocates and writes block by block
+    /// and never builds a `BlockBuffer` for it. A crash after the old runs
+    /// are freed and before the inode is rewritten leaves the inode
+    /// mapping blocks the bitmap already calls free (#179).
     fn apply_replace_file_content_indirect(
         &self,
         ino: u32,
