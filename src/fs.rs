@@ -1560,6 +1560,14 @@ impl Filesystem {
         if start < first_data || bpg == 0 {
             return Err(Error::InvalidBlock(start));
         }
+        // The last group is usually short, and its nominal span past
+        // `blocks_count` is padding: bits that stand for no block. A run
+        // reaching into it passed the group-index check below, and freeing
+        // it cleared padding bits and credited blocks that do not exist
+        // (Greptile on #188).
+        if end > self.sb.blocks_count {
+            return Err(Error::InvalidBlock(self.sb.blocks_count));
+        }
         let mut chunks = Vec::new();
         let mut at = start;
         while at < end {
@@ -5589,6 +5597,54 @@ impl Filesystem {
 mod tests {
     use super::*;
 
+    /// A run reaching past `blocks_count` into the short final group's
+    /// padding is refused; one ending at the last block is not.
+    #[test]
+    fn a_run_into_the_final_groups_padding_is_refused() {
+        let dir = fs_ext4_test_support::temp_dir()
+            .join(format!("ext4-short-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("s.img");
+        // 16284 blocks at 4096 per group: the last group has 4 blocks and
+        // 4092 bits of padding.
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(16284 * 4096)
+            .unwrap();
+        let Ok(made) = std::process::Command::new("mkfs.ext4")
+            .args(["-q", "-F", "-b", "4096", "-g", "4096", "-O", "^has_journal"])
+            .arg(&img)
+            .output()
+        else {
+            eprintln!("no mkfs.ext4 -- skipping");
+            return;
+        };
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let fs = Filesystem::mount(std::sync::Arc::new(
+            crate::block_io::FileDevice::open(img.to_str().unwrap()).unwrap(),
+        ))
+        .unwrap();
+        let last = fs.sb.blocks_count;
+        assert_ne!(
+            (last - u64::from(fs.sb.first_data_block)) % u64::from(fs.sb.blocks_per_group),
+            0,
+            "fixture: the final group is short"
+        );
+        assert!(
+            fs.group_chunks(last - 2, 2).is_ok(),
+            "a run ending at the last block"
+        );
+        assert!(
+            matches!(fs.group_chunks(last - 2, 3), Err(Error::InvalidBlock(_))),
+            "a run one block into the padding"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     /// A freed run that crosses a group boundary credits each group its
     /// own blocks and clears the second group's bits (#118).
     ///
@@ -5598,7 +5654,8 @@ mod tests {
     /// group 2 credited 0, its four bits left set. Skips without e2fsprogs.
     #[test]
     fn a_freed_run_across_a_group_boundary_credits_both_groups() {
-        let dir = std::env::temp_dir().join(format!("ext4-cross-group-{}", std::process::id()));
+        let dir = fs_ext4_test_support::temp_dir()
+            .join(format!("ext4-cross-group-{}", std::process::id()));
         std::fs::create_dir_all(&dir).unwrap();
         let img = dir.join("g.img");
         std::fs::File::create(&img)
