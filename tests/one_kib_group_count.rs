@@ -15,7 +15,8 @@ use std::sync::Arc;
 
 #[test]
 fn a_one_kib_volume_one_block_past_a_group_boundary_mounts_with_its_real_group_count() {
-    let dir = std::env::temp_dir().join(format!("ext4-group-count-{}", std::process::id()));
+    let dir =
+        fs_ext4_test_support::temp_dir().join(format!("ext4-group-count-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("g.img");
     std::fs::File::create(&img)
