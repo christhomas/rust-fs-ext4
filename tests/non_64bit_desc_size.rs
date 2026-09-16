@@ -14,7 +14,8 @@ use std::sync::Arc;
 
 #[test]
 fn a_non_64bit_volume_with_a_64_byte_desc_size_field_reads_its_real_descriptors() {
-    let dir = std::env::temp_dir().join(format!("ext4-desc-size-{}", std::process::id()));
+    let dir =
+        fs_ext4_test_support::temp_dir().join(format!("ext4-desc-size-{}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("d.img");
     std::fs::File::create(&img)
