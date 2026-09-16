@@ -1,0 +1,174 @@
+//! A volume with `GDT_CSUM` and not `METADATA_CSUM` is written correctly.
+//!
+//! That combination is what `mke2fs` produced by default before 1.43. Its
+//! group descriptors carry a crc16 (`crc16(~0, uuid || group || desc)`), not
+//! the crc32c `METADATA_CSUM` uses. The driver used to write only the crc32c
+//! form, and only when `METADATA_CSUM` was set, so every descriptor a write
+//! touched on such a volume was left stale and writes had to be refused.
+//!
+//! The oracle is the real toolchain: `mkfs.ext4` makes the volume, the driver
+//! writes to it, and `e2fsck -fn` must find nothing. Both descriptor sizes are
+//! covered, because with `64bit` the crc16 also covers the bytes after the
+//! checksum field and without it they are left out. The volume spans several
+//! groups so directory spreading reaches groups that are still `INODE_UNINIT`
+//! and `BLOCK_UNINIT`, which is where the descriptor edits happen.
+//!
+//! Skips (with a note) when `mkfs.ext4` or `e2fsck` is not installed.
+
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::features::RoCompat;
+use fs_ext4::{Error, Filesystem};
+use std::process::Command;
+use std::sync::Arc;
+
+const MKFS: &str = "mkfs.ext4";
+const E2FSCK: &str = "e2fsck";
+
+fn tool(name: &str) -> Option<String> {
+    for dir in ["/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/sbin"] {
+        let p = format!("{dir}/{name}");
+        if std::path::Path::new(&p).exists() {
+            return Some(p);
+        }
+    }
+    None
+}
+
+/// A fresh `mkfs.ext4` volume with `GDT_CSUM` and not `METADATA_CSUM`.
+fn make_volume(tag: &str, sixty_four: bool) -> Option<String> {
+    let (Some(mkfs), Some(_)) = (tool(MKFS), tool(E2FSCK)) else {
+        eprintln!("skip: {MKFS} or {E2FSCK} not installed");
+        return None;
+    };
+    let path =
+        fs_ext4_test_support::temp_path!("fs_ext4_gdt_csum_{tag}_{}.img", std::process::id());
+    std::fs::File::create(&path)
+        .and_then(|f| f.set_len(64 * 1024 * 1024))
+        .expect("size the image");
+    let features = if sixty_four {
+        "^metadata_csum,uninit_bg,64bit"
+    } else {
+        "^metadata_csum,uninit_bg,^64bit"
+    };
+    let out = Command::new(mkfs)
+        .args([
+            "-q",
+            "-F",
+            "-b",
+            "1024",
+            "-O",
+            features,
+            "-E",
+            "lazy_itable_init=1",
+        ])
+        .arg(&path)
+        .output()
+        .expect("run mkfs.ext4");
+    assert!(
+        out.status.success(),
+        "mkfs.ext4 failed: {}",
+        String::from_utf8_lossy(&out.stderr)
+    );
+    Some(path)
+}
+
+fn e2fsck_clean(path: &str) -> (bool, String) {
+    let out = Command::new(tool(E2FSCK).unwrap())
+        .args(["-fn", path])
+        .output()
+        .expect("run e2fsck");
+    (
+        out.status.success(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+fn write_and_check(tag: &str, sixty_four: bool) {
+    let Some(path) = make_volume(tag, sixty_four) else {
+        return;
+    };
+    {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&path).expect("open_rw")))
+            .expect("mount");
+        assert_ne!(
+            fs.sb.feature_ro_compat & RoCompat::GDT_CSUM.bits(),
+            0,
+            "[{tag}] gdt_csum"
+        );
+        assert_eq!(
+            fs.sb.feature_ro_compat & RoCompat::METADATA_CSUM.bits(),
+            0,
+            "[{tag}] metadata_csum must be off"
+        );
+        assert_eq!(
+            fs.sb.desc_size,
+            if sixty_four { 64 } else { 32 },
+            "[{tag}] desc_size"
+        );
+        assert!(fs.groups.len() > 2, "[{tag}] needs several groups");
+
+        for d in 0..6 {
+            let dir = format!("/d{d}");
+            fs.apply_mkdir(&dir, 0o755).expect("mkdir");
+            for f in 0..4 {
+                let file = format!("{dir}/f{f}");
+                fs.apply_create(&file, 0o644).expect("create");
+                fs.apply_pwrite(&file, 0, &vec![d as u8 ^ f as u8; 20_000])
+                    .expect("pwrite");
+            }
+        }
+        fs.apply_unlink("/d0/f0").expect("unlink");
+        fs.apply_rmdir("/d5")
+            .expect_err("rmdir of a non-empty dir is refused");
+        fs.dev.flush().expect("flush");
+    }
+    let (clean, report) = e2fsck_clean(&path);
+    // The exit status is not enough on its own: `e2fsck -n` answers "no" to
+    // "One or more block group descriptor checksums are invalid", prints
+    // IGNORED, and still exits 0 when nothing else is wrong.
+    assert!(
+        clean && !report.contains("IGNORED") && !report.contains("checksum"),
+        "[{tag}] e2fsck found problems after the driver's writes:\n{report}"
+    );
+
+    // The mount checks what it reads: a descriptor whose crc16 no longer
+    // matches is refused, as the kernel refuses it.
+    {
+        let dev = FileDevice::open_rw(&path).expect("open_rw");
+        let at = 2 * 1024 + 0x0C; // group 0's free-blocks count, 1 KiB blocks
+        let mut b = [0u8; 1];
+        dev.read_at(at, &mut b).unwrap();
+        dev.write_at(at, &[b[0] ^ 1]).unwrap();
+        dev.flush().unwrap();
+    }
+    match Filesystem::mount(Arc::new(FileDevice::open(&path).expect("open"))) {
+        Err(Error::BadChecksum { .. }) => {}
+        other => panic!(
+            "[{tag}] a stale crc16 must refuse the mount, got {:?}",
+            other.map(|_| ())
+        ),
+    }
+    let _ = std::fs::remove_file(&path);
+}
+
+#[test]
+fn gdt_csum_32_byte_descriptors_survive_e2fsck() {
+    write_and_check("32", false);
+}
+
+#[test]
+fn gdt_csum_64_byte_descriptors_survive_e2fsck() {
+    write_and_check("64", true);
+}
+
+/// The kernel's `crc16` is CRC-16/ARC's polynomial; seeded with `~0` it is
+/// CRC-16/MODBUS, whose published check value over "123456789" is 0x4B37.
+#[test]
+fn crc16_matches_the_published_check_value() {
+    assert_eq!(fs_ext4::checksum::crc16(!0, b"123456789"), 0x4B37);
+    assert_eq!(fs_ext4::checksum::crc16(0, b"123456789"), 0xBB3D);
+}
