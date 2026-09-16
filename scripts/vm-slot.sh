@@ -214,8 +214,8 @@ holder_is_dead() {
 #
 # Adding a condition does not fix that, because no condition was missing:
 # what was missing is the binding between the check and the action. So
-# the caller passes the token it saw, this re-reads the token as late as
-# possible, and refuses if it has changed.
+# the caller passes the token it saw, and the token is checked on the
+# generation actually taken away (see `delete_generation`).
 #
 # The deletion then goes through a rename into a path only this process
 # knows. `rename(2)` is atomic, so exactly one of several waiters can
@@ -223,24 +223,85 @@ holder_is_dead() {
 # follows targets a private directory rather than the shared path. The
 # loser's `mv` fails, it returns non-zero, and the wait loop tries again
 # — where `mkdir`'s own atomicity decides who acquires.
-#
-# Residual window, stated rather than glossed: between the token check
-# and the `mv` a lock can still be replaced, so a live holder's record
-# could be moved aside. It is two statements wide instead of a whole
-# decision wide, and the `mkdir` below still admits only one acquirer, so
-# the outcome is a lock that has to be re-taken rather than two VMs.
-# Closing it entirely needs a compare-and-swap the shell does not have.
 break_lock() {
-    local why="$1" token="${2-}" staged
+    local why="$1" token="${2-}"
+    delete_generation "$token" breaking || return 1
+    # Announced AFTER the fact, so the line describes something that
+    # happened rather than something that was attempted.
+    echo "[vm-slot] breaking the lock: $why" >&2
+}
+
+# Delete the lock if, and only if, it is generation `token`. `tag` names
+# the staging path (`breaking`, `releasing`).
+#
+# CHECKED ON THE MOVED COPY. This used to check the live path and then
+# move whatever occupied it, so a lock replaced between those two
+# statements was taken away unauthorised (#138). `mv` is atomic: once it
+# returns, the generation in the staging path is exactly what was taken
+# and nobody can be acquiring it, so the comparison there is the one
+# that binds. On a mismatch the lock is put back (`restore_lock`).
+#
+# CHECKED BEFORE THE MOVE AS WELL, and both checks earn their place. The
+# restore is a `mkdir` on a path that is briefly empty, which a waiter
+# can win, so moving a lock this process can ALREADY SEE is not its own
+# is a risk taken for nothing. The early check makes the restore the
+# rare case: reaching it needs a record that changed between these two
+# checks.
+delete_generation() {
+    local token="${1-}" tag="$2" staged
     if [ "$(holder_field 4 2>/dev/null || true)" != "$token" ]; then
         return 1
     fi
-    staged="${LOCK}.breaking.$$"
+    # Serialised because `cmd_acquire` can call `break_lock` repeatedly
+    # from one loop, and a name that repeats can collide with a copy
+    # still parked under it.
+    next_serial
+    staged="${LOCK}.${tag}.$$.$SERIAL"
     rm -rf "$staged"
     mv "$LOCK" "$staged" 2>/dev/null || return 1
-    echo "[vm-slot] breaking the lock: $why" >&2
+    if [ "$(record_field "$staged/holder" 4)" != "$token" ]; then
+        restore_lock "$staged"
+        return 1
+    fi
     rm -rf "$staged"
 }
+
+# Put a lock that was moved aside back at `$LOCK`, or keep its record.
+#
+# `mkdir`, NOT `mv`. `mv` onto an existing directory does not fail, it
+# moves the source INSIDE, so a restore that raced an acquire would bury
+# the displaced generation in the live lock and report success.
+#
+# When the path has been taken, the record is kept beside the lock under
+# `slot.lock.orphan.*` and reported, rather than deleted: it is a
+# generation this process was not authorised to break, so its VM may
+# still be running, and a visible orphan can be diagnosed where a silent
+# double hold cannot.
+restore_lock() {
+    local staged="$1" orphan
+    if mkdir "$LOCK" 2>/dev/null; then
+        mv "$staged/holder" "$HOLDER" 2>/dev/null || true
+        rm -rf "$staged"
+        return 0
+    fi
+    next_serial
+    orphan="${LOCK}.orphan.$$.$SERIAL"
+    rm -rf "$orphan"
+    if mv "$staged" "$orphan" 2>/dev/null; then
+        echo "[vm-slot] a lock was staged aside and the slot was retaken before it" >&2
+        echo "[vm-slot] could be restored; the displaced record is at $orphan" >&2
+        echo "[vm-slot] and its VM may still be running -- check before trusting" >&2
+        echo "[vm-slot] the slot." >&2
+    fi
+    return 1
+}
+
+# A counter, for names that must not repeat within one process. NOT a
+# command substitution: `x="$(next_serial)"` would increment in a
+# subshell and leave `SERIAL` unchanged here, so every call would yield
+# the same name.
+SERIAL=0
+next_serial() { SERIAL=$((SERIAL + 1)); }
 
 cmd_acquire() {
     mkdir -p "$STATE_DIR"
@@ -363,28 +424,10 @@ cmd_release() {
     # `vm.sh down` calls this unconditionally, so it runs far more often
     # than a break does.
     #
-    # THE CHECK IS AFTER THE MOVE HERE AND BEFORE IT IN `break_lock`, AND
-    # THAT ASYMMETRY IS DELIBERATE. `break_lock` refuses early because it
-    # is acting on somebody else's lock and should not disturb it at all
-    # unless it is the one it decided about. `cmd_release` is acting on
-    # what it believes is its OWN lock, so it can afford to take the lock
-    # out of circulation first and check afterwards: the move is atomic,
-    # so no third party can acquire while the question is being asked,
-    # and the answer decides whether to delete it or hand it straight
-    # back. Checking before the move here would leave the same window the
-    # binding exists to close.
-    local token staged
-    token="$(holder_field 4 2>/dev/null || true)"
-    staged="${LOCK}.releasing.$$"
-    rm -rf "$staged"
-    mv "$LOCK" "$staged" 2>/dev/null || return 0
-    if [ "$(record_field "$staged/holder" 4)" != "$token" ]; then
-        # Somebody replaced the lock between the check and the move. Put
-        # it back rather than delete a slot we do not hold.
-        mv "$staged" "$LOCK" 2>/dev/null || rm -rf "$staged"
-        return 0
-    fi
-    rm -rf "$staged"
+    # Both go through `delete_generation`, which checks the token on the
+    # copy it moved and puts back a lock that turns out not to be ours.
+    delete_generation "$(holder_field 4 2>/dev/null || true)" releasing || true
+    return 0
 }
 
 cmd_status() {

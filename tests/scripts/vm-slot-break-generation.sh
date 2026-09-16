@@ -36,6 +36,11 @@ export AM_VM_SLOT_LIB
 # failure, so restore this file's own options.
 set +e
 
+# The real `holder_field`, so a test that shadows it can put it back.
+# `unset -f` after a shadow removes the name altogether, and every later
+# section then calls a `holder_field` that no longer exists.
+real_holder_field="$(declare -f holder_field)"
+
 check() {
     local want="$1" what="$2" got
     if [ -d "$LOCK" ]; then got=survived; else got=removed; fi
@@ -104,7 +109,7 @@ release_with_stale_token() {
         esac
     }
     cmd_release
-    unset -f holder_field
+    eval "$real_holder_field"
 }
 
 rm -rf "$LOCK"; mkdir -p "$LOCK"
@@ -127,6 +132,118 @@ if [ -z "$(find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.*' -print -qu
 else
     printf 'FAIL  a staging directory survived: %s\n' \
         "$(find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.*' -print -quit)"
+    fails=$((fails + 1))
+fi
+
+record_token() { awk -F'\t' '{print $4}' "$1" 2>/dev/null; }
+
+# 5. BREAK_LOCK'S OWN INNER WINDOW (#138). Test 1 replaces the lock
+#    before `break_lock` is called, so its entry read already sees the
+#    replacement. The window that remained was between that read and the
+#    `mv`: the read saw the generation the breaker was authorised
+#    against, and the `mv` took whatever occupied the path by then.
+#
+#    As in 3b, the read is made to answer with the breaker's generation
+#    while the disk holds its replacement. The replacement must survive,
+#    which only a check on the MOVED copy can guarantee.
+break_with_stale_read() {
+    local stale="$1"
+    holder_field() {
+        case "$1" in
+            4) printf '%s\n' "$stale" ;;
+            *) printf 'holder-repo\n' ;;
+        esac
+    }
+    break_lock "a decision about $stale" "$stale" >/dev/null 2>&1
+    local rc=$?
+    eval "$real_holder_field"
+    return "$rc"
+}
+
+put_generation "generation-six"
+break_with_stale_read "generation-five"
+rc=$?
+check survived "a break whose read raced a replacement spares the replacement"
+if [ "$rc" -ne 0 ] && [ "$(record_token "$HOLDER")" = "generation-six" ]; then
+    printf 'ok    and reports the refusal with the replacement record intact\n'
+else
+    printf 'FAIL  break_lock returned %s with record token %s\n' "$rc" "$(record_token "$HOLDER")"
+    fails=$((fails + 1))
+fi
+
+# 5b. The mirror: the same stale-read harness with a token that DOES match
+#     the disk still breaks, so 5 is the check on the moved copy and not a
+#     harness that stops every break.
+put_generation "generation-seven"
+break_with_stale_read "generation-seven"
+check removed "a break whose read and disk agree still frees the lock"
+
+# 6. A RESTORE MUST NOT NEST, AND A RECORD IT CANNOT PUT BACK IS KEPT.
+#    Once a break or release has moved a generation aside and found it is
+#    not the one it was authorised against, it puts it back. `mv` onto an
+#    existing directory does not fail, it moves the source INSIDE, so a
+#    restore that raced an acquire would bury the displaced generation in
+#    the live lock. And that generation may still have a VM running, so
+#    when the path is taken its record is kept beside the lock, not
+#    deleted.
+put_generation "generation-live"
+staged="${LOCK}.breaking.test"
+rm -rf "$staged"; mkdir -p "$staged"
+printf '%s\t%s\t%s\t%s\n' "/some/other/repo" "holder-repo" "$(date +%s)" "generation-displaced" > "$staged/holder"
+restore_lock "$staged" 2>/dev/null
+check survived "the live lock survives a restore that races it"
+kept="$(find "$AM_ORACLE_VM_STATE" -maxdepth 1 -name 'slot.lock.orphan.*' -print -quit)"
+if [ "$(record_token "$HOLDER")" = "generation-live" ] \
+    && [ -z "$(find "$LOCK" -mindepth 1 -type d -print -quit)" ] \
+    && [ ! -e "$staged" ] \
+    && [ -n "$kept" ] && [ "$(record_token "$kept/holder")" = "generation-displaced" ]; then
+    printf 'ok    with nothing buried in it, and the displaced record kept as an orphan\n'
+else
+    printf 'FAIL  restore: live token %s, nested %s, staged %s, orphan %s\n' \
+        "$(record_token "$HOLDER")" "$(find "$LOCK" -mindepth 1 -type d | wc -l | tr -d ' ')" \
+        "$([ -e "$staged" ] && echo left || echo gone)" "${kept:-none}"
+    fails=$((fails + 1))
+fi
+rm -rf "$kept"
+
+# 6b. The ordinary restore, onto a path that is still free.
+rm -rf "$LOCK"
+rm -rf "$staged"; mkdir -p "$staged"
+printf '%s\t%s\t%s\t%s\n' "/some/other/repo" "holder-repo" "$(date +%s)" "generation-back" > "$staged/holder"
+restore_lock "$staged" 2>/dev/null
+check survived "a restore onto a free path puts the lock back"
+if [ "$(record_token "$HOLDER")" = "generation-back" ]; then
+    printf 'ok    with its record\n'
+else
+    printf 'FAIL  the restored lock carries token %s\n' "$(record_token "$HOLDER")"
+    fails=$((fails + 1))
+fi
+
+# 7. A BREAK THAT CAN ALREADY SEE IT IS NOT AUTHORISED MOVES NOTHING.
+#    Moving a lock aside frees its path until it is restored, and a waiter
+#    can win that `mkdir`, so the visible mismatch is refused before the
+#    move. No residue cannot show this: a move that is put back leaves
+#    none. Every `mv` is recorded instead, with an authorised break as the
+#    control that the recorder sees a move at all.
+moves="$sandbox/mv.log"
+mv() {
+    printf '%s\n' "$*" >> "$moves"
+    command mv "$@"
+}
+: > "$moves"
+put_generation "generation-eight"
+break_lock "a decision about another generation" "generation-other" >/dev/null 2>&1
+unauthorised_moves="$(wc -l < "$moves" | tr -d ' ')"
+: > "$moves"
+put_generation "generation-nine"
+break_lock "a decision about this generation" "generation-nine" >/dev/null 2>&1
+authorised_moves="$(wc -l < "$moves" | tr -d ' ')"
+unset -f mv
+if [ "$unauthorised_moves" = 0 ] && [ "$authorised_moves" = 1 ]; then
+    printf 'ok    a visibly unauthorised break never moves the lock\n'
+else
+    printf 'FAIL  moves: unauthorised %s (want 0), authorised %s (want 1)\n' \
+        "$unauthorised_moves" "$authorised_moves"
     fails=$((fails + 1))
 fi
 
