@@ -355,7 +355,19 @@ where
         let max_bits = blocks_in_group(sb, gi);
 
         let mut bitmap_bytes: Vec<u8> = if bgd.flags().contains(BgdFlags::BLOCK_UNINIT) {
-            vec![0u8; sb.block_size() as usize]
+            // Uninit is not empty: the group still holds its backup
+            // superblock and GDT, and without flex_bg its own bitmaps and
+            // inode table. The kernel's `ext4_init_block_bitmap` marks
+            // them; a plan that doesn't hands one of them out as free.
+            let mut bm = vec![0u8; sb.block_size() as usize];
+            for (first_bit, count) in group_owned_metadata_runs(sb, groups, gi as usize) {
+                for bit in first_bit..(first_bit + count).min(u64::from(max_bits)) {
+                    if let Some(b) = bm.get_mut((bit / 8) as usize) {
+                        *b |= 1u8 << (bit % 8);
+                    }
+                }
+            }
+            bm
         } else {
             bitmap_reader(bgd.block_bitmap)?
         };
@@ -394,6 +406,64 @@ where
     Err(Error::Corrupt(
         "no group has a contiguous free run of this size",
     ))
+}
+
+/// The blocks group `gi` owns that physically live inside it, as
+/// `(first_bit, count)` runs relative to the group's first block.
+///
+/// A BLOCK_UNINIT group's bitmap is implied rather than stored, and this
+/// is what it implies: everything here is in use, the rest is free. Both
+/// the planner and the first real write of the bitmap need it, or the
+/// group's own metadata becomes allocatable free space. Reading it off the
+/// descriptor rather than deriving it from the feature flags means an
+/// unusual layout is handled by inspection instead of by assumption.
+pub(crate) fn group_owned_metadata_runs(
+    sb: &Superblock,
+    groups: &[BlockGroupDescriptor],
+    gi: usize,
+) -> Vec<(u64, u64)> {
+    let bs = sb.block_size() as u64;
+    let bpg = sb.blocks_per_group as u64;
+    let group_start = sb.first_data_block as u64 + gi as u64 * bpg;
+    let mut runs = Vec::new();
+
+    // Superblock, group-descriptor-table backup and the blocks held
+    // back for growing the table, at the head of every group that
+    // carries a backup.
+    //
+    // Which groups those are is the filesystem's decision, not a
+    // constant: `SPARSE_SUPER2` puts backups in two named groups and
+    // no others, and a filesystem without `SPARSE_SUPER` puts one in
+    // every group. Assuming the classic rule reports "no backup
+    // here" for groups that have one, and a rebuilt bitmap then
+    // offers a live backup superblock as free space.
+    //
+    // `s_reserved_gdt_blocks` belongs in the same run. It sits
+    // between the descriptor table and the block bitmap, and it is
+    // the room the filesystem keeps to grow into — free-looking, and
+    // not free.
+    if sb.group_has_super(gi as u64) {
+        let gdt_blocks = (groups.len() as u64 * sb.desc_size as u64).div_ceil(bs);
+        let reserved = u64::from(sb.reserved_gdt_blocks);
+        runs.push((0, 1 + gdt_blocks + reserved));
+    }
+
+    // The group's own bitmaps and inode table, wherever the descriptor
+    // says they are — included only when that is inside this group.
+    let itable_blocks = (sb.inodes_per_group as u64 * sb.inode_size as u64).div_ceil(bs);
+    let Some(g) = groups.get(gi) else {
+        return runs;
+    };
+    for (block, count) in [
+        (g.block_bitmap, 1),
+        (g.inode_bitmap, 1),
+        (g.inode_table, itable_blocks),
+    ] {
+        if block >= group_start && block < group_start + bpg {
+            runs.push((block - group_start, count));
+        }
+    }
+    runs
 }
 
 /// Returns the number of blocks that actually exist in group `gi` (the last
@@ -960,9 +1030,41 @@ mod tests {
             call_count += 1;
             Ok(vec![0u8; 4096])
         };
-        let plan = plan_block_allocation_excluding(&sb, &groups, 1, 0, &[1], read).unwrap();
-        assert_eq!(plan.first_block, 2, "block 1 is reserved");
+        // Group 0's superblock and one GDT block are blocks 1 and 2, so 3
+        // is the first block the implied bitmap leaves free.
+        let plan = plan_block_allocation_excluding(&sb, &groups, 1, 0, &[3], read).unwrap();
+        assert_eq!(plan.first_block, 4, "block 3 is reserved");
         assert_eq!(call_count, 0, "an UNINIT group still reads no bitmap");
+    }
+
+    /// An uninit group is not an empty one. Its backup superblock, GDT and
+    /// reserved GDT blocks, and the bitmaps and inode table the descriptor
+    /// places inside it, are all in use in the bitmap the flag implies.
+    /// Planning against all zeroes handed the backup superblock out first.
+    #[test]
+    fn an_uninit_group_keeps_its_own_metadata() {
+        let mut sb = mk_sb(4096, 32768, 8192, 65536);
+        sb.reserved_gdt_blocks = 3;
+        let g0 = mk_bgd(0, 8000, 0, 0);
+        let mut g1 = mk_bgd(32768, 8000, 0, BgdFlags::BLOCK_UNINIT.bits());
+        // Group 1 starts at block 32769. Superblock, one GDT block and three
+        // reserved blocks take 32769..=32773; put the bitmaps right after and
+        // the inode table (8192 * 256 / 4096 = 512 blocks) after those.
+        g1.block_bitmap = 32774;
+        g1.inode_bitmap = 32775;
+        g1.inode_table = 32776;
+        let groups = vec![g0, g1];
+        let read = |_b| Ok(vec![0u8; 4096]);
+        let plan = plan_block_allocation(&sb, &groups, 1, 1, read).unwrap();
+        assert_eq!(
+            plan.first_block,
+            32776 + 512,
+            "first block past the group's metadata"
+        );
+
+        // The runs themselves, relative to the group start.
+        let runs = group_owned_metadata_runs(&sb, &groups, 1);
+        assert_eq!(runs, vec![(0, 5), (5, 1), (6, 1), (7, 512)]);
     }
 
     /// THE ACCEPTANCE HALF: a reservation is a reservation of one block

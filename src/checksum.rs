@@ -38,6 +38,61 @@ pub fn linux_crc32c(seed: u32, data: &[u8]) -> u32 {
     !crc32c::crc32c_append(!seed, data)
 }
 
+/// The kernel's `crc16()` (`lib/crc16.c`): polynomial 0x8005, reflected,
+/// no final XOR. Only `GDT_CSUM` group descriptors use it.
+pub fn crc16(mut crc: u16, data: &[u8]) -> u16 {
+    for &b in data {
+        crc ^= u16::from(b);
+        for _ in 0..8 {
+            crc = if crc & 1 != 0 {
+                (crc >> 1) ^ 0xA001
+            } else {
+                crc >> 1
+            };
+        }
+    }
+    crc
+}
+
+/// The checksum group descriptor `group` must carry at 0x1E, or `None`
+/// when the volume asks for none.
+///
+/// Mirrors the kernel's `ext4_group_desc_csum`. With `METADATA_CSUM` it is
+/// the low 16 bits of `crc32c(seed, group_le32 || desc)`. Otherwise, with
+/// `GDT_CSUM`, it is `crc16(~0, uuid || group_le32 || desc[..0x1E])`, plus
+/// the bytes past the checksum field only when `INCOMPAT_64BIT` is set.
+/// Either way the checksum field itself counts as zero. `desc` must hold
+/// at least `sb.desc_size` bytes; `None` is also returned when it doesn't.
+pub fn group_desc_csum(
+    sb: &Superblock,
+    csum: &Checksummer,
+    group: u32,
+    desc: &[u8],
+) -> Option<u16> {
+    let n = sb.desc_size as usize;
+    if desc.len() < n || n < 0x20 {
+        return None;
+    }
+    let le_group = group.to_le_bytes();
+    if sb.feature_ro_compat & RoCompat::METADATA_CSUM.bits() != 0 {
+        let mut c = linux_crc32c(csum.seed, &le_group);
+        c = linux_crc32c(c, &desc[..0x1E]);
+        c = linux_crc32c(c, &[0, 0]);
+        c = linux_crc32c(c, &desc[0x20..n]);
+        return Some(c as u16);
+    }
+    if sb.feature_ro_compat & RoCompat::GDT_CSUM.bits() == 0 {
+        return None;
+    }
+    let mut c = crc16(!0, &sb.uuid);
+    c = crc16(c, &le_group);
+    c = crc16(c, &desc[..0x1E]);
+    if sb.feature_incompat & Incompat::BIT64.bits() != 0 {
+        c = crc16(c, &desc[0x20..n]);
+    }
+    Some(c)
+}
+
 /// Per-mount checksum context: the seed and "is it enabled" flag.
 #[derive(Debug, Clone, Copy)]
 pub struct Checksummer {
