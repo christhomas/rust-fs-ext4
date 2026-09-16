@@ -12,6 +12,7 @@
 use fs_ext4::block_io::BlockDevice;
 use fs_ext4::error::{Error, Result};
 use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::Inode;
 use fs_ext4::journal::{ReplayEntry, ReplayPlan};
 use fs_ext4::{journal_apply, mkfs};
 use std::sync::{Arc, Mutex};
@@ -113,29 +114,46 @@ fn the_good_entry_applies_on_its_own() {
 
 #[test]
 fn one_bad_destination_refuses_the_plan_before_anything_is_written() {
-    for bad in [
-        entry(u64::MAX / 2),
-        // Past blocks_count by one.
-        ReplayEntry {
-            fs_block: IMAGE_BYTES / u64::from(BLOCK_SIZE),
-            ..entry(0)
-        },
-        // A source the journal inode does not map.
-        ReplayEntry {
-            journal_block: u64::from(u32::MAX),
-            ..entry(3)
-        },
-    ] {
+    type Bad = fn(&Filesystem) -> ReplayEntry;
+    let cases: [(&str, Bad, &str); 3] = [
+        ("far past the end", |_| entry(u64::MAX / 2), "past the end"),
+        (
+            "one block past the end",
+            |fs| ReplayEntry {
+                fs_block: fs.sb.blocks_count,
+                ..entry(0)
+            },
+            "past the end",
+        ),
+        (
+            // Inside the range the journal inode's block map can address,
+            // but past the blocks it holds, so the mapper answers "not
+            // mapped" rather than refusing the number itself (Greptile on
+            // #197: `u32::MAX` never reached that branch).
+            "a source past the journal's last block",
+            |fs| {
+                let jinode =
+                    Inode::parse(&fs.read_inode_raw(fs.sb.journal_inode).unwrap()).unwrap();
+                ReplayEntry {
+                    journal_block: jinode.size / u64::from(BLOCK_SIZE),
+                    ..entry(3)
+                }
+            },
+            "journal block unmapped",
+        ),
+    ];
+    for (name, bad, why) in cases {
         let (dev, fs, dest) = volume();
         let before = block(&dev, dest);
-        let result = journal_apply::apply(&fs, &plan(vec![entry(dest), bad.clone()]));
-        assert!(
-            matches!(result, Err(Error::Corrupt(_))),
-            "{bad:?}: the plan must be refused, got {result:?}"
-        );
+        let bad = bad(&fs);
+        let result = journal_apply::apply(&fs, &plan(vec![entry(dest), bad]));
+        match &result {
+            Err(Error::Corrupt(m)) => assert!(m.contains(why), "{name}: refused as {m:?}"),
+            other => panic!("{name}: the plan must be refused, got {other:?}"),
+        }
         assert!(
             block(&dev, dest) == before,
-            "{bad:?}: the entry before the refused one was already written"
+            "{name}: the entry before the refused one was already written"
         );
     }
 }
