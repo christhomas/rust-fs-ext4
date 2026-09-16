@@ -16,6 +16,9 @@
 //! block (32), and ones with bytes at or above 0x80, where the signed and
 //! unsigned variants differ. Skips when e2fsprogs is not installed.
 
+// e2fsprogs and byte-string file names: a Unix test.
+#![cfg(unix)]
+
 use fs_ext4::dir;
 use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;

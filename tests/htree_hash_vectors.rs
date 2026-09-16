@@ -228,6 +228,8 @@ fn every_version_matches_e2fsprogs() {
 
 /// Re-derive every vector from `debugfs` itself, so the table above can only
 /// be regenerated, not hand-edited into agreement. Skips without debugfs.
+// debugfs is an e2fsprogs tool, and the name is passed as raw bytes.
+#[cfg(unix)]
 #[test]
 fn live_debugfs_agrees() {
     let Some(debugfs) = ["/usr/sbin/debugfs", "/sbin/debugfs", "/usr/bin/debugfs"]
