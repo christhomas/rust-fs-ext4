@@ -6455,6 +6455,42 @@ mod tests {
     /// `0x76..0x78` only by `write_file_acl`. A hand-written second copy
     /// of either is what let the two disagree with `Inode::parse` for as
     /// long as they did.
+    /// Every statement in `src` that writes `field` with `copy_from_slice`,
+    /// whitespace collapsed.
+    ///
+    /// BY STATEMENT, NOT BY LINE (#162). rustfmt wraps a long write as
+    /// `raw[0x74..0x76]` on one line and `.copy_from_slice(..)` on the next,
+    /// so a line scan saw neither half as a write, and #157's defect could be
+    /// re-inlined with fmt, clippy and this test all green. Line comments are
+    /// removed first so a `;` or an offset in prose does not join or form a
+    /// statement.
+    fn half_word_writes(src: &str, field: &str) -> Vec<String> {
+        let code: String = src
+            .lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        code.split(';')
+            .map(|statement| statement.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|statement| statement.contains(field) && statement.contains("copy_from_slice"))
+            .collect()
+    }
+
+    /// The guard's reader sees a write however rustfmt lays it out.
+    #[test]
+    fn the_half_word_scan_reads_a_write_rustfmt_wrapped() {
+        let wrapped = "
+                    let acl_lo_value_for_the_external_xattr_block: u32 = 0;
+                    raw[0x74..0x76]
+                        .copy_from_slice(&acl_hi_value_for_the_external_xattr_block.to_le_bytes());
+                    // raw[0x74..0x76].copy_from_slice(&in_a_comment);
+        ";
+        assert_eq!(half_word_writes(wrapped, "0x74..0x76").len(), 1);
+        let one_line = "raw[0x74..0x76].copy_from_slice(&x.to_le_bytes());";
+        assert_eq!(half_word_writes(one_line, "0x74..0x76").len(), 1);
+        assert!(half_word_writes("let a = raw[0x74..0x76][0];", "0x74..0x76").is_empty());
+    }
+
     #[test]
     fn each_inode_half_word_is_written_in_exactly_one_place() {
         let whole = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fs.rs"))
@@ -6475,13 +6511,7 @@ mod tests {
              the split ate the file"
         );
 
-        let writes = |field: &str| -> Vec<String> {
-            src.lines()
-                .filter(|l| l.contains(field) && l.contains("copy_from_slice"))
-                .map(str::trim)
-                .map(str::to_owned)
-                .collect()
-        };
+        let writes = |field: &str| half_word_writes(src, field);
 
         let blocks_hi = writes("0x74..0x76");
         assert_eq!(
