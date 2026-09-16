@@ -61,8 +61,13 @@ jobs:
       # change and the reviewer who could have caught it, when someone
       # else cuts the next release. See rust-fs-ext4#109.
       #
-      # `--lib` only: a second compile of the same sources, and the
-      # arithmetic lives in the unit tests. `EXPECT_OVERFLOW_CHECKS=1`
+      # `--lib --bins`: the library's unit tests, and the unit tests of
+      # the `mkfs_ext4` binary, which is a separate target `--lib` never
+      # built -- so its tests ran only in the release run above, where an
+      # overflow wraps silently (#170). Not `--all-targets`: the
+      # integration targets need the test-disks images and are the reason
+      # this job is long, and running them in debug too is a separate
+      # decision with a cost to argue. `EXPECT_OVERFLOW_CHECKS=1`
       # tells `overflow_checks::the_build_the_gate_asked_to_check_does_check`
       # in src/lib.rs that this is the run that must trap an overflow --
       # asking the build directly rather than inferring it from which
@@ -72,7 +77,7 @@ jobs:
       # ci.yml -- this workflow specifically, not release.yml -- still
       # runs a `cargo test` without `--release` that sets it, and says
       # why release.yml having one is not enough.
-      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib
+      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib --bins
 
       # The shell that manages the oracle VM is not covered by `cargo
       # test`, and its defects are the expensive kind: a slot that frees
