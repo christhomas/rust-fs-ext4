@@ -18,7 +18,8 @@ use std::sync::Arc;
 /// A fresh image with the journal inode's first extent starting at
 /// `start`; `None` without mkfs.ext4.
 fn image_with_journal_at(name: &str, start: Option<u64>) -> Option<std::path::PathBuf> {
-    let dir = std::env::temp_dir().join(format!("ext4-jblock-{}-{name}", std::process::id()));
+    let dir =
+        fs_ext4_test_support::temp_dir().join(format!("ext4-jblock-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
     let img = dir.join("j.img");
     std::fs::File::create(&img)
