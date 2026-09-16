@@ -73,8 +73,9 @@ fn run(tag: &str, features: &str) {
         String::from_utf8_lossy(&out.stdout),
         String::from_utf8_lossy(&out.stderr)
     );
+    // `e2fsck -n` can print a problem as IGNORED and still exit 0.
     assert!(
-        out.status.success(),
+        out.status.success() && !report.contains("IGNORED"),
         "[{tag}] e2fsck found problems:\n{report}"
     );
     let _ = std::fs::remove_file(&path);
