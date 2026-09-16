@@ -1,0 +1,212 @@
+//! Writing into an htree-indexed directory leaves an index e2fsck accepts.
+//!
+//! The write path treated every directory block as a linear one. Block 0 of
+//! an indexed directory is the `dx_root`, whose fake `..` record spans the
+//! rest of the block, so the first create split that record and wrote the new
+//! entry over `dx_root_info` and the whole `dx_entry` array (#97). Lookups
+//! here scan linearly when the index misses, so nothing in this crate
+//! noticed. e2fsck does.
+//!
+//! The volume comes from the real toolchain: `mkfs.ext4 -d` copies in a
+//! directory of names, and `e2fsck -fyD` indexes it. The driver then creates,
+//! links, renames into and unlinks from that directory, and `e2fsck -fn` must
+//! find nothing, with and without metadata_csum. Skips without e2fsprogs.
+
+use fs_ext4::block_io::FileDevice;
+use fs_ext4::fs::Filesystem;
+use fs_ext4::inode::InodeFlags;
+use std::process::Command;
+use std::sync::Arc;
+
+fn tool(name: &str) -> Option<String> {
+    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
+        .iter()
+        .map(|dir| format!("{dir}/{name}"))
+        .find(|p| std::path::Path::new(p).exists())
+}
+
+fn run(cmd: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(tool(cmd).unwrap())
+        .args(args)
+        .output()
+        .unwrap();
+    (
+        out.status.code(),
+        format!(
+            "{}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// A fresh image whose `/bigdir` holds `count` files and is indexed.
+fn indexed_volume(tag: &str, features: &str, count: usize) -> Option<String> {
+    if tool("mkfs.ext4").is_none() || tool("e2fsck").is_none() {
+        eprintln!("skip: e2fsprogs not installed");
+        return None;
+    }
+    let root = fs_ext4_test_support::temp_path!("fs_ext4_htree_w_{tag}_{}", std::process::id());
+    let bigdir = std::path::Path::new(&root).join("bigdir");
+    std::fs::create_dir_all(bigdir.join("sub")).unwrap();
+    for i in 0..count {
+        std::fs::write(bigdir.join(format!("existing_file_{i:05}")), b"").unwrap();
+    }
+    std::fs::create_dir_all(std::path::Path::new(&root).join("elsewhere")).unwrap();
+    std::fs::write(std::path::Path::new(&root).join("elsewhere/mover"), b"m").unwrap();
+    // An indexed directory that is itself moved, so its dx_root's `..`
+    // changes.
+    let bigsub = std::path::Path::new(&root).join("elsewhere/bigsub");
+    std::fs::create_dir_all(&bigsub).unwrap();
+    for i in 0..count {
+        std::fs::write(bigsub.join(format!("inner_{i:05}")), b"").unwrap();
+    }
+    let image = format!("{root}.img");
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(64 * 1024 * 1024))
+        .unwrap();
+    let (code, log) = run(
+        "mkfs.ext4",
+        &[
+            "-q", "-F", "-b", "1024", "-O", features, "-d", &root, &image,
+        ],
+    );
+    assert_eq!(code, Some(0), "mkfs.ext4: {log}");
+    let (code, log) = run("e2fsck", &["-fyD", &image]);
+    assert!(matches!(code, Some(0 | 1)), "e2fsck -fyD: {log}");
+    let _ = std::fs::remove_dir_all(&root);
+    Some(image)
+}
+
+fn resolve(fs: &Filesystem, path: &str) -> fs_ext4::Result<u32> {
+    let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(inode, _)| inode);
+    fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, path)
+}
+
+fn is_indexed(fs: &Filesystem, path: &str) -> bool {
+    let ino = resolve(fs, path).expect("resolve");
+    let (inode, _) = fs.read_inode_verified(ino).expect("inode");
+    inode.flags & InodeFlags::INDEX.bits() != 0
+}
+
+fn e2fsck_clean(image: &str) -> Result<(), String> {
+    let (code, report) = run("e2fsck", &["-fn", image]);
+    // `-n` answers "no" and can still exit 0 with IGNORED lines.
+    if code == Some(0) && !report.contains("IGNORED") && !report.contains("HTREE") {
+        Ok(())
+    } else {
+        Err(report)
+    }
+}
+
+fn exercise(tag: &str, features: &str) {
+    let Some(image) = indexed_volume(tag, features, 600) else {
+        return;
+    };
+    {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+        assert!(
+            is_indexed(&fs, "/bigdir"),
+            "[{tag}] fixture: e2fsck -D did not index /bigdir"
+        );
+        for i in 0..40 {
+            fs.apply_create(&format!("/bigdir/new_{i}"), 0o644)
+                .expect("create");
+        }
+        fs.apply_link("/bigdir/new_0", "/bigdir/linked")
+            .expect("link");
+        fs.apply_rename("/elsewhere/mover", "/bigdir/moved_in", false)
+            .expect("rename in");
+        fs.apply_unlink("/bigdir/existing_file_00007")
+            .expect("unlink");
+        fs.apply_mkdir("/bigdir/newdir", 0o755).expect("mkdir");
+        assert!(
+            is_indexed(&fs, "/elsewhere/bigsub"),
+            "[{tag}] fixture: bigsub not indexed"
+        );
+        fs.apply_rename("/elsewhere/bigsub", "/bigdir/bigsub", false)
+            .expect("rename an indexed directory");
+        for i in 0..40 {
+            assert!(
+                resolve(&fs, &format!("/bigdir/new_{i}")).is_ok(),
+                "[{tag}] new_{i} not found"
+            );
+        }
+    }
+    if let Err(report) = e2fsck_clean(&image) {
+        panic!("[{tag}] e2fsck after writes into an indexed directory:\n{report}");
+    }
+    let _ = std::fs::remove_file(&image);
+}
+
+#[test]
+fn writes_into_an_indexed_directory_without_metadata_csum() {
+    exercise("nocsum", "^metadata_csum,^has_journal");
+}
+
+#[test]
+fn writes_into_an_indexed_directory_with_metadata_csum() {
+    exercise("csum", "metadata_csum");
+}
+
+/// When the leaf a name hashes to is full, the index is dropped and the
+/// directory carries on as a linear one, as the kernel's `dx_fallback` does.
+/// A block appended to a still-indexed directory is one no lookup through
+/// the index would reach.
+///
+/// 6000 names at 1 KiB blocks need a second index level, so the drop also
+/// converts interior nodes. With metadata_csum each converted block needs a
+/// dirent tail, and e2fsck checks every one.
+fn fill_a_leaf(tag: &str, features: &str) {
+    let Some(image) = indexed_volume(tag, features, 6000) else {
+        return;
+    };
+    let mut created = Vec::new();
+    {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+        let bigdir = resolve(&fs, "/bigdir").unwrap();
+        let (inode, _) = fs.read_inode_verified(bigdir).unwrap();
+        let root_phys = fs.map_inode_logical(&inode, 0).unwrap().unwrap();
+        let root = fs.read_block(root_phys).unwrap();
+        assert_eq!(root[30], 1, "[{tag}] fixture: expected a two-level index");
+
+        for i in 0..3000 {
+            let path = format!("/bigdir/a_longer_name_to_fill_leaves_{i:05}");
+            fs.apply_create(&path, 0o644).expect("create");
+            created.push(path);
+            if !is_indexed(&fs, "/bigdir") {
+                break;
+            }
+        }
+        assert!(
+            !is_indexed(&fs, "/bigdir"),
+            "[{tag}] 3000 creates never filled a leaf; the fallback went untested"
+        );
+        // A few more after the drop, through the linear path.
+        for i in 0..20 {
+            let path = format!("/bigdir/after_the_drop_{i}");
+            fs.apply_create(&path, 0o644).expect("create after drop");
+            created.push(path);
+        }
+        for path in created
+            .iter()
+            .chain([&"/bigdir/existing_file_05999".to_string()])
+        {
+            assert!(resolve(&fs, path).is_ok(), "[{tag}] {path} not found");
+        }
+    }
+    if let Err(report) = e2fsck_clean(&image) {
+        panic!("[{tag}] e2fsck after an index was dropped:\n{report}");
+    }
+    let _ = std::fs::remove_file(&image);
+}
+
+#[test]
+fn a_full_leaf_drops_the_index_without_metadata_csum() {
+    fill_a_leaf("fill_nocsum", "^metadata_csum,^has_journal");
+}
+
+#[test]
+fn a_full_leaf_drops_the_index_with_metadata_csum() {
+    fill_a_leaf("fill_csum", "metadata_csum");
+}
