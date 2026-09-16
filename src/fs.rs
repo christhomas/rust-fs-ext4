@@ -6092,6 +6092,37 @@ mod tests {
         let names =
             crate::xattr::list_names(&fs, &inode, &raw).expect("listing names needs no value");
         assert!(names.iter().any(|n| n == "user.big"), "{names:?}");
+        drop(fs);
+
+        // And through the door the bug was reported at: the C entry point
+        // must report the size, then write the name, instead of -1.
+        let image =
+            fs_ext4_test_support::temp_path!("fs_ext4_listxattr_{}.img", std::process::id());
+        std::fs::write(&image, &*dev.bytes.lock().unwrap()).expect("write image");
+        let c_image = std::ffi::CString::new(image.clone()).unwrap();
+        let c_path = std::ffi::CString::new("/subject.txt").unwrap();
+        unsafe {
+            let handle = crate::capi::fs_ext4_mount(c_image.as_ptr());
+            assert!(!handle.is_null(), "C mount");
+            let needed =
+                crate::capi::fs_ext4_listxattr(handle, c_path.as_ptr(), std::ptr::null_mut(), 0);
+            assert!(needed > 0, "the probe returned {needed}");
+            let mut buf = vec![0u8; needed as usize];
+            let wrote = crate::capi::fs_ext4_listxattr(
+                handle,
+                c_path.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            );
+            assert_eq!(wrote, needed);
+            assert!(
+                buf.split(|&b| b == 0).any(|n| n == b"user.big"),
+                "{:?}",
+                String::from_utf8_lossy(&buf)
+            );
+            crate::capi::fs_ext4_umount(handle);
+        }
+        let _ = std::fs::remove_file(&image);
     }
 
     /// The buffer-level parser cannot follow the pointer — it has no
