@@ -111,6 +111,19 @@ impl JournalWriter {
                 "journal declares more blocks than the filesystem holds",
             ));
         }
+        // NOR OVER THE BLOCKS EVERY MOUNT READS FIRST (#183). A commit
+        // writes wherever this map says, and `journal_apply::byte_offset_in`
+        // refuses only a block past the filesystem or the device -- block 0
+        // passes, and a journal inode mapping a logical block there put the
+        // first commit's descriptor over the primary superblock. So a
+        // mapping onto block 0, the superblock, group 0's descriptor table
+        // or its reserved growth, or past the end, is refused here, once,
+        // rather than trusted at every write.
+        let descriptor_bytes = fs.sb.block_group_count() * u64::from(fs.sb.desc_size);
+        let group0_metadata_end = u64::from(fs.sb.first_data_block)
+            + 1
+            + descriptor_bytes.div_ceil(u64::from(bs))
+            + u64::from(fs.sb.reserved_gdt_blocks);
         let mut physical_map = Vec::with_capacity(jsb.max_len as usize);
         for logical in 0..jsb.max_len as u64 {
             let phys = crate::indirect::map_logical_any(
@@ -123,6 +136,12 @@ impl JournalWriter {
             .ok_or(Error::Corrupt(
                 "journal_writer: journal inode has unmapped logical block",
             ))?;
+            if phys < group0_metadata_end || phys >= fs.sb.blocks_count {
+                return Err(Error::Corrupt(
+                    "journal_writer: journal inode maps a block onto the superblock, group 0's \
+                     descriptor table, or past the end of the filesystem",
+                ));
+            }
             physical_map.push(phys);
         }
 
