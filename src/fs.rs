@@ -5653,6 +5653,51 @@ mod tests {
             .expect("write sb");
     }
 
+    /// fsck repair is a write, and refuses what every other write refuses
+    /// (#119).
+    ///
+    /// The repair gate checked only that the device was writable. The
+    /// control is the point: the same volume, in the same process, refuses
+    /// a create, and an audit without repair still runs.
+    #[test]
+    fn fsck_repair_refuses_a_volume_whose_features_refuse_writes() {
+        let dev = formatted();
+        let mut sb = vec![0u8; 1024];
+        dev.read_at(crate::superblock::SUPERBLOCK_OFFSET, &mut sb)
+            .unwrap();
+        let cur = u32::from_le_bytes(sb[0x64..0x68].try_into().unwrap());
+        let quota = crate::features::RoCompat::QUOTA.bits();
+        sb[0x64..0x68].copy_from_slice(&(cur | quota).to_le_bytes());
+        let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        dev.write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb)
+            .unwrap();
+
+        let fs = mount(&dev);
+        assert!(
+            matches!(
+                fs.apply_create("/x", 0o644),
+                Err(Error::UnsupportedRoCompat(_))
+            ),
+            "control: an ordinary write is refused on this volume"
+        );
+        fs.audit_repair(u32::MAX, u32::MAX, false)
+            .expect("an audit without repair still runs");
+        match fs.audit_repair(u32::MAX, u32::MAX, true) {
+            Err(Error::UnsupportedRoCompat(bits)) => assert_eq!(bits & quota, quota),
+            other => panic!("repair must be refused, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// And an ordinary volume still repairs.
+    #[test]
+    fn fsck_repair_still_runs_on_an_ordinary_volume() {
+        let dev = formatted();
+        let fs = mount(&dev);
+        fs.audit_repair(u32::MAX, u32::MAX, true)
+            .expect("repair on an ordinary volume");
+    }
+
     /// A CASEFOLD volume must not be mounted writable.
     ///
     /// The kernel files a directory entry into the htree leaf that the
