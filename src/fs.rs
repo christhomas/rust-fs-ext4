@@ -1515,35 +1515,64 @@ impl Filesystem {
     /// bitmap bits AND patches the BGD counters in the buffer. Returns
     /// `len` so callers can accumulate a running freed-block total to
     /// feed to `buffer_patch_sb_counters`.
+    ///
+    /// A run may cross a group boundary -- the kernel merges extents on
+    /// adjacency alone, and so does `extent_mut::are_contiguous` -- so it
+    /// is freed one group at a time (#118). It used to take the group of
+    /// `start` alone: the bits past that group were dropped, and its
+    /// descriptor was credited the whole length, so the next group's
+    /// blocks stayed allocated for ever while the first group over-counted.
     pub(crate) fn buffer_free_block_run_and_bgd(
         &self,
         buf: &mut BlockBuffer,
         start: u64,
         len: u64,
     ) -> Result<u64> {
-        let bpg = self.sb.blocks_per_group as u64;
-        let first_data = self.sb.first_data_block as u64;
-        let gi = ((start - first_data) / bpg) as usize;
-        if gi >= self.groups.len() {
-            return Err(Error::InvalidBlock(start));
-        }
-        let group_start = first_data + gi as u64 * bpg;
-        let bit_start = (start - group_start) as u32;
-        let bitmap_block = self.groups[gi].block_bitmap;
-        {
-            let bm = buf.get_mut(self, bitmap_block)?;
-            for i in 0..len {
-                let bit = bit_start as u64 + i;
-                let byte = (bit / 8) as usize;
-                let mask = 1u8 << (bit % 8);
-                if byte < bm.len() {
-                    bm[byte] &= !mask;
+        for (gi, bit_start, chunk) in self.group_chunks(start, len)? {
+            let bitmap_block = self.groups[gi].block_bitmap;
+            {
+                let bm = buf.get_mut(self, bitmap_block)?;
+                for i in 0..chunk {
+                    let bit = bit_start + i;
+                    let byte = (bit / 8) as usize;
+                    let mask = 1u8 << (bit % 8);
+                    if byte < bm.len() {
+                        bm[byte] &= !mask;
+                    }
                 }
             }
+            self.buffer_refresh_bitmap_csum(buf, gi, false)?;
+            self.buffer_patch_bgd_counters(buf, gi, chunk as i32, 0, 0)?;
         }
-        self.buffer_refresh_bitmap_csum(buf, gi, false)?;
-        self.buffer_patch_bgd_counters(buf, gi, len as i32, 0, 0)?;
         Ok(len)
+    }
+
+    /// `[start, start + len)` split at block-group boundaries, as
+    /// `(group, bit within the group, length)` for each group it touches.
+    ///
+    /// Every group is validated, not only the first: a run whose tail
+    /// leaves the last group is refused rather than truncated. A caller
+    /// working in a `BlockBuffer` drops it uncommitted on that error.
+    fn group_chunks(&self, start: u64, len: u64) -> Result<Vec<(usize, u64, u64)>> {
+        let bpg = self.sb.blocks_per_group as u64;
+        let first_data = self.sb.first_data_block as u64;
+        let end = start.checked_add(len).ok_or(Error::InvalidBlock(start))?;
+        if start < first_data || bpg == 0 {
+            return Err(Error::InvalidBlock(start));
+        }
+        let mut chunks = Vec::new();
+        let mut at = start;
+        while at < end {
+            let gi = ((at - first_data) / bpg) as usize;
+            if gi >= self.groups.len() {
+                return Err(Error::InvalidBlock(at));
+            }
+            let group_start = first_data + gi as u64 * bpg;
+            let chunk = end.min(group_start + bpg) - at;
+            chunks.push((gi, at - group_start, chunk));
+            at += chunk;
+        }
+        Ok(chunks)
     }
 
     /// Rewrite the checksum of the group descriptor at `block[off..]` (group
@@ -4138,12 +4167,14 @@ impl Filesystem {
     /// SB updates are deliberately deferred so freeing a 1000-extent file
     /// produces 1 SB write instead of 1000.
     fn free_block_run_and_bgd(&self, start: u64, len: u64) -> Result<u64> {
-        self.free_block_run(start, len)?;
-        let bpg = self.sb.blocks_per_group as u64;
+        // One group at a time, as `free_block_run`'s contract requires; the
+        // run itself may cross a boundary (#118).
+        let chunks = self.group_chunks(start, len)?;
         let first_data = self.sb.first_data_block as u64;
-        let gi = ((start - first_data) / bpg) as usize;
-        if gi < self.groups.len() {
-            self.patch_bgd_counters(gi, len as i32, 0, 0)?;
+        let bpg = self.sb.blocks_per_group as u64;
+        for (gi, bit_start, chunk) in chunks {
+            self.free_block_run(first_data + gi as u64 * bpg + bit_start, chunk)?;
+            self.patch_bgd_counters(gi, chunk as i32, 0, 0)?;
         }
         Ok(len)
     }
@@ -5557,6 +5588,144 @@ impl Filesystem {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A freed run that crosses a group boundary credits each group its
+    /// own blocks and clears the second group's bits (#118).
+    ///
+    /// Witnessed by the descriptors and the second group's bitmap, not the
+    /// return value or the superblock delta: those are `len` before and
+    /// after the fix alike. Measured before it: group 1 credited 8 and
+    /// group 2 credited 0, its four bits left set. Skips without e2fsprogs.
+    #[test]
+    fn a_freed_run_across_a_group_boundary_credits_both_groups() {
+        let dir = std::env::temp_dir().join(format!("ext4-cross-group-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let img = dir.join("g.img");
+        std::fs::File::create(&img)
+            .unwrap()
+            .set_len(64 * 1024 * 1024)
+            .unwrap();
+        let Ok(made) = std::process::Command::new("mkfs.ext4")
+            .args([
+                "-q",
+                "-F",
+                "-b",
+                "4096",
+                "-g",
+                "4096",
+                "-O",
+                "^metadata_csum,^has_journal",
+            ])
+            .arg(&img)
+            .output()
+        else {
+            eprintln!("no mkfs.ext4 -- skipping");
+            return;
+        };
+        assert!(
+            made.status.success(),
+            "{}",
+            String::from_utf8_lossy(&made.stderr)
+        );
+        let path = img.to_str().unwrap().to_owned();
+        let mount = || {
+            Filesystem::mount(std::sync::Arc::new(
+                crate::block_io::FileDevice::open_rw(&path).unwrap(),
+            ))
+            .unwrap()
+        };
+        let boundary = 2 * 4096u64; // group 2 starts here
+        let bit_set = |fs: &Filesystem, gi: usize, bit: u64| {
+            let bm = fs.read_block(fs.groups[gi].block_bitmap).unwrap();
+            bm[(bit / 8) as usize] & (1 << (bit % 8)) != 0
+        };
+
+        // Four blocks either side of the boundary, allocated per group.
+        {
+            let fs = mount();
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            fs.buffer_mark_block_run_used(&mut buf, boundary - 4, 4)
+                .unwrap();
+            fs.buffer_mark_block_run_used(&mut buf, boundary, 4)
+                .unwrap();
+            fs.commit_block_buffer(buf).unwrap();
+        }
+        let (free1, free2) = {
+            let fs = mount();
+            assert!(
+                (0..4).all(|b| bit_set(&fs, 2, b)),
+                "fixture: group 2's run is allocated"
+            );
+            (
+                fs.groups[1].free_blocks_count,
+                fs.groups[2].free_blocks_count,
+            )
+        };
+
+        // One run across the boundary, as a merged extent frees it.
+        {
+            let fs = mount();
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            assert_eq!(
+                fs.buffer_free_block_run_and_bgd(&mut buf, boundary - 4, 8)
+                    .unwrap(),
+                8
+            );
+            fs.commit_block_buffer(buf).unwrap();
+        }
+        let fs = mount();
+        assert_eq!(
+            (
+                fs.groups[1].free_blocks_count - free1,
+                fs.groups[2].free_blocks_count - free2
+            ),
+            (4, 4),
+            "(group 1 credited, group 2 credited)"
+        );
+        assert!(
+            (0..4).all(|b| !bit_set(&fs, 2, b)),
+            "group 2's blocks are still marked allocated"
+        );
+        drop(fs);
+
+        // The same across the next boundary, through the direct-to-disk
+        // helper rather than the buffered one.
+        let boundary = 3 * 4096u64;
+        {
+            let fs = mount();
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            fs.buffer_mark_block_run_used(&mut buf, boundary - 4, 4)
+                .unwrap();
+            fs.buffer_mark_block_run_used(&mut buf, boundary, 4)
+                .unwrap();
+            fs.commit_block_buffer(buf).unwrap();
+        }
+        let (free2, free3) = {
+            let fs = mount();
+            (
+                fs.groups[2].free_blocks_count,
+                fs.groups[3].free_blocks_count,
+            )
+        };
+        {
+            let fs = mount();
+            assert_eq!(fs.free_block_run_and_bgd(boundary - 4, 8).unwrap(), 8);
+        }
+        let fs = mount();
+        assert_eq!(
+            (
+                fs.groups[2].free_blocks_count - free2,
+                fs.groups[3].free_blocks_count - free3
+            ),
+            (4, 4),
+            "direct path: (group 2 credited, group 3 credited)"
+        );
+        assert!(
+            (0..4).all(|b| !bit_set(&fs, 3, b)),
+            "direct path: group 3's blocks still allocated"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
     use crate::inode::{
         EXTRA_ISIZE_DEFAULT, INODE_SIZE_WITH_CRTIME, INODE_SIZE_WITH_EXTRA, OFF_ATIME, OFF_CRTIME,
         OFF_CTIME, OFF_EXTRA_ISIZE, OFF_GENERATION, OFF_MTIME,
