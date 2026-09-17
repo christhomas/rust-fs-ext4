@@ -28,6 +28,10 @@
 
 ### Fixed
 
+- Truncate refuses anything but a regular file. `apply_truncate_grow` and
+  `apply_truncate_shrink` set the size of a directory, symlink or device
+  node, leaving an inode e2fsck rejects. They now return `IsADirectory` for
+  a directory and `InvalidArgument` otherwise, as the kernel does (#253).
 - Replacing a file's content keeps its external xattr block in `i_blocks`.
   The count was set to the new data blocks alone, one block short for any
   file with an xattr block, on both the extent-mapped and block-mapped
