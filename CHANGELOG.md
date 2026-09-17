@@ -28,6 +28,17 @@
 
 ### Fixed
 
+- **A hole can be punched in a file whose extent tree is deeper than the
+  inode.** Punching wrote what survived back into the inode's four inline
+  entries and freed every node below, so a punch leaving more than four
+  extents was refused with `Corrupt("surviving entries exceed inline-root
+  capacity")` — which is every punch on a large file, the case a punch is
+  for. `extent_mut::plan_repack_tree` now packs the survivors into full
+  leaves and index levels over the blocks the file already holds: a punch's
+  survivors are a subset of its entries, so the layout never needs more
+  blocks than the tree has, and nothing is allocated inside an operation
+  whose job is to free. The nodes the layout no longer needs go back with the
+  data blocks (#258).
 - **A hole below the first entry of a deep extent tree reads as zeros.** The
   index descent kept the last entry at or below the block it was mapping and
   refused when there was none, which is every block before the first one a

@@ -495,6 +495,90 @@ fn build_inline_leaf_root(generation: u32, extents: &[Extent]) -> Vec<u8> {
     build_root(&header, extents, 60)
 }
 
+/// An extent tree laid out again over blocks the file already owns.
+pub struct RepackedTree {
+    /// The 60 bytes for the inode's `i_block`.
+    pub new_root: Vec<u8>,
+    /// Blocks to write, and what to write into them. The tail checksum is
+    /// the caller's, as everywhere else here.
+    pub block_writes: Vec<(u64, Vec<u8>)>,
+    /// The blocks from `nodes` that the layout used, in the order it used
+    /// them. Everything else in `nodes` is now unreferenced.
+    pub used_nodes: Vec<u64>,
+}
+
+/// Lay `entries` out again as a tree over `nodes`, packing every node full.
+///
+/// This is what a punch needs. The survivors of a punch are a subset of the
+/// entries the tree already held, so packing them takes no more nodes than
+/// the tree already has, and the blocks it does not use go back to free
+/// space. Nothing is allocated: a punch frees, and an allocation inside it
+/// would be a second thing that can fail.
+///
+/// Four or fewer entries need no nodes at all — they go in the inode, which
+/// is the case the punch path handled before (#258).
+///
+/// # Errors
+///
+/// [`Error::CorruptExtentTree`] if `nodes` runs out, which means the tree
+/// held fewer blocks than its own entries need.
+pub fn plan_repack_tree(
+    generation: u32,
+    entries: &[Extent],
+    block_size: u32,
+    nodes: &[u64],
+) -> Result<RepackedTree> {
+    let bs = block_size as usize;
+    let mut used_nodes: Vec<u64> = Vec::new();
+    let mut block_writes: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    if entries.len() <= 4 {
+        return Ok(RepackedTree {
+            new_root: build_inline_leaf_root(generation, entries),
+            block_writes,
+            used_nodes,
+        });
+    }
+
+    let mut supply = nodes.iter().copied();
+    let mut take = |used: &mut Vec<u64>| -> Result<u64> {
+        let block = supply.next().ok_or(Error::CorruptExtentTree(
+            "repacking the extent tree ran out of the blocks it already held",
+        ))?;
+        used.push(block);
+        Ok(block)
+    };
+
+    let cap = node_max_entries(bs) as usize;
+
+    // The leaves, each packed full, and the index entries naming them.
+    let mut indices: Vec<(u32, u64)> = Vec::new();
+    for chunk in entries.chunks(cap) {
+        let block = take(&mut used_nodes)?;
+        block_writes.push((block, build_full_leaf_block(generation, chunk, bs)));
+        indices.push((chunk[0].logical_block, block));
+    }
+
+    // Index levels, until what is left fits the inode's four entries.
+    let mut depth = 1u16;
+    while indices.len() > 4 {
+        let mut above: Vec<(u32, u64)> = Vec::new();
+        for chunk in indices.chunks(cap) {
+            let block = take(&mut used_nodes)?;
+            block_writes.push((block, build_full_index_block(generation, depth, chunk, bs)));
+            above.push((chunk[0].0, block));
+        }
+        indices = above;
+        depth += 1;
+    }
+
+    Ok(RepackedTree {
+        new_root: build_inline_index_root(generation, depth, &indices),
+        block_writes,
+        used_nodes,
+    })
+}
+
 /// Reject any insert whose logical range overlaps an existing leaf entry.
 fn check_no_overlap(entries: &[Extent], new: &Extent) -> Result<()> {
     let n_start = new.logical_block as u64;
