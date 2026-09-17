@@ -2,6 +2,20 @@
 
 ## [Unreleased]
 
+### Fixed
+
+- Journal transactions carry the checksums their journal declares. On a
+  `metadata_csum` filesystem every tag, descriptor, revoke and commit
+  checksum was written as zero, so Linux's recovery stopped at the commit
+  and a crash mid-operation was never repaired. A CSUM_V3 tag is also 16
+  bytes without 64-bit block numbers, as the kernel reads it.
+- Replay believes only a committed transaction whose checksums hold. A
+  torn commit or descriptor ends the log; a damaged data or revoke block
+  in a committed transaction refuses the replay. The tag after one
+  carrying a UUID is read where it is, and a journal declaring
+  `ASYNC_COMMIT`, `FAST_COMMIT` or an unknown incompat feature, or a block
+  size other than the filesystem's, is refused.
+
 ## [0.5.1] — 2026-09-06
 
 ### Fixed

@@ -112,7 +112,9 @@ fn synthetic_dirty_journal_round_trip() {
     }
     tx.add_write(target_fs_block, payload.clone())
         .expect("add_write");
-    let blocks = tx.commit().expect("commit");
+    // With the checksums the fixture's CSUM_V3 journal declares: replay
+    // takes a commit whose checksum fails for the end of the log (#81).
+    let blocks = tx.commit_for(&jsb).expect("commit");
     assert_eq!(blocks.len(), 3, "desc + data + commit");
 
     // Splice the three blocks into journal logical blocks 1, 2, 3
