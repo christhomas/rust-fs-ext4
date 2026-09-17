@@ -18,21 +18,13 @@
 //!
 //! Here a file is written one block every 16 blocks from logical block 16
 //! upward, so the tree is deeper than the inode and nothing covers block 0.
-//! e2fsprogs is required.
+//! `mkfs.ext4` and `e2fsck` judge it, from the harness VM they live in.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
+use fs_ext4_test_support::oracle;
 use std::sync::Arc;
-
-fn tool(name: &str) -> String {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or_else(|| panic!("{name} is not installed; install e2fsprogs"))
-}
 
 #[test]
 fn a_hole_below_the_first_index_entry_reads_as_zeros() {
@@ -40,11 +32,10 @@ fn a_hole_below_the_first_index_entry_reads_as_zeros() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(128 * 1024 * 1024))
         .unwrap();
-    let mkfs = Command::new(tool("mkfs.ext4"))
+    let mkfs = oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096"])
         .arg(&image)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         mkfs.status.success(),
         "{}",
@@ -100,10 +91,7 @@ fn a_hole_below_the_first_index_entry_reads_as_zeros() {
     assert!(buf.iter().all(|&b| b == 9), "{:?}", &buf[..8]);
     drop(fs);
 
-    let out = Command::new(tool("e2fsck"))
-        .args(["-fn", &image])
-        .output()
-        .unwrap();
+    let out = oracle("e2fsck").args(["-fn", &image]).output();
     assert!(
         out.status.success(),
         "e2fsck rejected the volume:\n{}",
