@@ -388,7 +388,9 @@ int fs_ext4_readlink(fs_ext4_fs_t *fs, const char *path,
  *
  * Returns: total bytes of output (names + NUL terminators) on success,
  *          -1 on error. If bufsize is less than the required size, writes
- *          as much as fits and still returns the required size.
+ *          as many WHOLE names as fit -- never part of one, which a caller
+ *          could not tell from a real name -- and still returns the
+ *          required size.
  */
 int64_t fs_ext4_listxattr(fs_ext4_fs_t *fs, const char *path,
                               char *buf, size_t bufsize);

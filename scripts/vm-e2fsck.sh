@@ -28,17 +28,35 @@ mkdir -p "$SHARE"
 
 # Stage copies rather than the originals: e2fsck is run with -n so it
 # does not write, but a fixture is not worth risking to prove that.
-staged=()
+#
+# EACH COPY IS NAMED BY THIS SCRIPT, NOT BY THE CALLER (#153). The name
+# goes into a command string the guest re-parses as root, so a basename
+# carrying `;` or `$(...)` ran there; and two inputs sharing a basename
+# (`a/test.img`, `b/test.img`) were staged over each other, so the second
+# check read the first image and passed a file it never looked at. A
+# name made of this process's id and the argument's position is unique
+# per input and holds nothing a shell would act on. The report still
+# names the path the caller passed.
 for img in "$@"; do
     [ -f "$img" ] || { echo "no such image: $img" >&2; exit 2; }
-    base="$(basename "$img")"
-    cp "$img" "$SHARE/$base"
-    staged+=("$base")
+done
+staged=()
+for i in $(seq 1 $#); do
+    staged+=("vm-e2fsck-$$-$i.img")
+done
+trap 'for name in "${staged[@]}"; do rm -f "$SHARE/$name"; done' EXIT
+i=0
+for img in "$@"; do
+    cp "$img" "$SHARE/${staged[$i]}"
+    i=$((i + 1))
 done
 
 rc=0
-for base in "${staged[@]}"; do
-    echo "############ e2fsck $base ############"
+i=0
+for img in "$@"; do
+    base="${staged[$i]}"
+    i=$((i + 1))
+    echo "############ e2fsck $img ############"
     # `-f` forces a full check even when the superblock says clean, and
     # `-n` answers no to every repair prompt, so this reports without
     # touching the image.
@@ -46,10 +64,6 @@ for base in "${staged[@]}"; do
         rc=1
     fi
     echo
-done
-
-for base in "${staged[@]}"; do
-    rm -f "$SHARE/$base"
 done
 
 if [ "$rc" -ne 0 ]; then

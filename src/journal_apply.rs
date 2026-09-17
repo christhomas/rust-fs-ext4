@@ -12,22 +12,21 @@
 //!                              ▼
 //!                   journal_apply::apply  ──▶ final-location disk writes
 //!
-//! Mount flow (when journal is dirty):
+//! Mount flow (when journal is dirty), in [`replay_if_dirty`]:
 //!
 //! ```text
-//!   1. Parse JBD2 superblock via jbd2::read_superblock.
-//!   2. If !is_clean() AND dev.is_writable():
-//!        plan = journal::walk(&fs, &jsb)?
-//!        journal_apply::apply(&fs, &plan)?
-//!        jbd2::mark_journal_clean(&fs, &jsb)?   // future E11 follow-up
-//!   3. Continue read-only mount.
+//!   1. A read-only device: return, replaying nothing.
+//!   2. Parse the JBD2 superblock via jbd2::read_superblock; clean: return.
+//!   3. Refuse a volume with a write-breaking INCOMPAT bit.
+//!   4. plan = journal::walk(&fs, &jsb)?; journal_apply::apply(&fs, &plan)?
+//!   5. The mount continues, read-write.
 //! ```
 //!
-//! Safety: we do NOT yet clear `jsb.start` after apply — that would signal
-//! "clean unmount" and kernel tools would skip replay. Leaving it set means
-//! replaying twice is a no-op (each write is idempotent), so it's safe to
-//! defer the start-field update to a future commit. The kernel itself
-//! tolerates repeated replays.
+//! Replay does not clear `jsb.start`. Nothing named `mark_journal_clean`
+//! exists: the journal is marked clean by the next transaction this driver
+//! commits (`journal_writer`, whose last step writes `start = 0`). Until
+//! then a remount replays the same transactions again, which is a no-op
+//! because each replayed write is idempotent (#90).
 
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;

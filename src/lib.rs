@@ -3,7 +3,8 @@
 //! Exposes a stable C ABI (`fs_ext4_*`) via [`capi`] so FFI consumers
 //! (Swift/C/Go/…) can link `libfs_ext4.a` and `#include "fs_ext4.h"`.
 //!
-//! Architecture (read-only Phase 1):
+//! Architecture (reading; the write path is in [`fs`], [`alloc`],
+//! [`journal_writer`] and the `*_mut` modules):
 //! - [`block_io`] — abstract trait for reading device blocks
 //! - [`superblock`] — parse + validate the on-disk superblock
 //! - [`features`] — feature flag inventory (COMPAT/INCOMPAT/RO_COMPAT)

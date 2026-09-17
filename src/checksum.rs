@@ -19,10 +19,15 @@
 //!   - [`Checksummer::seed`] — derived once at mount time
 //!   - [`Checksummer::superblock`], [`Checksummer::inode`], etc.
 //!
-//! Phase 1: read-only verification. We do NOT recompute checksums on writes
-//! (no writes yet). Verification is currently INFORMATIONAL — corrupt
-//! metadata would still parse; this module just lets callers decide whether
-//! to trust the result.
+//! Verification is enforced, not informational. A superblock or group
+//! descriptor whose checksum does not match aborts the mount with
+//! `Error::BadChecksum`, as does an inode read through
+//! `Filesystem::read_inode_verified`, and extent and directory blocks are
+//! checked as they are read. Every write recomputes the checksums of what it
+//! rewrites -- inodes in `finalize_inode_raw`, group descriptors and the
+//! superblock in `buffer_patch_bgd_counters` / `buffer_patch_sb_counters`,
+//! and the tails of directory and extent blocks -- so a new write path that
+//! rewrites a metadata block must recompute its checksum too (#90).
 
 use crate::features::{Incompat, RoCompat};
 use crate::superblock::Superblock;
@@ -256,6 +261,60 @@ impl Checksummer {
         c = linux_crc32c(c, &generation.to_le_bytes());
         c = linux_crc32c(c, &block[..end - 12]);
         block[end - 4..end].copy_from_slice(&c.to_le_bytes());
+        true
+    }
+
+    /// Whether an htree block's `dx_tail` checksum is the one its contents
+    /// give: `Some(true)` or `Some(false)`, or `None` when checksums are off
+    /// or the count/limit pair leaves no room for a tail to check.
+    ///
+    /// The same computation as [`Checksummer::patch_dx_tail`], compared
+    /// rather than written.
+    pub fn verify_dx_tail(
+        &self,
+        ino: u32,
+        generation: u32,
+        block: &[u8],
+        count_offset: usize,
+    ) -> Option<bool> {
+        let mut copy = block.to_vec();
+        if !self.patch_dx_tail(ino, generation, &mut copy, count_offset) {
+            return None;
+        }
+        Some(copy == block)
+    }
+
+    /// Recompute the checksum in an htree block's `dx_tail`.
+    ///
+    /// The kernel's `ext4_dx_csum`: crc32c over the inode number and
+    /// generation, the block up to the last used `dx_entry`, and the tail's
+    /// reserved word, with the checksum field itself counted as zero. The
+    /// tail sits right after `limit` entries. `count_offset` is where the
+    /// count/limit pair starts: 32 in a `dx_root`, 8 in an interior node.
+    /// Returns `false` (and writes nothing) when checksums are off or the
+    /// count/limit pair does not leave room for a tail in this block.
+    pub fn patch_dx_tail(
+        &self,
+        ino: u32,
+        generation: u32,
+        block: &mut [u8],
+        count_offset: usize,
+    ) -> bool {
+        if !self.enabled || block.len() < count_offset + 4 {
+            return false;
+        }
+        let limit = u16::from_le_bytes([block[count_offset], block[count_offset + 1]]) as usize;
+        let count = u16::from_le_bytes([block[count_offset + 2], block[count_offset + 3]]) as usize;
+        let tail = count_offset + limit * 8;
+        if count > limit || tail + 8 > block.len() {
+            return false;
+        }
+        let mut c = linux_crc32c(self.seed, &ino.to_le_bytes());
+        c = linux_crc32c(c, &generation.to_le_bytes());
+        c = linux_crc32c(c, &block[..count_offset + count * 8]);
+        c = linux_crc32c(c, &block[tail..tail + 4]);
+        c = linux_crc32c(c, &[0; 4]);
+        block[tail + 4..tail + 8].copy_from_slice(&c.to_le_bytes());
         true
     }
 
