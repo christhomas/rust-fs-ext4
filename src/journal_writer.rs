@@ -76,6 +76,27 @@ pub struct JournalWriter {
     blocks_count: u64,
 }
 
+/// Whether a journal of `max_len` blocks fits both its inode and the device.
+fn journal_len_fits(
+    max_len: u32,
+    inode_size: u64,
+    block_size: u32,
+    device_bytes: u64,
+) -> Result<()> {
+    let block_size = u64::from(block_size.max(1));
+    if u64::from(max_len) > inode_size / block_size {
+        return Err(Error::Corrupt(
+            "journal declares more blocks than its inode holds",
+        ));
+    }
+    if u64::from(max_len) > device_bytes / block_size {
+        return Err(Error::Corrupt(
+            "journal declares more blocks than the device holds",
+        ));
+    }
+    Ok(())
+}
+
 impl JournalWriter {
     /// Open the writer for a mounted filesystem.
     ///
@@ -111,6 +132,13 @@ impl JournalWriter {
                 "journal declares more blocks than the filesystem holds",
             ));
         }
+        // `s_blocks_count` is a raw field too, so the bound above is only as
+        // good as the image (#182). Two that are not the superblock's to
+        // choose: the journal inode's own length, which is the check the
+        // kernel makes ("journal file too short"), and the device, which a
+        // journal on it cannot outgrow. `i_size` is raw as well; the device
+        // bound is the one that caps the reservation below.
+        journal_len_fits(jsb.max_len, jinode.size, bs, fs.dev.size_bytes())?;
         let mut physical_map = Vec::with_capacity(jsb.max_len as usize);
         for logical in 0..jsb.max_len as u64 {
             let phys = crate::indirect::map_logical_any(
@@ -304,6 +332,18 @@ mod tests {
     use crate::block_io::FileDevice;
     use std::fs;
     use std::sync::Arc;
+
+    #[test]
+    fn a_journal_must_fit_its_inode_and_the_device() {
+        // 8 blocks in the inode, 16 on the device.
+        assert!(journal_len_fits(8, 8 * 4096, 4096, 16 * 4096).is_ok());
+        assert!(journal_len_fits(9, 8 * 4096, 4096, 16 * 4096).is_err());
+        // An inode claiming more than the device holds does not raise the
+        // device's ceiling.
+        assert!(journal_len_fits(17, u64::MAX, 4096, 16 * 4096).is_err());
+        assert!(journal_len_fits(16, u64::MAX, 4096, 16 * 4096).is_ok());
+        assert!(journal_len_fits(u32::MAX, u64::MAX, 4096, 64 << 20).is_err());
+    }
 
     fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
         use std::sync::atomic::{AtomicU32, Ordering};

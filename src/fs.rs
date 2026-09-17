@@ -5709,6 +5709,51 @@ mod tests {
         let _ = std::fs::remove_file(&image);
     }
 
+    /// fsck repair is a write, and refuses what every other write refuses
+    /// (#119).
+    ///
+    /// The repair gate checked only that the device was writable. The
+    /// control is the point: the same volume, in the same process, refuses
+    /// a create, and an audit without repair still runs.
+    #[test]
+    fn fsck_repair_refuses_a_volume_whose_features_refuse_writes() {
+        let dev = formatted();
+        let mut sb = vec![0u8; 1024];
+        dev.read_at(crate::superblock::SUPERBLOCK_OFFSET, &mut sb)
+            .unwrap();
+        let cur = u32::from_le_bytes(sb[0x64..0x68].try_into().unwrap());
+        let quota = crate::features::RoCompat::QUOTA.bits();
+        sb[0x64..0x68].copy_from_slice(&(cur | quota).to_le_bytes());
+        let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        dev.write_at(crate::superblock::SUPERBLOCK_OFFSET, &sb)
+            .unwrap();
+
+        let fs = mount(&dev);
+        assert!(
+            matches!(
+                fs.apply_create("/x", 0o644),
+                Err(Error::UnsupportedRoCompat(_))
+            ),
+            "control: an ordinary write is refused on this volume"
+        );
+        fs.audit_repair(u32::MAX, u32::MAX, false)
+            .expect("an audit without repair still runs");
+        match fs.audit_repair(u32::MAX, u32::MAX, true) {
+            Err(Error::UnsupportedRoCompat(bits)) => assert_eq!(bits & quota, quota),
+            other => panic!("repair must be refused, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// And an ordinary volume still repairs.
+    #[test]
+    fn fsck_repair_still_runs_on_an_ordinary_volume() {
+        let dev = formatted();
+        let fs = mount(&dev);
+        fs.audit_repair(u32::MAX, u32::MAX, true)
+            .expect("repair on an ordinary volume");
+    }
+
     /// A CASEFOLD volume must not be mounted writable.
     ///
     /// The kernel files a directory entry into the htree leaf that the
@@ -6040,14 +6085,15 @@ mod tests {
 
     /// THE OTHER DOOR. `get_resolved` is the single-attribute entry
     /// point and `read_all_resolved` is the list-all one, and they are
-    /// separate functions with separate resolution — `capi.rs` reaches
-    /// the first from `fs_ext4_getxattr` and the second from
-    /// `fs_ext4_listxattr`.
+    /// separate functions with separate resolution. `capi.rs` reaches the
+    /// first from `fs_ext4_getxattr`; `fs_ext4_listxattr` returns names
+    /// only and uses `list_names`, which resolves nothing (#122).
     ///
-    /// A consumer enumerating attributes rather than asking for one by
-    /// name goes through the list-all path, so leaving it unresolved
-    /// hands back an empty value with a success return: the same failure
-    /// this issue is about, through a different door.
+    /// A Rust consumer enumerating attributes WITH their values rather
+    /// than asking for one by name goes through the list-all path, so
+    /// leaving it unresolved hands back an empty value with a success
+    /// return: the same failure this issue is about, through a different
+    /// door.
     #[test]
     fn the_list_all_path_resolves_an_ea_inode_value_too() {
         let (dev, real) = ea_inode_volume();
@@ -6071,6 +6117,68 @@ mod tests {
             "the value was read from e_value_offs instead of from the EA inode"
         );
         assert_eq!(e.value, real, "the value must be the EA inode's file body");
+    }
+
+    /// A names-only listing does not read values, so a value that cannot be
+    /// read does not fail it (#122).
+    ///
+    /// `fs_ext4_listxattr` resolved every EA-inode value and discarded it,
+    /// and one unreadable value turned the whole listing into -1. Here the
+    /// attribute points at an inode WITHOUT the EA_INODE flag, which
+    /// `read_value_inode` refuses: resolving values fails (the control),
+    /// and listing names still names it.
+    #[test]
+    fn listing_names_does_not_read_an_unreadable_ea_inode_value() {
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            fs.apply_create("/subject.txt", 0o644).expect("create");
+            let not_ea = fs.apply_create("/plain.bin", 0o644).expect("create");
+            let subject = resolve(&fs, "/subject.txt").expect("resolve");
+            plant_ea_inode_xattr(&fs, subject, "user.big", not_ea, &DECOY);
+        }
+        let fs = mount(&dev);
+        let ino = resolve(&fs, "/subject.txt").expect("resolve");
+        let (inode, raw) = fs.read_inode_verified(ino).expect("read inode");
+
+        assert!(
+            crate::xattr::read_all_resolved(&fs, &inode, &raw).is_err(),
+            "control: the value behind this attribute cannot be read"
+        );
+        let names =
+            crate::xattr::list_names(&fs, &inode, &raw).expect("listing names needs no value");
+        assert!(names.iter().any(|n| n == "user.big"), "{names:?}");
+        drop(fs);
+
+        // And through the door the bug was reported at: the C entry point
+        // must report the size, then write the name, instead of -1.
+        let image =
+            fs_ext4_test_support::temp_path!("fs_ext4_listxattr_{}.img", std::process::id());
+        std::fs::write(&image, &*dev.bytes.lock().unwrap()).expect("write image");
+        let c_image = std::ffi::CString::new(image.clone()).unwrap();
+        let c_path = std::ffi::CString::new("/subject.txt").unwrap();
+        unsafe {
+            let handle = crate::capi::fs_ext4_mount(c_image.as_ptr());
+            assert!(!handle.is_null(), "C mount");
+            let needed =
+                crate::capi::fs_ext4_listxattr(handle, c_path.as_ptr(), std::ptr::null_mut(), 0);
+            assert!(needed > 0, "the probe returned {needed}");
+            let mut buf = vec![0u8; needed as usize];
+            let wrote = crate::capi::fs_ext4_listxattr(
+                handle,
+                c_path.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            );
+            assert_eq!(wrote, needed);
+            assert!(
+                buf.split(|&b| b == 0).any(|n| n == b"user.big"),
+                "{:?}",
+                String::from_utf8_lossy(&buf)
+            );
+            crate::capi::fs_ext4_umount(handle);
+        }
+        let _ = std::fs::remove_file(&image);
     }
 
     /// The buffer-level parser cannot follow the pointer — it has no

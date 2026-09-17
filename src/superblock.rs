@@ -407,14 +407,36 @@ impl Superblock {
         classic_sparse_super(g)
     }
 
+    /// Whether directory names are hashed as unsigned bytes: `s_flags`
+    /// (0x160) carries `EXT2_FLAGS_UNSIGNED_HASH` (0x2). See
+    /// [`crate::hash::effective_version`].
+    pub fn unsigned_hash(&self) -> bool {
+        self.raw
+            .get(0x160..0x164)
+            .is_some_and(|f| u32::from_le_bytes(f.try_into().unwrap()) & 0x2 != 0)
+    }
+
     /// Block size in bytes: 1024 << log_block_size.
     pub fn block_size(&self) -> u32 {
         1024u32 << self.log_block_size
     }
 
     /// Number of block groups.
+    ///
+    /// Counted from `s_first_data_block`, as the kernel's `ext4_fill_super`
+    /// does: on a 1 KiB-block filesystem block 0 is the boot block and the
+    /// groups start at block 1. Dividing the whole of `s_blocks_count`
+    /// gave one group too many whenever it was one past a multiple of
+    /// `s_blocks_per_group`, and the phantom group's descriptor -- zeros --
+    /// failed its checksum and refused a volume Linux mounts (#86). The
+    /// rest of the crate (`alloc::blocks_in_group`, the block-to-group
+    /// mapping) already subtracted it.
     pub fn block_group_count(&self) -> u64 {
-        self.blocks_count.div_ceil(self.blocks_per_group as u64)
+        group_count(
+            self.blocks_count,
+            self.first_data_block,
+            self.blocks_per_group,
+        )
     }
 
     /// Whether the 64BIT incompat feature is enabled.
@@ -511,5 +533,40 @@ mod backup_layout_tests {
             sb_with(0, RoCompat::SPARSE_SUPER.bits(), [0, 0], 0).reserved_gdt_blocks,
             0
         );
+    }
+}
+
+/// `ceil((blocks_count - first_data_block) / blocks_per_group)`, the
+/// kernel's group count; see [`Superblock::block_group_count`].
+pub fn group_count(blocks_count: u64, first_data_block: u32, blocks_per_group: u32) -> u64 {
+    blocks_count
+        .saturating_sub(u64::from(first_data_block))
+        .div_ceil(u64::from(blocks_per_group).max(1))
+}
+
+#[cfg(test)]
+mod group_count_tests {
+    use super::group_count;
+
+    /// Against the kernel's arithmetic, including the 1 KiB geometries
+    /// one block past a multiple of the group size, where dividing the
+    /// whole block count gave one group too many (#86).
+    #[test]
+    fn the_group_count_starts_at_the_first_data_block() {
+        for (blocks, first, bpg, groups) in [
+            (16385u64, 1u32, 8192u32, 2u64),
+            (16384, 1, 8192, 2),
+            (24577, 1, 8192, 3),
+            (8193, 1, 8192, 1),
+            (16385, 0, 8192, 3),
+            (32768, 0, 32768, 1),
+            (32769, 0, 32768, 2),
+        ] {
+            assert_eq!(
+                group_count(blocks, first, bpg),
+                groups,
+                "blocks={blocks} first_data_block={first} blocks_per_group={bpg}"
+            );
+        }
     }
 }
