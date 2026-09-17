@@ -271,22 +271,37 @@ pub fn lookup_verified(
         }
 
         // Internal: find the largest index entry whose ei_block <= logical_block.
+        //
+        // OR THE FIRST ONE, when the block is below all of them. That is a
+        // hole in front of the file's first data, and the leaf below the
+        // first index says so by holding no extent that contains it. Refusing
+        // here instead called a sound filesystem corrupt, and made every
+        // sparse file whose data starts past block 0 unreadable at its
+        // leading hole (#260). It is what `ext4_ext_binsearch_idx` does: the
+        // path is left at `EXT_FIRST_INDEX` when the search runs off the
+        // front.
         let mut chosen_idx: Option<ExtentIdx> = None;
+        let mut first_idx: Option<ExtentIdx> = None;
         for i in 0..header.entries {
             let off = EXT4_EXT_NODE_SIZE * (1 + i as usize);
             if off + EXT4_EXT_NODE_SIZE > cursor.len() {
                 return Err(Error::CorruptExtentTree("index entry out of range"));
             }
             let idx = ExtentIdx::parse(&cursor[off..off + EXT4_EXT_NODE_SIZE])?;
+            if first_idx.is_none() {
+                first_idx = Some(idx);
+            }
             if (idx.logical_block as u64) <= logical_block {
                 chosen_idx = Some(idx);
             } else {
                 break;
             }
         }
-        let idx = chosen_idx.ok_or(Error::CorruptExtentTree(
-            "no index entry covers logical block",
-        ))?;
+        // An index node with no entries at all is corrupt: there is nothing
+        // below it to descend into.
+        let idx = chosen_idx
+            .or(first_idx)
+            .ok_or(Error::CorruptExtentTree("index node holds no entries"))?;
 
         // Read the child block, parse its header, continue loop.
         let mut buf = vec![0u8; block_size as usize];

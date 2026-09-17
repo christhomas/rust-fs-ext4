@@ -28,6 +28,14 @@
 
 ### Fixed
 
+- **A hole below the first entry of a deep extent tree reads as zeros.** The
+  index descent kept the last entry at or below the block it was mapping and
+  refused when there was none, which is every block before the first one a
+  sparse file holds. An ordinary file whose data starts past block 0 was
+  therefore unreadable at its leading hole, and the error called the extent
+  tree corrupt on a volume `e2fsck` accepts. The descent now falls back to
+  the first index entry, as `ext4_ext_binsearch_idx` does, and the leaf below
+  it reports the hole (#260).
 - A directory the kernel indexed takes creates and unlinks. When the kernel
   turns a directory into an htree it keeps the old dirent tail's bytes in
   the root's `dt_reserved`, so the root ends in what looks like a dirent
