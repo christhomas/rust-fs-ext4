@@ -76,29 +76,50 @@ fn lwext4_cross_validate_skips_when_lwext4_dir_unset() {
 
 #[test]
 fn lwext4_cross_validate_each_test_image() {
-    let Some(_dir) = lwext4_dir() else {
-        eprintln!("[lwext4_cross_validate] SKIP (no LWEXT4_DIR)");
-        return;
-    };
-    // FUTURE WORK (tracked in scripts/cross-validate-lwext4.sh):
-    //
-    // 1. Iterate `test-disks/ext*.img` and any LWEXT4_VALIDATE_IMAGE override.
-    // 2. For each: spawn lwext4's CLI demo as a subprocess, capture its
-    //    listing + per-file content hashes.
-    // 3. Mount via Filesystem::mount, do the same.
-    // 4. assert_eq! on (path → sha256(content)) maps. Any divergence is a
-    //    test failure naming the divergent path.
-    //
-    // The demo binary's exact name + arg format depends on the lwext4
-    // build flavor (`generic` vs `xilinx`); the script normalizes this
-    // before invoking the test. Once that's settled and we've captured
-    // a working invocation in the script, this body fills in.
-    //
-    // Until then this test passes (intentionally) — it serves as the
-    // hook the script plugs into so the integration is incremental, not
-    // big-bang.
-    eprintln!(
-        "[lwext4_cross_validate] env detected; full diff harness pending. \
-         Update this body when lwext4 demo binary's invocation is settled."
+    match lwext4_dir() {
+        None => eprintln!("[lwext4_cross_validate] SKIP (no LWEXT4_DIR)"),
+        Some(dir) => cross_validate_each_test_image(&dir),
+    }
+}
+
+/// The comparison, when a built lwext4 tree is present.
+///
+/// NOT WRITTEN YET, AND SAYS SO BY FAILING (#99). This body was a comment
+/// and a success, so enabling the harness -- setting `LWEXT4_DIR`, which
+/// is all `scripts/cross-validate-lwext4.sh` does -- turned a skip that
+/// nobody believed was validation into a pass that looked like one.
+/// Until it iterates `test-disks/ext*.img`, reads every file through
+/// both drivers and compares (path -> size, mode, sha256), asking for it
+/// is an error.
+///
+/// What it has to do, when it is written:
+///
+/// 1. Iterate `test-disks/ext*.img` and any `LWEXT4_VALIDATE_IMAGE`.
+/// 2. For each, run lwext4 over it (its demo binary, or a thin C
+///    wrapper) and capture a listing with per-file content hashes.
+/// 3. Mount the same image with `Filesystem::mount` and do the same.
+/// 4. Compare the two maps; a divergence fails naming the path.
+fn cross_validate_each_test_image(dir: &std::path::Path) {
+    panic!(
+        "[lwext4_cross_validate] LWEXT4_DIR is set ({}), but the lwext4 comparison is not \
+         implemented: this would report success having compared nothing. See #99.",
+        dir.display()
     );
+}
+
+/// Enabling the harness fails while it has nothing to compare, so a CI
+/// lane that sets `LWEXT4_DIR` cannot go green on an empty body.
+#[test]
+fn enabling_the_harness_fails_until_it_compares_something() {
+    let fake = std::env::temp_dir().join(format!("lwext4-fake-{}", std::process::id()));
+    std::fs::create_dir_all(fake.join("build_generic/src")).unwrap();
+    std::fs::write(fake.join("build_generic/src/liblwext4.a"), b"").unwrap();
+    let outcome = std::panic::catch_unwind(|| cross_validate_each_test_image(&fake));
+    let _ = std::fs::remove_dir_all(&fake);
+    let message = outcome
+        .expect_err("an enabled harness with no comparison reported success")
+        .downcast::<String>()
+        .map(|m| *m)
+        .unwrap_or_default();
+    assert!(message.contains("not implemented"), "{message}");
 }
