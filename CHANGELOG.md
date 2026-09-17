@@ -28,6 +28,10 @@
 
 ### Fixed
 
+- Replacing a file's content keeps its external xattr block in `i_blocks`.
+  The count was set to the new data blocks alone, one block short for any
+  file with an xattr block, on both the extent-mapped and block-mapped
+  paths (#251).
 - A write into a preallocated range lands in the preallocated blocks.
   `apply_pwrite` took an uninitialized extent, which reads as zeros, for a
   hole, and was refused inserting a fresh extent over it as a corrupt
