@@ -15,7 +15,8 @@
 //! Mount flow (when journal is dirty), in [`replay_if_dirty`]:
 //!
 //! ```text
-//!   1. A read-only device: return, replaying nothing.
+//!   1. A read-only device: return, replaying nothing here. Mount replays
+//!      into the buffer cache instead ([`replay_into_cache`], #72).
 //!   2. Parse the JBD2 superblock via jbd2::read_superblock; clean: clear a
 //!      leftover needs_recovery and return.
 //!   3. Refuse a volume with a write-breaking INCOMPAT bit.
@@ -179,8 +180,6 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
         ));
     }
 
-    let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
-    let jinode = Inode::parse(&raw)?;
     let block_size = fs.sb.block_size() as u64;
 
     // EVERY ENTRY IS RESOLVED BEFORE ANY IS WRITTEN. Checked inside the
@@ -191,15 +190,7 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
     // Source: journal_block is a logical block inside the journal inode,
     // resolved to a physical fs block via the extent tree. Destination:
     // fs_block, bounds-checked against the filesystem and the device.
-    let resolved = plan
-        .writes
-        .iter()
-        .map(|w| {
-            let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
-                .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
-            Ok((byte_offset_of(fs, phys)?, byte_offset_of(fs, w.fs_block)?))
-        })
-        .collect::<Result<Vec<(u64, u64)>>>()?;
+    let resolved = resolve(fs, plan)?;
 
     let mut applied = 0usize;
     for (w, &(source, destination)) in plan.writes.iter().zip(&resolved) {
@@ -226,18 +217,75 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
     Ok(applied)
 }
 
+/// Replay a dirty journal into the device's buffer cache, writing nothing
+/// (#72).
+///
+/// A transaction in a dirty journal is committed: the filesystem told its
+/// caller the change was durable and had not yet checkpointed it. A
+/// read-only mount that skipped replay read the superseded metadata and
+/// reported it as fact. This walks the journal exactly as
+/// [`replay_if_dirty`] does, with every refusal the walk makes, and pins
+/// each replayed block's bytes in the cache (`populate_cache`) instead of
+/// writing them, so reads see the committed state and the device stays
+/// untouched.
+///
+/// Returns the number of blocks pinned: 0 for a clean journal or none.
+pub fn replay_into_cache(fs: &Filesystem) -> Result<usize> {
+    let Some(jsb) = jbd2::read_superblock(fs)? else {
+        return Ok(0);
+    };
+    if jsb.is_clean() {
+        return Ok(0);
+    }
+    let plan = crate::journal::walk(fs, &jsb)?;
+    if plan.writes.is_empty() {
+        return Ok(0);
+    }
+    let block_size = fs.sb.block_size() as u64;
+    let resolved = resolve(fs, &plan)?;
+    // Read every source before pinning any, so a failed read leaves the
+    // cache as it was rather than half replayed.
+    let mut blocks = Vec::with_capacity(plan.writes.len());
+    for (w, &(source, _)) in plan.writes.iter().zip(&resolved) {
+        let mut buf = vec![0u8; block_size as usize];
+        fs.dev.read_at(source, &mut buf)?;
+        if w.flags & crate::journal::TAG_ESCAPED != 0 {
+            buf[0..4].copy_from_slice(&crate::jbd2::JBD2_MAGIC_NUMBER.to_be_bytes());
+        }
+        blocks.push((w.fs_block, buf));
+    }
+    // In log order, so a block a later transaction rewrote ends with its
+    // later bytes.
+    let n = blocks.len();
+    for (block, bytes) in blocks {
+        fs.dev.populate_cache(block, bytes);
+    }
+    Ok(n)
+}
+
+/// Each entry's journal source and filesystem destination as device byte
+/// offsets, or the refusal for the first that has none.
+fn resolve(fs: &Filesystem, plan: &ReplayPlan) -> Result<Vec<(u64, u64)>> {
+    let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
+    let jinode = Inode::parse(&raw)?;
+    plan.writes
+        .iter()
+        .map(|w| {
+            let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
+                .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
+            Ok((byte_offset_of(fs, phys)?, byte_offset_of(fs, w.fs_block)?))
+        })
+        .collect()
+}
+
 /// Convenience: mount-time entry point. Reads the journal superblock and,
 /// if the journal is dirty AND the device is writable, walks + applies in
 /// one shot. Returns the number of blocks replayed (0 if clean or device
 /// is read-only — the latter is not an error; mount proceeds read-only).
 pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
-    // Read-only mounts skip replay regardless of journal state — the read
-    // path tolerates a non-clean journal (pending transactions are
-    // invisible, which is correct for a read-only view of a dirty image).
-    // Checking this BEFORE `read_superblock` matters for ext3: the journal
-    // inode's i_block holds legacy indirect pointers, and the deeper code
-    // currently bails on non-extent journals. RO mounts have no business
-    // touching the journal at all, so we exit early here.
+    // A read-only device cannot take a replay. Mount replays a dirty
+    // journal into the cache instead (`replay_into_cache`, #72); this entry
+    // point is the one that writes.
     if !fs.dev.is_writable() {
         return Ok(0);
     }

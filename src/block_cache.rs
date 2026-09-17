@@ -190,8 +190,27 @@ impl BlockDevice for CachedDevice {
             return Ok(());
         }
 
-        // Multi-block read (rare): bypass the cache, pass through.
-        self.inner.read_at(offset, buf)
+        // Multi-block read (rare): pass through, then lay any pinned
+        // blocks over it. Pinned bytes are not on disk yet, and the group
+        // descriptor table -- read this way -- is exactly what a journal
+        // replayed into the cache pins (#72). Clean entries match disk.
+        self.inner.read_at(offset, buf)?;
+        let state = self.state.lock().expect("cache mutex poisoned");
+        if state.pinned.is_empty() {
+            return Ok(());
+        }
+        let end = offset + len as u64;
+        for block in offset / bs..end.div_ceil(bs) {
+            let Some(img) = state.pinned.get(&block) else {
+                continue;
+            };
+            let block_start = block * bs;
+            let from = offset.max(block_start);
+            let to = end.min(block_start + bs);
+            buf[(from - offset) as usize..(to - offset) as usize]
+                .copy_from_slice(&img[(from - block_start) as usize..(to - block_start) as usize]);
+        }
+        Ok(())
     }
 
     fn size_bytes(&self) -> u64 {
@@ -331,6 +350,22 @@ mod tests {
         fn is_writable(&self) -> bool {
             self.writable
         }
+    }
+
+    /// A read spanning several blocks sees the pinned ones. It went straight
+    /// to the device, so a group descriptor table longer than a block read
+    /// the on-disk descriptors under a journal replayed into the cache (#72).
+    #[test]
+    fn a_multi_block_read_sees_pinned_blocks() {
+        let inner = CountingDevice::new(4096 * 16, false);
+        let cached = CachedDevice::new(inner.clone(), 4096, 8);
+        cached.populate_cache(3, vec![0xBBu8; 4096]);
+        // From the middle of block 2 to the middle of block 4.
+        let mut buf = vec![0u8; 8192];
+        cached.read_at(2 * 4096 + 2048, &mut buf).unwrap();
+        assert_eq!(&buf[..2048], &[0u8; 2048][..], "block 2 is the device's");
+        assert_eq!(&buf[2048..6144], &[0xBBu8; 4096][..], "block 3 is pinned");
+        assert_eq!(&buf[6144..], &[0u8; 2048][..], "block 4 is the device's");
     }
 
     #[test]
