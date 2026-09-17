@@ -1746,12 +1746,8 @@ impl Filesystem {
             BgdUninitFlag::Block => BLOCK_UNINIT,
         };
 
-        let bs = self.sb.block_size() as u64;
-        let desc_size = self.sb.desc_size as u64;
-        let bgt_first_block = self.sb.first_data_block as u64 + 1;
-        let byte_in_bgt = gi as u64 * desc_size;
-        let bgt_block = bgt_first_block + byte_in_bgt / bs;
-        let off = (byte_in_bgt % bs) as usize;
+        // Where the descriptor lives, META_BG or not (#73).
+        let (bgt_block, off) = self.sb.descriptor_location(gi as u64);
 
         let block = buf.get_mut(self, bgt_block)?;
         let flags_off = off + 0x12;
@@ -1855,6 +1851,15 @@ impl Filesystem {
                     }
                 }
             }
+            // Bits past the group's last block are set, as the kernel's
+            // `ext4_mark_bitmap_end` sets them: e2fsck reports "Padding at
+            // end of block bitmap is not set" otherwise. Every group whose
+            // blocks_per_group is under the bitmap block's 8 * block_size
+            // bits has some, and a short last group more.
+            let in_group = u64::from(crate::alloc::blocks_in_group(&self.sb, gi as u32));
+            for bit in in_group..(bm.len() as u64 * 8) {
+                bm[(bit / 8) as usize] |= 1u8 << (bit % 8);
+            }
         }
         for i in 0..len {
             let bit = bit_start as u64 + i;
@@ -1903,12 +1908,9 @@ impl Filesystem {
             crate::checksum::linux_crc32c(self.csum.seed, &bm[..end])
         };
 
-        let bs = self.sb.block_size() as u64;
         let desc_size = self.sb.desc_size as u64;
-        let bgt_first_block = self.sb.first_data_block as u64 + 1;
-        let byte_in_bgt = gi as u64 * desc_size;
-        let bgt_block = bgt_first_block + byte_in_bgt / bs;
-        let off = (byte_in_bgt % bs) as usize;
+        // Where the descriptor lives, META_BG or not (#73).
+        let (bgt_block, off) = self.sb.descriptor_location(gi as u64);
         let has_hi = desc_size >= 0x40;
         let block = buf.get_mut(self, bgt_block)?;
         block[off + lo_off..off + lo_off + 2]
@@ -2010,12 +2012,9 @@ impl Filesystem {
         // the change stands alone; the following counter patch recomputes it
         // again harmlessly.
         let floor = ipg.saturating_sub(bit as u32 + 1);
-        let bs = self.sb.block_size() as u64;
         let desc_size = self.sb.desc_size as u64;
-        let bgt_first_block = self.sb.first_data_block as u64 + 1;
-        let byte_in_bgt = gi as u64 * desc_size;
-        let bgt_block = bgt_first_block + byte_in_bgt / bs;
-        let off = (byte_in_bgt % bs) as usize;
+        // Where the descriptor lives, META_BG or not (#73).
+        let (bgt_block, off) = self.sb.descriptor_location(gi as u64);
         let has_hi = desc_size >= 0x40;
         let block = buf.get_mut(self, bgt_block)?;
         let cur_lo = u16::from_le_bytes(block[off + 0x1C..off + 0x1E].try_into().unwrap()) as u32;
@@ -2047,12 +2046,9 @@ impl Filesystem {
         free_inodes_delta: i32,
         used_dirs_delta: i32,
     ) -> Result<()> {
-        let bs = self.sb.block_size() as u64;
         let desc_size = self.sb.desc_size as u64;
-        let bgt_first_block = self.sb.first_data_block as u64 + 1;
-        let byte_in_bgt = gi as u64 * desc_size;
-        let bgt_block = bgt_first_block + byte_in_bgt / bs;
-        let off_in_block = (byte_in_bgt % bs) as usize;
+        // Where the descriptor lives, META_BG or not (#73).
+        let (bgt_block, off_in_block) = self.sb.descriptor_location(gi as u64);
 
         let block = buf.get_mut(self, bgt_block)?;
         patch_counter_u32(
@@ -4424,10 +4420,8 @@ impl Filesystem {
     ) -> Result<()> {
         let bs = self.sb.block_size() as u64;
         let desc_size = self.sb.desc_size as u64;
-        let bgt_first_block = self.sb.first_data_block as u64 + 1;
-        let byte_in_bgt = gi as u64 * desc_size;
-        let bgt_block = bgt_first_block + byte_in_bgt / bs;
-        let off_in_block = (byte_in_bgt % bs) as usize;
+        // Where the descriptor lives, META_BG or not (#73).
+        let (bgt_block, off_in_block) = self.sb.descriptor_location(gi as u64);
 
         let mut block = self.read_block(bgt_block)?;
 

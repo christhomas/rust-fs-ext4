@@ -71,6 +71,9 @@ pub const SUPPORTED_INCOMPAT: u32 = Incompat::FILETYPE.bits()
     | Incompat::BIT64.bits()
     | Incompat::FLEX_BG.bits()
     | Incompat::CSUM_SEED.bits()
+    // Descriptors kept per meta group rather than in one table: found
+    // through `Superblock::descriptor_location` (#73).
+    | Incompat::META_BG.bits()
     // A dirty journal: replayed onto the device by a writable mount
     // (`journal_apply::replay_if_dirty`), and into the buffer cache by a
     // read-only one (`journal_apply::replay_into_cache`, #72).

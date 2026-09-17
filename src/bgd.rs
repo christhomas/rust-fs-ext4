@@ -114,9 +114,6 @@ pub fn read_all<D: BlockDevice + ?Sized>(
     csum: &Checksummer,
 ) -> Result<Vec<BlockGroupDescriptor>> {
     let block_size = sb.block_size() as u64;
-    // BGT starts at block (first_data_block + 1).
-    let bgt_block = sb.first_data_block as u64 + 1;
-    let bgt_offset = bgt_block * block_size;
 
     let group_count = sb.block_group_count();
     // THE TABLE HAS TO BE INSIDE THE FILESYSTEM.
@@ -127,28 +124,44 @@ pub fn read_all<D: BlockDevice + ?Sized>(
     // that aborts through `handle_alloc_error`, past `ffi_guard`'s
     // `catch_unwind`, taking the host process with it. blocks_count
     // u64::MAX wrapped the multiply instead and gave "capacity
-    // overflow". Both from a 4 MiB image, at mount.
+    // overflow". Both from a 4 MiB image, at mount. Every descriptor
+    // takes its own bytes of the device, wherever the table is laid out.
     let total_bytes = group_count
         .checked_mul(sb.desc_size as u64)
         .ok_or(Error::Corrupt(
             "superblock: the group descriptor table's size overflows",
         ))?;
-    let end = bgt_offset.checked_add(total_bytes).ok_or(Error::Corrupt(
-        "superblock: the group descriptor table's extent overflows",
-    ))?;
-    if end > dev.size_bytes() {
+    if total_bytes > dev.size_bytes() {
         return Err(Error::Corrupt(
             "superblock: the group descriptor table reaches past the end of the device",
         ));
     }
 
-    let mut buf = vec![0u8; total_bytes as usize];
-    dev.read_at(bgt_offset, &mut buf)?;
-
+    // Descriptor by descriptor, from wherever each lives: one table after
+    // the superblock, or under META_BG a block per meta group (#73). A
+    // block is read once for all the descriptors it holds.
+    let mut table_block: Option<(u64, Vec<u8>)> = None;
     let mut groups = Vec::with_capacity(group_count as usize);
     for i in 0..(group_count as usize) {
-        let off = i * sb.desc_size as usize;
-        let raw = &buf[off..off + sb.desc_size as usize];
+        let (block, off) = sb.descriptor_location(i as u64);
+        if table_block.as_ref().map(|(b, _)| *b) != Some(block) {
+            let end = block
+                .checked_add(1)
+                .and_then(|b| b.checked_mul(block_size))
+                .ok_or(Error::Corrupt(
+                    "superblock: the group descriptor table's extent overflows",
+                ))?;
+            if end > dev.size_bytes() {
+                return Err(Error::Corrupt(
+                    "superblock: the group descriptor table reaches past the end of the device",
+                ));
+            }
+            let mut bytes = vec![0u8; block_size as usize];
+            dev.read_at(block * block_size, &mut bytes)?;
+            table_block = Some((block, bytes));
+        }
+        let bytes = &table_block.as_ref().unwrap().1;
+        let raw = &bytes[off..off + sb.desc_size as usize];
         let stored = u16::from_le_bytes([raw[0x1E], raw[0x1F]]);
         if crate::checksum::group_desc_csum(sb, csum, i as u32, raw)
             .is_some_and(|want| want != stored)

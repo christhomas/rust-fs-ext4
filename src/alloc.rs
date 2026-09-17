@@ -442,10 +442,13 @@ pub(crate) fn group_owned_metadata_runs(
     // between the descriptor table and the block bitmap, and it is
     // the room the filesystem keeps to grow into — free-looking, and
     // not free.
-    if sb.group_has_super(gi as u64) {
-        let gdt_blocks = (groups.len() as u64 * sb.desc_size as u64).div_ceil(bs);
-        let reserved = u64::from(sb.reserved_gdt_blocks);
-        runs.push((0, 1 + gdt_blocks + reserved));
+    //
+    // Under `META_BG` the table is split by meta group instead, and a
+    // group's head holds one descriptor block when it is the first, second
+    // or last of its meta group (#73). `group_head_metadata_blocks` has both.
+    let head = sb.group_head_metadata_blocks(gi as u64);
+    if head > 0 {
+        runs.push((0, head));
     }
 
     // The group's own bitmaps and inode table, wherever the descriptor
@@ -468,7 +471,7 @@ pub(crate) fn group_owned_metadata_runs(
 
 /// Returns the number of blocks that actually exist in group `gi` (the last
 /// group may be shorter than `blocks_per_group`).
-fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
+pub(crate) fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
     let ngroups = sb.block_group_count() as u32;
     if gi + 1 < ngroups {
         return sb.blocks_per_group;
