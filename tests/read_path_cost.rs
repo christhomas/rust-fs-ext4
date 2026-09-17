@@ -27,11 +27,22 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Instant;
 
+/// The block size the image is made with.
+const BLOCK: u64 = 4096;
+
 /// ext4's `BlockDevice` over the counter, read-only.
-struct Counted(Arc<CountingDevice>);
+///
+/// It also counts the requests that were not exactly one block at a block
+/// boundary. The counter only has totals, and bytes over calls is an
+/// average: requests of mixed lengths, or a 4 KiB request straddling two
+/// blocks, give the same ratio as one aligned block each.
+struct Counted(Arc<CountingDevice>, std::sync::atomic::AtomicU64);
 
 impl fs_ext4::block_io::BlockDevice for Counted {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_ext4::Result<()> {
+        if offset % BLOCK != 0 || buf.len() as u64 != BLOCK {
+            self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        }
         self.0
             .read_at(offset, buf)
             .map_err(|e| fs_ext4::Error::Io(std::io::Error::other(e.to_string())))
@@ -106,7 +117,12 @@ fn entries(fs: &Filesystem, ino: u32) -> Vec<(Vec<u8>, u32)> {
     let data = fs_ext4::file_io::read_all(fs, &inode).unwrap();
     let bs = fs.sb.block_size() as usize;
     data.chunks(bs)
-        .flat_map(|b| fs_ext4::dir::parse_block(b, true).unwrap_or_default())
+        .flat_map(|b| {
+            // A block that does not parse is a failure, not an empty block:
+            // skipping it would shrink every later pass's work and still pass.
+            fs_ext4::dir::parse_block(b, true)
+                .unwrap_or_else(|e| panic!("a block of directory {ino} does not parse: {e:?}"))
+        })
         .filter(|e| e.inode != 0 && e.name != b"." && e.name != b"..")
         .map(|e| (e.name, e.inode))
         .collect()
@@ -152,12 +168,10 @@ fn measure_pass(image: &str, blocks: usize) -> Pass {
     let counting = Arc::new(CountingDevice::new(Arc::new(
         FileDevice::open(image).unwrap(),
     )));
+    let device = Arc::new(Counted(counting.clone(), Default::default()));
     let mut fs = None;
     let mount = measure(&counting, 1, || {
-        fs = Some(
-            Filesystem::mount_with_cache(Arc::new(Counted(counting.clone())), blocks)
-                .expect("mount"),
-        );
+        fs = Some(Filesystem::mount_with_cache(device.clone(), blocks).expect("mount"));
     });
     let fs = fs.unwrap();
 
@@ -189,6 +203,13 @@ fn measure_pass(image: &str, blocks: usize) -> Pass {
     });
 
     let files: Vec<u32> = paths.iter().filter(|p| !p.2).map(|p| p.1).collect();
+    // The recipe's own counts, so a walk that came up short fails here
+    // instead of making every later figure smaller: ten directories with
+    // `a` and `a/b` each, `many`, `lost+found` and the root; 200 files in
+    // each of the ten, a `deep` under each, and 3000 in `many`.
+    assert_eq!(dirs, 33, "directories walked");
+    assert_eq!(files.len(), 5010, "files found");
+    assert_eq!(paths.len(), 5042, "paths found");
     let read = measure(&counting, files.len(), || {
         for ino in &files {
             let (inode, raw) = fs.read_inode_verified(*ino).unwrap();
@@ -208,6 +229,8 @@ fn measure_pass(image: &str, blocks: usize) -> Pass {
     ] {
         report(what, c);
     }
+    let odd = device.1.load(std::sync::atomic::Ordering::Relaxed);
+    eprintln!("requests that were not one aligned {BLOCK}-byte block: {odd}");
     Pass {
         mount,
         walk: walk_cost,
