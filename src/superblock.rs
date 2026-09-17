@@ -319,6 +319,29 @@ impl Superblock {
         if blocks_count == 0 {
             return Err(Error::Corrupt("superblock: blocks_count == 0"));
         }
+        // THE FIRST GROUP STARTS INSIDE THE FILESYSTEM (#181). Every block
+        // the allocator returns is `group * blocks_per_group +
+        // first_data_block + bit`, so a first data block at or past the
+        // end put every allocation outside the filesystem -- and on a
+        // device larger than it, as an FSKit mount routinely is, inside
+        // somebody else's bytes. The kernel refuses both of these in
+        // `ext4_fill_super` ("bad geometry").
+        if u64::from(first_data_block) >= blocks_count {
+            return Err(Error::Corrupt(
+                "superblock: first_data_block is at or past the end of the filesystem",
+            ));
+        }
+        // On a 1 KiB block size block 0 is the boot block, so the first
+        // group starts at block 1 -- unless clusters are larger than a
+        // block, which bigalloc allows.
+        if first_data_block == 0
+            && log_block_size == 0
+            && feature_ro_compat & crate::features::RoCompat::BIGALLOC.bits() == 0
+        {
+            return Err(Error::Corrupt(
+                "superblock: a 1 KiB-block filesystem's first data block is 0, not 1",
+            ));
+        }
 
         Ok(Self {
             inodes_count,
@@ -405,6 +428,15 @@ impl Superblock {
             return true;
         }
         classic_sparse_super(g)
+    }
+
+    /// Whether directory names are hashed as unsigned bytes: `s_flags`
+    /// (0x160) carries `EXT2_FLAGS_UNSIGNED_HASH` (0x2). See
+    /// [`crate::hash::effective_version`].
+    pub fn unsigned_hash(&self) -> bool {
+        self.raw
+            .get(0x160..0x164)
+            .is_some_and(|f| u32::from_le_bytes(f.try_into().unwrap()) & 0x2 != 0)
     }
 
     /// Block size in bytes: 1024 << log_block_size.
@@ -524,6 +556,74 @@ mod backup_layout_tests {
             sb_with(0, RoCompat::SPARSE_SUPER.bits(), [0, 0], 0).reserved_gdt_blocks,
             0
         );
+    }
+}
+
+#[cfg(test)]
+mod geometry_tests {
+    use super::*;
+
+    fn raw(blocks_count: u32, first_data_block: u32, log_block_size: u32) -> Vec<u8> {
+        let mut raw = vec![0u8; SUPERBLOCK_SIZE];
+        raw[0x38..0x3A].copy_from_slice(&EXT4_MAGIC.to_le_bytes());
+        raw[0x00..0x04].copy_from_slice(&8192u32.to_le_bytes()); // inodes_count
+        raw[0x04..0x08].copy_from_slice(&blocks_count.to_le_bytes());
+        raw[0x14..0x18].copy_from_slice(&first_data_block.to_le_bytes());
+        raw[0x18..0x1C].copy_from_slice(&log_block_size.to_le_bytes());
+        raw[0x20..0x24].copy_from_slice(&8192u32.to_le_bytes()); // blocks_per_group
+        raw[0x28..0x2C].copy_from_slice(&2048u32.to_le_bytes()); // inodes_per_group
+        raw[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes()); // rev_level
+        raw[0x58..0x5A].copy_from_slice(&256u16.to_le_bytes()); // inode_size
+        raw[0xFE..0x100].copy_from_slice(&64u16.to_le_bytes()); // desc_size
+        raw
+    }
+
+    fn refusal(raw: Vec<u8>) -> String {
+        match Superblock::parse(raw) {
+            Err(Error::Corrupt(m)) => m.to_string(),
+            other => panic!("expected Corrupt, got {:?}", other.map(|_| ())),
+        }
+    }
+
+    /// A first data block at or past the end is refused, as the kernel's
+    /// "bad geometry" check does (#181).
+    #[test]
+    fn a_first_data_block_past_the_end_is_refused() {
+        for (blocks, first) in [(16384u32, 16384u32), (16384, 20000), (100, u32::MAX)] {
+            assert!(
+                refusal(raw(blocks, first, 0)).contains("first_data_block"),
+                "blocks {blocks}, first {first}"
+            );
+        }
+    }
+
+    /// And a 1 KiB-block filesystem that starts its groups at block 0 --
+    /// unless it is bigalloc, whose clusters are larger than a block and
+    /// may start at 0.
+    #[test]
+    fn a_one_kib_filesystem_starting_at_block_zero_is_refused() {
+        assert!(refusal(raw(16384, 0, 0)).contains("first data block is 0"));
+
+        let mut bigalloc = raw(16384, 0, 0);
+        bigalloc[0x64..0x68]
+            .copy_from_slice(&crate::features::RoCompat::BIGALLOC.bits().to_le_bytes());
+        Superblock::parse(bigalloc)
+            .expect("a 1 KiB bigalloc filesystem may start its groups at block 0");
+    }
+
+    /// The geometries mke2fs writes still parse: 1 KiB from block 1, and
+    /// larger blocks from block 0.
+    #[test]
+    fn the_geometries_mke2fs_writes_still_parse() {
+        for (blocks, first, log) in [
+            (16385u32, 1u32, 0u32),
+            (16384, 1, 0),
+            (65536, 0, 2),
+            (1, 0, 2),
+        ] {
+            Superblock::parse(raw(blocks, first, log))
+                .unwrap_or_else(|e| panic!("blocks {blocks}, first {first}, log {log}: {e:?}"));
+        }
     }
 }
 
