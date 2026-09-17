@@ -31,10 +31,12 @@ and `-O ^extent,^64bit,^metadata_csum` (block-mapped).
 no edit here was applied to a filesystem the driver had misread.
 
 **Findings, both refusals rather than corruption:**
-- **#258.** A punch is refused on any file whose surviving extents do not fit
-  in the inode's four inline entries, so a file with a deep tree cannot be
-  punched at all: 750 of 750 punches were refused on 4 KiB and on 1 KiB
-  blocks. It is also raised as `Corrupt`, which reads as a damaged volume.
+- **#258.** A punch is refused when what survives it does not fit the inode's
+  four inline entries, whatever the tree's depth. The probe's file held 1,500
+  extents and the punch took every other one, leaving 750, so all 750 punches
+  were refused on 4 KiB and on 1 KiB blocks. A punch that happens to leave
+  four or fewer entries still goes through. It is also raised as `Corrupt`,
+  which reads as a damaged volume.
 - **#147** (an external pull request). On 1 KiB blocks, 1,445 operations were
   refused with `descriptor block overflow (too many tags)`, and 797 later ones
   then failed with `NotFound` because their files were never created. A
