@@ -5587,6 +5587,26 @@ impl Filesystem {
         let bs = self.sb.block_size();
         let bs_u64 = bs as u64;
 
+        // ONLY A ROOT WITH ONE INDEX ENTRY HAS A SINGLE LEAF. Once the deep
+        // path has split that leaf the root indexes two or more, and the
+        // new extent belongs in the last of them; appending it to the
+        // first put logical blocks past the split where no lookup
+        // descends, and the entry just added was not found.
+        if crate::extent::ExtentHeader::parse(&parent_inode.block)?.entries != 1 {
+            return self.extend_dir_and_add_entry_deep(
+                parent_ino,
+                parent_inode,
+                parent_raw,
+                name,
+                target_ino,
+                file_type,
+                has_ft,
+                new_phys,
+                new_extent,
+                plan,
+            );
+        }
+
         // Resolve the single index entry in the 60-byte inline root.
         let idx = crate::extent::ExtentIdx::parse(
             &parent_inode.block
