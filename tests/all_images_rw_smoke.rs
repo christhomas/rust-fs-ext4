@@ -281,11 +281,10 @@ fn ext4_inline() {
 fn ext4_largedir() {
     run_round_trip("ext4-largedir")
 }
-/// Creating a file in the kernel-grown 515-entry root fails with EIO (#233).
-/// The same files in an `e2fsck -D`-rebuilt index round-trip, so the defect
-/// is in inserting into the tree the kernel builds incrementally.
+/// A kernel-grown 515-entry htree root: its dx_tail keeps the bytes of the
+/// dirent tail it had before it was indexed, which the driver used to verify
+/// as one and refuse every create and unlink with EIO (#233).
 #[test]
-#[ignore = "EIO creating in a kernel-grown htree root — #233"]
 fn ext4_manyfiles() {
     run_round_trip("ext4-manyfiles")
 }

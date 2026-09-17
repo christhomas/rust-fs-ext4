@@ -2260,6 +2260,12 @@ impl Filesystem {
                 continue;
             };
             let block = buf.get_mut(self, phys)?;
+            // An index block holds no entries to remove, and read as one it
+            // ends in a tail-shaped dt_reserved and a `..` spanning the rest
+            // (#233).
+            if Self::is_htree_index_block(parent_inode, logical, block) {
+                continue;
+            }
             let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
                 12
             } else {
@@ -3252,6 +3258,12 @@ impl Filesystem {
                 continue;
             };
             let block = buf.get_mut(self, phys)?;
+            // An index block holds no entries to remove, and read as one it
+            // ends in a tail-shaped dt_reserved and a `..` spanning the rest
+            // (#233).
+            if Self::is_htree_index_block(&parent_inode, logical, block) {
+                continue;
+            }
             // `dir_entry_tail` occupies the last 12 bytes when metadata_csum
             // is on; don't scribble over it.
             let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
@@ -4590,6 +4602,24 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Whether logical block `logical` of directory `dir` is an htree index
+    /// block (the dx_root, or a dx_node) rather than a block of entries.
+    ///
+    /// The kernel's rule in `__ext4_read_dirblock`: in an indexed directory,
+    /// block 0 is the root, and a block whose first record is an empty entry
+    /// spanning the whole block is a node. Nothing at the END of the block
+    /// decides it. A kernel-grown dx_root keeps the bytes of the dirent tail
+    /// the directory had before it was indexed, so it ends in what looks
+    /// exactly like one (#233).
+    fn is_htree_index_block(dir: &Inode, logical: u64, block: &[u8]) -> bool {
+        if dir.flags & crate::inode::InodeFlags::INDEX.bits() == 0 || block.len() < 8 {
+            return false;
+        }
+        let first_inode = u32::from_le_bytes(block[0..4].try_into().unwrap());
+        let first_len = u16::from_le_bytes(block[4..6].try_into().unwrap()) as usize;
+        logical == 0 || (first_inode == 0 && first_len == block.len())
+    }
+
     /// Refuse a directory block whose tail checksum does not verify, before
     /// anything reads entries out of it.
     ///
@@ -4609,10 +4639,38 @@ impl Filesystem {
     /// Same predicate as `dir::parse_block_verified` (`dir.rs`), deliberately:
     /// `csum.enabled` AND a recognisable tail. A volume without the feature,
     /// and a block predating the tail, are both parsed exactly as before.
-    fn refuse_unverified_dir_block(&self, ino: u32, generation: u32, block: &[u8]) -> Result<()> {
+    fn refuse_unverified_dir_block(
+        &self,
+        ino: u32,
+        dir: &Inode,
+        logical: u64,
+        block: &[u8],
+    ) -> Result<()> {
+        // AN INDEX BLOCK IS VERIFIED AS ONE (#233). An htree directory's
+        // block 0 is its dx_root and a block whose first record is an empty
+        // entry spanning the whole block is a dx_node, and their checksum is
+        // the dx_tail's. The kernel's __ext4_read_dirblock tells them apart
+        // this way. The dirent-tail test alone does not: when the kernel
+        // turns a linear directory into an index it keeps the old tail's
+        // bytes in dt_reserved, so a kernel-grown dx_root ENDS in what looks
+        // exactly like a dirent tail, whose "checksum" is the index's. Every
+        // create in such a directory was refused as a bad directory block.
+        if Self::is_htree_index_block(dir, logical, block) {
+            // Only the root is verified as an index here. A node is known by
+            // its shape alone, and a leaf with no dirent tail whose first
+            // record is an empty entry spanning the block has the same shape,
+            // so the kernel does not verify a node-shaped block a linear scan
+            // reads either (`__ext4_read_dirblock` with `DIRENT`). The
+            // htree walk verifies real nodes as it descends (CodeRabbit on
+            // #256).
+            if logical == 0 {
+                return self.check_dx_block(ino, dir, block, true);
+            }
+            return Ok(());
+        }
         if self.csum.enabled
             && crate::dir::has_csum_tail(block)
-            && !self.csum.verify_dir_entry_tail(ino, generation, block)
+            && !self.csum.verify_dir_entry_tail(ino, dir.generation, block)
         {
             return Err(Error::BadChecksum {
                 what: "directory block",
@@ -4663,7 +4721,7 @@ impl Filesystem {
                 continue;
             };
             let block = self.read_block(phys)?;
-            self.refuse_unverified_dir_block(dir_ino, dir_inode.generation, &block)?;
+            self.refuse_unverified_dir_block(dir_ino, dir_inode, logical, &block)?;
             for entry in crate::dir::DirBlockIter::new(&block, has_ft) {
                 let e = entry?;
                 if e.name == name {
@@ -5241,11 +5299,7 @@ impl Filesystem {
                     let block = self.read_block(phys)?;
                     // The block this branch is about to overwrite. Unverified
                     // here, it would be emptied and re-stamped valid.
-                    self.refuse_unverified_dir_block(
-                        dst_old_ino,
-                        dst_old_inode.generation,
-                        &block,
-                    )?;
+                    self.refuse_unverified_dir_block(dst_old_ino, &dst_old_inode, logical, &block)?;
                     for entry in crate::dir::DirBlockIter::new(&block, has_ft) {
                         let e = entry?;
                         if e.name != b"." && e.name != b".." {
@@ -6278,7 +6332,7 @@ impl Filesystem {
             // The emptiness decision is made from this block's contents, and
             // the block is then freed. Unverified, a corrupt one reads as
             // empty or not-empty by accident.
-            self.refuse_unverified_dir_block(target_ino, target_inode.generation, &block)?;
+            self.refuse_unverified_dir_block(target_ino, &target_inode, logical, &block)?;
             for entry in crate::dir::DirBlockIter::new(&block, has_ft) {
                 let e = entry?;
                 if e.name != b"." && e.name != b".." {
@@ -6336,6 +6390,12 @@ impl Filesystem {
                 continue;
             };
             let block = buf.get_mut(self, phys)?;
+            // An index block holds no entries to remove, and read as one it
+            // ends in a tail-shaped dt_reserved and a `..` spanning the rest
+            // (#233).
+            if Self::is_htree_index_block(&parent_inode, logical, block) {
+                continue;
+            }
             let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
                 12
             } else {

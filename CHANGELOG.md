@@ -28,6 +28,13 @@
 
 ### Fixed
 
+- A directory the kernel indexed takes creates and unlinks. When the kernel
+  turns a directory into an htree it keeps the old dirent tail's bytes in
+  the root's `dt_reserved`, so the root ends in what looks like a dirent
+  tail. The driver verified it as one and refused every create as a bad
+  directory block, and every unlink as a bad record length. Index blocks are
+  now recognised as the kernel does, by position and first record, and
+  verified as index blocks (#233).
 - Truncate refuses anything but a regular file. `apply_truncate_grow` and
   `apply_truncate_shrink` set the size of a directory, symlink or device
   node, leaving an inode e2fsck rejects. They now return `IsADirectory` for
