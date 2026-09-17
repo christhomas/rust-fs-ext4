@@ -310,12 +310,24 @@ impl Superblock {
         // "range end index 12 out of range for slice of length 8" during
         // mount.
         let sixty_four_bit = feature_incompat & crate::features::Incompat::BIT64.bits() != 0;
-        let smallest = if sixty_four_bit { 64 } else { 32 };
-        if desc_size < smallest || !desc_size.is_power_of_two() {
-            return Err(Error::Corrupt(
-                "superblock: desc_size is not a group descriptor size",
-            ));
-        }
+        // WITHOUT 64BIT THE FIELD IS NOT READ AT ALL (#140). The kernel's
+        // `ext4_fill_super` sets the descriptor size to 32 on such a volume
+        // whatever `s_desc_size` says, and range-checks the field only
+        // under 64BIT: a power of two from 64 to 1024. A floor alone let a
+        // non-64BIT volume with a padded field of 64 have its descriptors
+        // read at 64-byte stride with the 64-bit halves filled from the
+        // next descriptor -- and refusing it instead would refuse a volume
+        // Linux mounts.
+        let desc_size = if sixty_four_bit {
+            if !(64..=1024).contains(&desc_size) || !desc_size.is_power_of_two() {
+                return Err(Error::Corrupt(
+                    "superblock: desc_size is not a group descriptor size",
+                ));
+            }
+            desc_size
+        } else {
+            32
+        };
         if blocks_count == 0 {
             return Err(Error::Corrupt("superblock: blocks_count == 0"));
         }
@@ -657,6 +669,57 @@ mod group_count_tests {
                 group_count(blocks, first, bpg),
                 groups,
                 "blocks={blocks} first_data_block={first} blocks_per_group={bpg}"
+            );
+        }
+    }
+}
+
+#[cfg(test)]
+mod desc_size_tests {
+    use super::*;
+
+    fn raw(desc_size: u16, sixty_four_bit: bool) -> Vec<u8> {
+        let mut raw = vec![0u8; SUPERBLOCK_SIZE];
+        raw[0x38..0x3A].copy_from_slice(&EXT4_MAGIC.to_le_bytes());
+        raw[0x00..0x04].copy_from_slice(&8192u32.to_le_bytes()); // inodes_count
+        raw[0x04..0x08].copy_from_slice(&65536u32.to_le_bytes()); // blocks_count
+        raw[0x18..0x1C].copy_from_slice(&2u32.to_le_bytes()); // 4 KiB blocks
+        raw[0x20..0x24].copy_from_slice(&32768u32.to_le_bytes()); // blocks_per_group
+        raw[0x28..0x2C].copy_from_slice(&4096u32.to_le_bytes()); // inodes_per_group
+        raw[0x4C..0x50].copy_from_slice(&1u32.to_le_bytes()); // rev_level
+        raw[0x58..0x5A].copy_from_slice(&256u16.to_le_bytes()); // inode_size
+        if sixty_four_bit {
+            let incompat = crate::features::Incompat::BIT64.bits();
+            raw[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+        }
+        raw[0xFE..0x100].copy_from_slice(&desc_size.to_le_bytes());
+        raw
+    }
+
+    /// Without 64BIT the descriptor is 32 bytes whatever the field says,
+    /// as the kernel reads it (#140).
+    #[test]
+    fn without_64bit_the_descriptor_is_32_bytes_whatever_the_field_says() {
+        for field in [0u16, 32, 64, 128, 1024, 33] {
+            let sb = Superblock::parse(raw(field, false))
+                .unwrap_or_else(|e| panic!("field {field}: {e:?}"));
+            assert_eq!(sb.desc_size, 32, "field {field}");
+        }
+    }
+
+    /// With 64BIT the field is the size, a power of two from 64 to 1024.
+    #[test]
+    fn with_64bit_the_field_is_range_checked() {
+        for field in [64u16, 128, 1024] {
+            assert_eq!(
+                Superblock::parse(raw(field, true)).unwrap().desc_size,
+                field
+            );
+        }
+        for field in [0u16, 32, 96, 2048] {
+            assert!(
+                matches!(Superblock::parse(raw(field, true)), Err(Error::Corrupt(_))),
+                "field {field} must be refused"
             );
         }
     }
