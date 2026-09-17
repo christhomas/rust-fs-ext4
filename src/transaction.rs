@@ -157,6 +157,9 @@ impl Transaction {
                 "journal declares an incompat feature this driver does not write",
             ));
         }
+        if let Some(why) = jsb.checksum_declaration_error() {
+            return Err(Error::Corrupt(why));
+        }
         if self.block_size != jsb.block_size
             || self.uses_64bit != jsb.uses_64bit()
             || self.uses_csum_v3 != jsb.uses_csum_v3()

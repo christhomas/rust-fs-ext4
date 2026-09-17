@@ -149,6 +149,28 @@ impl JournalSuperblock {
         self.feature_incompat & !SUPPORTED_JBD_INCOMPAT
     }
 
+    /// Why this journal's checksum declaration is one JBD2 refuses, or `None`.
+    ///
+    /// The kernel's `journal_check_superblock`: CSUM_V2 and CSUM_V3 exclude
+    /// each other and the v1 `COMPAT_CHECKSUM`, and either needs
+    /// `s_checksum_type` crc32c. Both bits are supported one at a time, so
+    /// `unsupported_incompat` passes a journal declaring both, and replay and
+    /// the writer would pick a layout the declaration does not name.
+    pub fn checksum_declaration_error(&self) -> Option<&'static str> {
+        let v2 = self.feature_incompat & JbdIncompat::CSUM_V2.bits() != 0;
+        let v3 = self.feature_incompat & JbdIncompat::CSUM_V3.bits() != 0;
+        if v2 && v3 {
+            return Some("journal declares both CSUM_V2 and CSUM_V3");
+        }
+        if (v2 || v3) && self.feature_compat & JBD2_FEATURE_COMPAT_CHECKSUM != 0 {
+            return Some("journal declares v1 checksums alongside CSUM_V2/V3");
+        }
+        if (v2 || v3) && self.checksum_type != JBD2_CRC32C_CHKSUM {
+            return Some("journal checksum type is not crc32c");
+        }
+        None
+    }
+
     /// `j_csum_seed`: the crc32c of the journal's UUID, from `~0`. Every
     /// transaction-block checksum starts from it.
     pub fn csum_seed(&self) -> u32 {
@@ -175,6 +197,12 @@ impl JournalSuperblock {
         }
     }
 }
+
+/// `JBD2_FEATURE_COMPAT_CHECKSUM`: the v1 commit-block checksum.
+pub const JBD2_FEATURE_COMPAT_CHECKSUM: u32 = 0x1;
+
+/// `JBD2_CRC32C_CHKSUM`, the one `s_checksum_type` CSUM_V2/V3 allow.
+pub const JBD2_CRC32C_CHKSUM: u8 = 4;
 
 /// Journal incompat bits this driver replays and writes.
 pub const SUPPORTED_JBD_INCOMPAT: u32 = JbdIncompat::REVOKE.bits()
@@ -363,6 +391,25 @@ mod tests {
                 "incompat {incompat:#x}"
             );
         }
+    }
+
+    /// The kernel's `journal_check_superblock` rules on the checksum bits.
+    #[test]
+    fn checksum_declarations_jbd2_refuses() {
+        let v2 = JbdIncompat::CSUM_V2.bits();
+        let v3 = JbdIncompat::CSUM_V3.bits();
+        let with = |incompat: u32, compat: u32, kind: u8| {
+            let mut jsb = jsb_with(incompat);
+            jsb.feature_compat = compat;
+            jsb.checksum_type = kind;
+            jsb.checksum_declaration_error()
+        };
+        assert_eq!(with(v3, 0, JBD2_CRC32C_CHKSUM), None);
+        assert_eq!(with(v2, 0, JBD2_CRC32C_CHKSUM), None);
+        assert_eq!(with(0, JBD2_FEATURE_COMPAT_CHECKSUM, 1), None, "v1 alone");
+        assert!(with(v2 | v3, 0, JBD2_CRC32C_CHKSUM).is_some());
+        assert!(with(v3, JBD2_FEATURE_COMPAT_CHECKSUM, JBD2_CRC32C_CHKSUM).is_some());
+        assert!(with(v3, 0, 1).is_some(), "crc32 is not a v3 checksum type");
     }
 
     #[test]

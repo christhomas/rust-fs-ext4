@@ -45,13 +45,15 @@
 //!
 //! A transaction's writes and revokes join the plan only once its commit
 //! block has been read and, on a CSUM_V2/V3 journal, has passed its
-//! checksum. A commit or descriptor block failing its checksum ends the log
-//! there, as `do_one_pass` treats it: that is what a crash mid-commit leaves.
-//! A committed transaction whose data block or revoke block fails its
-//! checksum is corruption rather than a crash, and the walk refuses with
-//! [`Error::BadChecksum`] before anything is replayed. A journal declaring
-//! an incompat feature outside [`jbd2::SUPPORTED_JBD_INCOMPAT`], or a block
-//! size other than the filesystem's, is refused outright.
+//! checksum. A commit block failing its checksum ends the log there, as
+//! `do_one_pass` treats it: that is what a crash mid-commit leaves. A
+//! committed transaction -- one whose commit checks out -- with a
+//! descriptor, data or revoke block failing its checksum is corruption
+//! rather than a crash, and the walk refuses with [`Error::BadChecksum`]
+//! before anything is replayed. A journal declaring
+//! an incompat feature outside [`jbd2::SUPPORTED_JBD_INCOMPAT`], a checksum
+//! declaration JBD2 refuses, or a block size other than the filesystem's, is
+//! refused outright.
 
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
@@ -142,6 +144,9 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
             "journal declares an incompat feature this driver cannot replay",
         ));
     }
+    if let Some(why) = jsb.checksum_declaration_error() {
+        return Err(Error::Corrupt(why));
+    }
     if jsb.block_size != fs.sb.block_size() {
         return Err(Error::Corrupt(
             "journal block size differs from the filesystem's",
@@ -185,10 +190,20 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
 
         match hdr.block_type {
             JBD2_DESCRIPTOR_BLOCK => {
-                if seed.is_some_and(|seed| !tail_checksum_matches(seed, &block_buf)) {
-                    break;
+                // A descriptor failing its checksum is judged at the commit,
+                // as the kernel's `need_check_commit_time` judges it: with no
+                // valid commit after it, a crash tore the transaction and the
+                // log ends; with one, the log is corrupt. Its tags still say
+                // how many data blocks to step over, if they parse at all.
+                let torn = seed.is_some_and(|seed| !tail_checksum_matches(seed, &block_buf));
+                let tags = match parse_descriptor_tags(&block_buf, &mut cur, jsb, expect_seq) {
+                    Ok(tags) => tags,
+                    Err(_) if torn => break,
+                    Err(e) => return Err(e),
+                };
+                if torn {
+                    pending_corrupt = Some("journal descriptor block of a committed transaction");
                 }
-                let tags = parse_descriptor_tags(&block_buf, &mut cur, jsb, expect_seq)?;
                 for (entry, stored) in tags {
                     if let Some(seed) = seed {
                         let data =

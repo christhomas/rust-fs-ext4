@@ -312,19 +312,60 @@ fn a_damaged_commit_block_ends_the_log() {
     let _ = std::fs::remove_file(&image);
 }
 
-/// A damaged descriptor tail ends the log the same way.
+/// A damaged descriptor with a commit that checks out after it is
+/// corruption, as the kernel's `need_check_commit_time` judges it: refused,
+/// nothing replayed.
 #[test]
-fn a_damaged_descriptor_block_ends_the_log() {
+fn a_damaged_descriptor_in_a_committed_transaction_is_refused() {
     let Some(image) = debugfs_journal("descriptor") else {
         eprintln!("skip: e2fsprogs not installed");
         return;
     };
     damage_journal(&image, 1, 4000);
-    Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
-        .expect("a torn descriptor is the end of the log, not an error");
+    let err = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
+        .err()
+        .expect("a committed transaction's damaged descriptor");
+    assert!(matches!(err, fs_ext4::Error::BadChecksum { .. }), "{err:?}");
     for &block in &TARGETS {
         assert_eq!(read_block(&image, block), vec![0u8; BS as usize]);
     }
+    let _ = std::fs::remove_file(&image);
+}
+
+/// A damaged descriptor with no valid commit after it is a transaction a
+/// crash tore: the end of the log.
+#[test]
+fn a_torn_transaction_ends_the_log() {
+    let Some(image) = debugfs_journal("torn") else {
+        eprintln!("skip: e2fsprogs not installed");
+        return;
+    };
+    damage_journal(&image, 1, 4000);
+    damage_journal(&image, 6, 100);
+    Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
+        .expect("a torn transaction is the end of the log, not an error");
+    for &block in &TARGETS {
+        assert_eq!(read_block(&image, block), vec![0u8; BS as usize]);
+    }
+    let _ = std::fs::remove_file(&image);
+}
+
+/// CSUM_V2 declared beside CSUM_V3: JBD2 refuses the journal, so replay
+/// does too, rather than pick one layout.
+#[test]
+fn both_checksum_versions_are_refused() {
+    let Some(image) = debugfs_journal("v2v3") else {
+        eprintln!("skip: e2fsprogs not installed");
+        return;
+    };
+    set_journal_incompat(&image, 0x8);
+    let err = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
+        .err()
+        .expect("a journal declaring CSUM_V2 and CSUM_V3");
+    assert!(
+        matches!(err, fs_ext4::Error::Corrupt(m) if m.contains("CSUM_V2 and CSUM_V3")),
+        "{err:?}"
+    );
     let _ = std::fs::remove_file(&image);
 }
 
