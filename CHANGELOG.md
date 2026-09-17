@@ -91,6 +91,14 @@
   leaf blocks allocated, and counted in `i_blocks` for a punch. An unlink
   of such a file was refused. These paths now free what
   `extent::collect_all_with_nodes` reads from the tree (#242).
+- An external xattr block shared by several inodes is edited as shared.
+  The kernel keeps one block for every inode with an identical attribute
+  set and counts them in `h_refcount`. `apply_setxattr` rewrote it in
+  place and reset the count to one, changing the other inodes' attributes
+  too. `apply_removexattr` freed it while others still pointed at it. Unlink,
+  rmdir, rename-over and orphan release never released it at all. An edit
+  now gives the inode its own copy, and every release drops one reference,
+  freeing the block only at the last (#245).
 
 ## [0.5.1] — 2026-09-06
 

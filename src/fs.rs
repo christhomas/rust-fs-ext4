@@ -883,6 +883,10 @@ impl Filesystem {
             };
             freed += self.buffer_free_runs(buf, &runs)?;
         }
+        // Its xattr block: freed, or one reference fewer if shared.
+        if parsed.file_acl != 0 {
+            freed += self.buffer_release_xattr_block(buf, parsed.file_acl)?;
+        }
         // Free the inode bitmap slot + BGD free_inodes++.
         self.buffer_free_inode_slot(buf, orphan_ino)?;
 
@@ -2725,7 +2729,19 @@ impl Filesystem {
             let block_nr = inode.file_acl;
             let mut block = vec![0u8; bs as usize];
             self.dev.read_at(block_nr * bs_u64, &mut block)?;
+            let refs = u32::from_le_bytes(block[4..8].try_into().unwrap());
             match crate::xattr::plan_remove_from_external_block(&mut block, name, 1)? {
+                crate::xattr::BlockRemoveOutcome::Removed if refs > 1 => {
+                    // Shared: this inode's remaining attributes move to a
+                    // block of its own, and the others keep the old one.
+                    let mut buf = BlockBuffer::new(bs);
+                    let new_nr = self.buffer_unshare_xattr_block(&mut buf, ino, block_nr, block)?;
+                    Self::write_file_acl(&mut raw, new_nr)?;
+                    raw[0x0C..0x10].copy_from_slice(&now_unix_seconds().to_le_bytes());
+                    self.finalize_inode_raw(ino, inode.generation, &mut raw)?;
+                    self.buffer_write_inode(&mut buf, ino, &raw)?;
+                    return self.commit_block_buffer(buf);
+                }
                 crate::xattr::BlockRemoveOutcome::Removed => {
                     if self.csum.enabled {
                         self.csum.patch_xattr_block(block_nr, &mut block);
@@ -2743,8 +2759,9 @@ impl Filesystem {
                     // corrupting the bitmap csum and the free counters. The
                     // buffer helpers do it correctly and atomically.
                     let mut buf = BlockBuffer::new(bs);
-                    self.buffer_free_block_run_and_bgd(&mut buf, block_nr, 1)?;
-                    self.buffer_patch_sb_counters(&mut buf, 1, 0)?;
+                    // Freed only if no other inode shares it.
+                    let freed = self.buffer_release_xattr_block(&mut buf, block_nr)?;
+                    self.buffer_patch_sb_counters(&mut buf, freed as i64, 0)?;
                     // Both halves, at the offsets the reader uses.
                     Self::write_file_acl(&mut raw, 0)?;
                     let sectors_per_block = bs_u64 / 512;
@@ -2861,12 +2878,20 @@ impl Filesystem {
             let block_nr = inode.file_acl;
             let mut block = vec![0u8; bs as usize];
             self.dev.read_at(block_nr * bs_u64, &mut block)?;
+            let refs = u32::from_le_bytes(block[4..8].try_into().unwrap());
             crate::xattr::plan_set_in_external_block(&mut block, name, value, 1)?;
-            if self.csum.enabled {
-                self.csum.patch_xattr_block(block_nr, &mut block);
+            if refs > 1 {
+                // Shared: the edit is this inode's alone, so it gets its
+                // own block. One block before and after, so i_blocks holds.
+                let new_nr = self.buffer_unshare_xattr_block(&mut buf, ino, block_nr, block)?;
+                Self::write_file_acl(raw, new_nr)?;
+            } else {
+                if self.csum.enabled {
+                    self.csum.patch_xattr_block(block_nr, &mut block);
+                }
+                buf.put(block_nr, block);
             }
-            buf.put(block_nr, block);
-            // i_file_acl unchanged — only need to bump ctime.
+            // i_blocks unchanged — only need to bump ctime.
             let now = now_unix_seconds();
             raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
             self.finalize_inode_raw(ino, inode.generation, raw)?;
@@ -2924,6 +2949,83 @@ impl Filesystem {
         self.buffer_write_inode(&mut buf, ino, raw)?;
 
         self.commit_block_buffer(buf)
+    }
+
+    /// Allocate one block near `ino`'s group, staged in `buf` with its
+    /// bitmap, descriptor and superblock counts.
+    fn buffer_allocate_block(&self, buf: &mut BlockBuffer, ino: u32) -> Result<u64> {
+        let plan = {
+            let mut bitmap_reader = |block: u64| -> Result<Vec<u8>> {
+                if let Some(bytes) = buf.dirty.get(&block) {
+                    return Ok(bytes.clone());
+                }
+                self.read_block(block)
+            };
+            crate::alloc::plan_block_allocation(
+                &self.sb,
+                &self.allocation_groups(),
+                1,
+                (ino - 1) / self.sb.inodes_per_group,
+                &mut bitmap_reader,
+            )?
+        };
+        self.buffer_mark_block_run_used(buf, plan.first_block, 1)?;
+        self.buffer_patch_bgd_counters(
+            buf,
+            plan.bgd.group_idx as usize,
+            plan.bgd.free_blocks_delta,
+            plan.bgd.free_inodes_delta,
+            plan.bgd.used_dirs_delta,
+        )?;
+        self.buffer_patch_sb_counters(buf, plan.sb.free_blocks_delta, plan.sb.free_inodes_delta)?;
+        Ok(plan.first_block)
+    }
+
+    /// Drop one inode's reference to the external xattr block at `block_nr`.
+    ///
+    /// THE BLOCK MAY NOT BE THIS INODE'S ALONE. The kernel keeps one block
+    /// for every inode with an identical attribute set and counts them in
+    /// `h_refcount`, so files with the same ACL or security label share
+    /// one. At a count of one the block is freed. Above one, the count is
+    /// written back one lower and the block stays where the other inodes
+    /// point. Returns the blocks freed, 0 or 1; the caller credits the
+    /// superblock.
+    pub(crate) fn buffer_release_xattr_block(
+        &self,
+        buf: &mut BlockBuffer,
+        block_nr: u64,
+    ) -> Result<u64> {
+        let mut block = buf.get_mut(self, block_nr)?.clone();
+        let refs = u32::from_le_bytes(block[4..8].try_into().unwrap());
+        if refs <= 1 {
+            return self.buffer_free_block_run_and_bgd(buf, block_nr, 1);
+        }
+        block[4..8].copy_from_slice(&(refs - 1).to_le_bytes());
+        if self.csum.enabled {
+            self.csum.patch_xattr_block(block_nr, &mut block);
+        }
+        buf.put(block_nr, block);
+        Ok(0)
+    }
+
+    /// Give `ino` its own copy of a shared xattr block holding `block`'s
+    /// edited contents: a new block for this inode, and one reference fewer
+    /// on the old one. Returns the new block's number.
+    fn buffer_unshare_xattr_block(
+        &self,
+        buf: &mut BlockBuffer,
+        ino: u32,
+        old_nr: u64,
+        mut block: Vec<u8>,
+    ) -> Result<u64> {
+        let new_nr = self.buffer_allocate_block(buf, ino)?;
+        block[4..8].copy_from_slice(&1u32.to_le_bytes());
+        if self.csum.enabled {
+            self.csum.patch_xattr_block(new_nr, &mut block);
+        }
+        buf.put(new_nr, block);
+        self.buffer_release_xattr_block(buf, old_nr)?;
+        Ok(new_nr)
     }
 
     /// Bump `i_ctime` to now and re-checksum + write the inode. Used on
@@ -3151,6 +3253,13 @@ impl Filesystem {
         if target_inode.has_extents() {
             let runs = self.extent_tree_runs(&target_inode.block)?;
             freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
+        }
+
+        // The xattr block goes with the inode, or loses one reference if
+        // another inode shares it. It was never released at all.
+        if target_inode.file_acl != 0 {
+            freed_sectors += self.buffer_release_xattr_block(&mut buf, target_inode.file_acl)?
+                * sectors_per_block;
         }
 
         // Inode bitmap + BGD free_inodes_count; SB counter for both
@@ -5223,6 +5332,11 @@ impl Filesystem {
                     let runs = self.extent_tree_runs(&dst_old_inode.block)?;
                     freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
                 }
+                if dst_old_inode.file_acl != 0 {
+                    freed_sectors += self
+                        .buffer_release_xattr_block(&mut buf, dst_old_inode.file_acl)?
+                        * sectors_per_block;
+                }
 
                 self.buffer_free_inode_slot(&mut buf, dst_old_ino)?;
                 if dst_is_dir {
@@ -6151,7 +6265,11 @@ impl Filesystem {
         // Free target's data blocks. Each freed run credits its own group's
         // BGD; SB credit accumulates and lands once below.
         let runs = self.extent_tree_runs(&target_inode.block)?;
-        let freed_blocks = self.buffer_free_runs(&mut buf, &runs)?;
+        let mut freed_blocks = self.buffer_free_runs(&mut buf, &runs)?;
+
+        if target_inode.file_acl != 0 {
+            freed_blocks += self.buffer_release_xattr_block(&mut buf, target_inode.file_acl)?;
+        }
 
         // Free the inode slot. A removed dir decrements `bg_used_dirs_count`
         // — buffer_free_inode_slot already credits free_inodes by +1, so we
