@@ -924,6 +924,76 @@ pub fn plan_free_extent(root: &[u8], idx: usize) -> Result<Vec<ExtentMutation>> 
     ])
 }
 
+/// Plan marking logical blocks `[first, end)` initialized in an inline-root
+/// leaf, wherever an uninitialized extent covers them.
+///
+/// Each uninitialized extent the range touches is split into at most three:
+/// an uninitialized head, the initialized middle and an uninitialized tail.
+/// A piece contiguous with its neighbour in the same state is merged back.
+/// Returns the new root and the logical blocks that changed state. Those
+/// blocks read as zeros until now, and their physical contents are whatever
+/// was there, so the caller has to write every byte of them.
+///
+/// Errors:
+/// - `multi-level tree mutation not yet supported` on a root that isn't a leaf;
+/// - `LEAF_FULL_NEEDS_PROMOTION` if the pieces don't fit in the root.
+pub fn plan_initialize_range(root: &[u8], first: u32, end: u32) -> Result<(Vec<u8>, Vec<u32>)> {
+    let (header, entries) = read_leaf_entries(root)?;
+    let mut out: Vec<Extent> = Vec::with_capacity(entries.len() + 2);
+    let mut converted = Vec::new();
+    for e in entries {
+        let el = e.logical_block;
+        let er = el + u32::from(e.length);
+        if !e.uninitialized || er <= first || el >= end {
+            out.push(e);
+            continue;
+        }
+        let lo = el.max(first);
+        let hi = er.min(end);
+        let piece = |from: u32, to: u32, uninitialized: bool| Extent {
+            logical_block: from,
+            length: (to - from) as u16,
+            physical_block: e.physical_block + u64::from(from - el),
+            uninitialized,
+        };
+        if el < lo {
+            out.push(piece(el, lo, true));
+        }
+        out.push(piece(lo, hi, false));
+        if hi < er {
+            out.push(piece(hi, er, true));
+        }
+        converted.extend(lo..hi);
+    }
+    let mut merged: Vec<Extent> = Vec::with_capacity(out.len());
+    for e in out {
+        match merged.last_mut() {
+            Some(prev)
+                if are_contiguous(prev, &e)
+                    && u32::from(prev.length) + u32::from(e.length)
+                        <= u32::from(if e.uninitialized {
+                            crate::extent::EXT_INIT_MAX_LEN - 1
+                        } else {
+                            crate::extent::EXT_INIT_MAX_LEN
+                        }) =>
+            {
+                prev.length += e.length
+            }
+            _ => merged.push(e),
+        }
+    }
+    if merged.len() as u16 > header.max {
+        return Err(Error::CorruptExtentTree(
+            "LEAF_FULL_NEEDS_PROMOTION: initializing part of an extent exceeds root capacity",
+        ));
+    }
+    let header = ExtentHeader {
+        entries: merged.len() as u16,
+        ..header
+    };
+    Ok((build_root(&header, &merged, root.len()), converted))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -951,6 +1021,54 @@ mod tests {
 
     fn read_back(bytes: &[u8]) -> Vec<Extent> {
         read_leaf_entries(bytes).unwrap().1
+    }
+
+    fn shape(extents: Vec<Extent>) -> Vec<(u32, u16, u64, bool)> {
+        extents
+            .iter()
+            .map(|e| (e.logical_block, e.length, e.physical_block, e.uninitialized))
+            .collect()
+    }
+
+    #[test]
+    fn initializing_the_middle_of_an_uninit_extent_splits_it_in_three() {
+        let root = mk_root(&[ext(0, 16, 1000, true)]);
+        let (bytes, converted) = plan_initialize_range(&root, 4, 6).unwrap();
+        assert_eq!(converted, vec![4, 5]);
+        assert_eq!(
+            shape(read_back(&bytes)),
+            vec![(0, 4, 1000, true), (4, 2, 1004, false), (6, 10, 1006, true)]
+        );
+    }
+
+    #[test]
+    fn initializing_all_of_an_uninit_extent_merges_with_an_initialized_neighbour() {
+        let root = mk_root(&[ext(0, 4, 1000, false), ext(4, 4, 1004, true)]);
+        let (bytes, converted) = plan_initialize_range(&root, 4, 20).unwrap();
+        assert_eq!(converted, vec![4, 5, 6, 7]);
+        assert_eq!(shape(read_back(&bytes)), vec![(0, 8, 1000, false)]);
+    }
+
+    #[test]
+    fn initialized_extents_and_ranges_outside_are_left_alone() {
+        let root = mk_root(&[ext(0, 4, 1000, false), ext(10, 4, 2000, true)]);
+        let (bytes, converted) = plan_initialize_range(&root, 0, 10).unwrap();
+        assert!(converted.is_empty());
+        assert_eq!(shape(read_back(&bytes)), shape(read_back(&root)));
+    }
+
+    #[test]
+    fn initializing_that_overflows_the_root_is_refused() {
+        let root = mk_root(&[
+            ext(0, 16, 1000, true),
+            ext(20, 1, 3000, false),
+            ext(30, 1, 4000, false),
+        ]);
+        let err = plan_initialize_range(&root, 4, 6).unwrap_err();
+        assert!(
+            format!("{err:?}").contains("LEAF_FULL_NEEDS_PROMOTION"),
+            "{err:?}"
+        );
     }
 
     #[test]
