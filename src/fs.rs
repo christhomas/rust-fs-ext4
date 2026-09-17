@@ -3838,7 +3838,13 @@ impl Filesystem {
         // Empty write: BGDs already credited per-run above; only SB needs
         // a single update + inode rewrite.
         if data.is_empty() {
-            self.finalize_inode_raw_after_write(ino, &mut raw, &inode, 0, 0)?;
+            self.finalize_inode_raw_after_write(
+                ino,
+                &mut raw,
+                &inode,
+                0,
+                Self::xattr_block_sectors(&inode, bs),
+            )?;
             if freed_fs_blocks > 0 {
                 self.buffer_patch_sb_counters(&mut buf, freed_fs_blocks as i64, 0)?;
             }
@@ -3895,7 +3901,8 @@ impl Filesystem {
             }
         }
         let new_size = data.len() as u64;
-        let new_sectors = needed_blocks as u64 * sectors_per_block;
+        let new_sectors =
+            needed_blocks as u64 * sectors_per_block + Self::xattr_block_sectors(&inode, bs);
         self.finalize_inode_raw_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
         self.buffer_write_inode(&mut buf, ino, &raw)?;
 
@@ -3954,6 +3961,19 @@ impl Filesystem {
         Ok(count)
     }
 
+    /// The sectors an inode's external xattr block adds to `i_blocks`.
+    ///
+    /// `i_blocks` counts every block the inode holds, and the xattr block is
+    /// one of them. Replacing a file's content replaces its data, not its
+    /// attributes, so the count set afterwards keeps this.
+    fn xattr_block_sectors(inode: &Inode, block_size: u32) -> u64 {
+        if inode.file_acl != 0 {
+            u64::from(block_size) / 512
+        } else {
+            0
+        }
+    }
+
     fn apply_replace_file_content_indirect(
         &self,
         ino: u32,
@@ -3994,7 +4014,13 @@ impl Filesystem {
         Self::patch_inode_block_area(&mut raw, &zero_iblock)?;
 
         if data.is_empty() {
-            self.finalize_inode_raw_after_write(ino, &mut raw, &inode, 0, 0)?;
+            self.finalize_inode_raw_after_write(
+                ino,
+                &mut raw,
+                &inode,
+                0,
+                Self::xattr_block_sectors(&inode, bs),
+            )?;
             if freed_fs_blocks > 0 {
                 self.buffer_patch_sb_counters(&mut buf, freed_fs_blocks as i64, 0)?;
             }
@@ -4072,7 +4098,8 @@ impl Filesystem {
         // blocks (in 512-byte sectors) — extent metadata blocks count the
         // same way for ext4 so the rule is consistent across flavors.
         let new_size = data.len() as u64;
-        let new_sectors = (needed_data_blocks as u64 + n_indirect as u64) * sectors_per_block;
+        let new_sectors = (needed_data_blocks as u64 + n_indirect as u64) * sectors_per_block
+            + Self::xattr_block_sectors(&inode, bs);
         self.finalize_inode_raw_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
         self.buffer_write_inode(&mut buf, ino, &raw)?;
         self.commit_block_buffer(buf)?;
