@@ -82,9 +82,8 @@ pub fn format_filesystem(
 ///   128-byte inodes, no journal, no metadata_csum. Mounts under both this
 ///   crate and the kernel's single ext4 driver running in ext2-compat mode.
 /// - [`FsFlavor::Ext3`] — ext2 layout plus a journal inode and JBD2 log area.
-///   PARTIAL support: it formats and mounts read/write under this crate, but the
-///   produced journal is not yet `e2fsck`-clean (the `mkfs_ext3_oracle` cases
-///   stay `#[ignore]`d), so it is not yet a fully validated ext3 image.
+///   `e2fsck -fn` accepts it fresh and after writes through this crate
+///   (`tests/mkfs_ext3_oracle.rs`).
 ///
 /// Arguments:
 /// - `label`     — volume name (truncated to 16 bytes; UTF-8 stored verbatim).
@@ -695,7 +694,7 @@ fn build_jbd2_superblock(block_size: u32, max_len: u32, uuid: &[u8; 16]) -> Vec<
 }
 
 /// Write the journal-inode image (typically inode 8) for ext3. The
-/// journal inode is mode-less (`i_mode = 0`), `i_links_count = 1`, and
+/// journal inode is a regular file (`i_mode = 0100600`), `i_links_count = 1`, and
 /// `i_block` is filled by the caller from `indirect_mut::plan_contiguous`
 /// — the journal data lives at a contiguous physical run, so the same
 /// indirect-tree primitive every regular ext2/3 file uses works here.
@@ -703,9 +702,11 @@ fn build_jbd2_superblock(block_size: u32, max_len: u32, uuid: &[u8; 16]) -> Vec<
 /// `i_size` covers ONLY the journal data blocks (not the indirect-tree
 /// metadata blocks, which add to `i_blocks` but not `i_size`).
 fn write_journal_inode(slot: &mut [u8], size_bytes: u64, blocks_512: u64, i_block: &[u8; 60]) {
-    // i_mode = 0 — journal has no POSIX type. The kernel checks ino number,
-    // not mode, when locating it. Linux mkfs writes 0 here.
-    slot[0x00..0x02].copy_from_slice(&0u16.to_le_bytes());
+    // i_mode = S_IFREG | 0600, as mke2fs writes it. e2fsck refuses a
+    // journal inode that is not a regular file ("Superblock has an invalid
+    // journal (inode 8)"), and so does the kernel's `ext4_get_journal_inode`
+    // (#89).
+    slot[0x00..0x02].copy_from_slice(&(0o100600u16).to_le_bytes());
     // i_size_lo
     slot[0x04..0x08].copy_from_slice(&((size_bytes & 0xFFFF_FFFF) as u32).to_le_bytes());
     // i_links_count = 1 (the journal-inode-table reference itself).

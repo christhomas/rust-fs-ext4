@@ -94,7 +94,10 @@ contract" below).
 ext3 RW landed via Phase B's flavor-aware journal dispatch
 (`jbd2::journal_block_to_physical` and `JournalWriter::open`
 both branch on `EXTENTS_FL`). ext2 has no journal but otherwise
-shares the same write helpers.
+shares the same write helpers. `tests/mkfs_ext3_oracle.rs` formats both
+flavors, writes through the crate and requires `e2fsck -fn` to pass. An
+ext2/ext3 directory grows through its direct and single-indirect blocks
+only; one that would need the double-indirect block is refused.
 
 ## What works
 
