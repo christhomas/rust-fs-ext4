@@ -15,6 +15,14 @@
   carrying a UUID is read where it is, and a journal declaring
   `ASYNC_COMMIT`, `FAST_COMMIT` or an unknown incompat feature, or a block
   size other than the filesystem's, is refused.
+- A commit sets `needs_recovery` before its journal goes live and clears
+  it once the journal is clean again, including in a superblock block the
+  transaction journals. Linux replays only a filesystem carrying that
+  flag and wipes the journal of one without it, so a crash mid-commit was
+  discarded rather than recovered.
+- Replay marks the journal clean and clears `needs_recovery` once the
+  writes are on disk. It left both set, so every mount replayed the same
+  log again and `e2fsck` reported a journal still holding data.
 
 ## [0.5.1] — 2026-09-06
 

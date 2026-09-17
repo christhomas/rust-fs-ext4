@@ -171,11 +171,12 @@ fn e2fsck_replays_what_this_crate_committed(tag: &str, features: &str, bits: u32
         for (i, &block) in TARGETS.iter().enumerate() {
             tx.add_write(block, pattern(i)).unwrap();
         }
-        // Descriptor, three data blocks and the commit, then the journal
-        // superblock marked dirty. The final-location writes are lost.
+        // Descriptor, three data blocks and the commit, `needs_recovery`,
+        // then the journal superblock marked dirty. The final-location
+        // writes are lost.
         let dev = CrashDevice {
             inner: Arc::new(FileDevice::open_rw(&image).unwrap()),
-            budget: 5 + 1,
+            budget: 5 + 1 + 1,
             writes: AtomicUsize::new(0),
         };
         writer.commit(&dev, &tx).unwrap();
