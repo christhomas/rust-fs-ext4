@@ -23,6 +23,14 @@
 
 ### Fixed
 
+- A write into a preallocated range lands in the preallocated blocks.
+  `apply_pwrite` took an uninitialized extent, which reads as zeros, for a
+  hole, and was refused inserting a fresh extent over it as a corrupt
+  extent tree. The written range is now marked initialized
+  (`extent_mut::plan_initialize_range`), and its blocks are written in
+  full, so none of the preallocation's old contents can be read. A
+  preallocation whose split doesn't fit the inode's inline root is refused
+  as unsupported (#240).
 - Journal transactions carry the checksums their journal declares. On a
   `metadata_csum` filesystem every tag, descriptor, revoke and commit
   checksum was written as zero, so Linux's recovery stopped at the commit

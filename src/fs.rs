@@ -4005,6 +4005,46 @@ impl Filesystem {
         let mut newly_alloc: std::collections::BTreeSet<u64> = std::collections::BTreeSet::new();
         let mut alloc_total_blocks: u64 = 0;
 
+        // A PREALLOCATED BLOCK IS NOT A HOLE. `map_logical` answers `None`
+        // for an uninitialized extent, so reads see zeros, and Phase 1
+        // below took that for a hole: it allocated a fresh block and was
+        // refused inserting an extent over the preallocated one. The
+        // blocks already belong to the file, so the write goes into them
+        // and the range it covers becomes initialized. They count as new
+        // in Phase 2: a zero-filled block holds the data, so whatever the
+        // preallocated block held never becomes readable.
+        let mut preallocated = false;
+        for lb in first_lb..last_lb_excl.min(u64::from(u32::MAX)) {
+            if let Some(e) =
+                crate::extent::lookup(&root_bytes, self.dev.as_ref(), self.sb.block_size(), lb)?
+            {
+                if e.uninitialized {
+                    preallocated = true;
+                    break;
+                }
+            }
+        }
+        if preallocated {
+            let (new_root, converted) = crate::extent_mut::plan_initialize_range(
+                &root_bytes,
+                first_lb as u32,
+                last_lb_excl.min(u64::from(u32::MAX)) as u32,
+            )
+            .map_err(|e| match e {
+                Error::CorruptExtentTree(msg)
+                    if msg.contains("multi-level") || msg.contains("LEAF_FULL") =>
+                {
+                    Error::Unsupported(
+                        "pwrite: writing into a preallocated range needs its extent split \
+                         in a tree deeper than the inode's inline root",
+                    )
+                }
+                e => e,
+            })?;
+            root_bytes = new_root;
+            newly_alloc.extend(converted.into_iter().map(u64::from));
+        }
+
         // Phase 1: walk affected logical blocks; allocate each contiguous
         // unmapped run as one physical extent and stage the bitmap/BGD
         // updates. Repeated `map_logical` calls re-parse `root_bytes` each
