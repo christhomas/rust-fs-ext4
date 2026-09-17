@@ -5472,6 +5472,18 @@ impl Filesystem {
         };
 
         let (mut left, mut right) = (split.left_bytes, split.right_bytes);
+        let seal = |block: &mut Vec<u8>| {
+            if reserved_tail == 12 {
+                self.csum
+                    .patch_dir_entry_tail(dir_ino, dir.generation, block);
+            }
+        };
+        // The new half goes on disk first holding only the names it takes
+        // from the full leaf, which that leaf still holds: until the commit
+        // below routes to it, it is an unreferenced copy, and every name is
+        // where the index sends a lookup (CodeRabbit on #238).
+        let mut right_moved = right.clone();
+        seal(&mut right_moved);
         let into = if hash >= split.split_out_hash {
             &mut right
         } else {
@@ -5489,19 +5501,24 @@ impl Filesystem {
             Err(Error::OutOfBounds) => return Ok(false),
             Err(e) => return Err(e),
         }
+        seal(&mut left);
+        seal(&mut right);
         let mut parent = parent;
-        if reserved_tail == 12 {
-            self.csum
-                .patch_dir_entry_tail(dir_ino, dir.generation, &mut left);
-            self.csum
-                .patch_dir_entry_tail(dir_ino, dir.generation, &mut right);
-        }
         self.csum
             .patch_dx_tail(dir_ino, dir.generation, &mut parent, count_offset);
 
-        self.append_dir_block(dir_ino, right)?;
+        self.append_dir_block(dir_ino, right_moved)?;
+        let (grown, _) = self.read_inode_verified(dir_ino)?;
+        let right_phys = self
+            .map_inode_logical(&grown, u64::from(new_logical))?
+            .ok_or(Error::CorruptDirEntry(
+                "the appended htree leaf is not mapped",
+            ))?;
+        // The halved leaf, the new name in its half and the routing entry
+        // land in one transaction.
         let mut buf = BlockBuffer::new(self.sb.block_size());
         buf.put(leaf_phys, left);
+        buf.put(right_phys, right);
         buf.put(parent_phys, parent);
         self.commit_block_buffer(buf)?;
         Ok(true)
@@ -5555,10 +5572,7 @@ impl Filesystem {
                 &parent_inode,
                 &mut parent_raw,
                 new_logical_block,
-                name,
-                target_ino,
-                file_type,
-                has_ft,
+                block,
             );
         }
 
@@ -5713,10 +5727,7 @@ impl Filesystem {
         parent_inode: &Inode,
         parent_raw: &mut [u8],
         new_logical_block: u64,
-        name: &[u8],
-        target_ino: u32,
-        file_type: crate::dir::DirEntryType,
-        has_ft: bool,
+        block: Vec<u8>,
     ) -> Result<()> {
         use crate::inode::OFF_BLOCK;
         const DIRECT: u64 = 12;
@@ -5784,22 +5795,6 @@ impl Filesystem {
             }
         }
         self.write_inode_raw(parent_ino, parent_raw)?;
-
-        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
-        let mut block = vec![0u8; bs as usize];
-        block[4..6].copy_from_slice(&((bs as usize - reserved_tail) as u16).to_le_bytes());
-        crate::dir::add_entry_to_block(
-            &mut block,
-            target_ino,
-            name,
-            file_type,
-            has_ft,
-            reserved_tail,
-        )?;
-        if reserved_tail == 12 {
-            self.csum
-                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
-        }
         self.dev.write_at(u64::from(new_phys) * bs_u64, &block)
     }
 

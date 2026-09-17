@@ -153,11 +153,13 @@ fn writes_into_an_indexed_directory_with_metadata_csum() {
 ///
 /// `e2fsck -D` packs the leaves full, so the first create into any of them
 /// splits it: half its names move to a new block, the name goes into its
-/// half, and the root gains the entry routing the new block. 1500 creates
+/// half, and the root gains the entry routing the new block. 800 creates
 /// into a 600-name directory split many times without filling the 1 KiB
-/// root. Every name must then be in the leaf the index routes it to -- a
-/// lookup here falls back to a linear scan, so finding it is not enough --
-/// and e2fsck, which checks the whole index, must be clean.
+/// root, which holds 123 routes under metadata_csum -- 1500 filled it on
+/// x86_64, where the names hash to a different spread. Every name must then
+/// be in the leaf the index routes it to -- a lookup here falls back to a
+/// linear scan, so finding it is not enough -- and e2fsck, which checks the
+/// whole index, must be clean.
 fn split_leaves(tag: &str, features: &str) {
     let Some(image) = indexed_volume(tag, features, 600) else {
         return;
@@ -175,7 +177,7 @@ fn split_leaves(tag: &str, features: &str) {
         };
         let before = root_count(&fs);
         let mut names: Vec<String> = (0..600).map(|i| format!("existing_file_{i:05}")).collect();
-        for i in 0..1500 {
+        for i in 0..800 {
             let name = format!("a_longer_name_to_fill_leaves_{i:05}");
             fs.apply_create(&format!("/bigdir/{name}"), 0o644)
                 .expect("create");
