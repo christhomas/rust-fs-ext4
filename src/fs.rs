@@ -517,6 +517,70 @@ impl Filesystem {
         Ok(out)
     }
 
+    /// The orphan chain as recovery walks it: [`Self::orphan_list`], except
+    /// that it stops at a member that is not allocated in the inode bitmap
+    /// and whose `i_dtime` is no longer a link, as the kernel's
+    /// `ext4_orphan_cleanup` stops at a "bad orphan inode" before clearing
+    /// `s_last_orphan`.
+    ///
+    /// Such a member is an orphan an earlier recovery already reclaimed and
+    /// stamped with a deletion time. Following that time as an inode number
+    /// failed every later mount's recovery on "InvalidInode", and the chain
+    /// was never cleared (#124).
+    ///
+    /// A free member whose `i_dtime` is still an inode number is different:
+    /// a recovery was cut while reclaiming it, before the superblock moved
+    /// the head past it. [`Self::recover_orphans`] keeps that link until the
+    /// head has moved, so the walk goes through it and on to the members
+    /// behind it, and the retry finishes whatever the cut left.
+    fn orphan_chain_to_recover(&self) -> Result<Vec<u32>> {
+        let mut out = Vec::new();
+        let mut cur = self.sb.last_orphan;
+        while cur != 0 {
+            if out.len() as u64 > u64::from(self.sb.inodes_count) {
+                return Err(Error::Corrupt(
+                    "orphan_list: chain longer than inodes_count (cycle?)",
+                ));
+            }
+            let allocated = self.inode_bit_is_set(cur)?;
+            if !allocated && (cur > self.sb.inodes_count || cur < self.sb.first_inode) {
+                break;
+            }
+            let raw = self.read_inode_raw(cur)?;
+            if raw.len() < 0x18 {
+                return Err(Error::Corrupt("orphan_list: inode too short"));
+            }
+            let next = u32::from_le_bytes(raw[0x14..0x18].try_into().unwrap());
+            if !allocated && next > self.sb.inodes_count {
+                break;
+            }
+            out.push(cur);
+            cur = next;
+        }
+        Ok(out)
+    }
+
+    /// Whether `ino` is marked in use in its group's inode bitmap. An
+    /// out-of-range number, or a group still `INODE_UNINIT`, is not.
+    fn inode_bit_is_set(&self, ino: u32) -> Result<bool> {
+        if ino == 0 || ino > self.sb.inodes_count || self.sb.inodes_per_group == 0 {
+            return Ok(false);
+        }
+        let ipg = self.sb.inodes_per_group;
+        let groups = self.allocation_groups();
+        let Some(group) = groups.get(((ino - 1) / ipg) as usize) else {
+            return Ok(false);
+        };
+        if group.flags().contains(crate::bgd::BgdFlags::INODE_UNINIT) {
+            return Ok(false);
+        }
+        let bitmap = self.read_block(group.inode_bitmap)?;
+        let bit = ((ino - 1) % ipg) as usize;
+        Ok(bitmap
+            .get(bit / 8)
+            .is_some_and(|byte| byte & (1 << (bit % 8)) != 0))
+    }
+
     /// Phase 6.2 — orphan replay.
     ///
     /// # THE CHAIN HAS TWO KINDS OF MEMBER AND THEY GET OPPOSITE
@@ -542,8 +606,26 @@ impl Filesystem {
     /// the only way back to its contents — zeroed, while the directory
     /// entries naming it were left pointing at a free inode.
     ///
-    /// Runs as ONE multi-block journaled transaction so a crash
-    /// mid-recovery either commits all of it or none of it.
+    /// # ONE COMMIT PER MEMBER, AND THE LINK OUTLIVES THE MEMBER
+    ///
+    /// A member's only link to the next is its own `i_dtime`, which both
+    /// treatments overwrite. So each member is its own commit, which also
+    /// moves `s_last_orphan` on to the next member, and in that commit the
+    /// member's `i_dtime` still holds the link. Without a journal the
+    /// superblock is written last, so a cut anywhere in the commit leaves
+    /// the head on this member with the link intact, and the next mount
+    /// walks through it to the rest (see [`Self::orphan_chain_to_recover`]).
+    /// The final `i_dtime` (a deletion time, or zero for a finished
+    /// truncate) is written in the NEXT member's commit, once the head is
+    /// durably past it. The last member has nothing behind it to lose and
+    /// gets its final `i_dtime` at once.
+    ///
+    /// All in one commit, a cut after the head's group and before a later
+    /// member's left the head free with a deletion time and the later
+    /// member allocated, and the next mount cleared the chain at the head
+    /// and stranded the rest (Greptile on #201). A cut between two commits
+    /// can still leave one member off the chain with its link for an
+    /// `i_dtime`, which `e2fsck -p` resets without asking.
     ///
     /// Returns the number of orphan inodes **reclaimed** — completed
     /// truncates are not counted, because nothing was reclaimed. No-op
@@ -562,84 +644,135 @@ impl Filesystem {
         if self.refuse_write().is_err() {
             return Ok(0);
         }
-        let chain = self.orphan_list()?;
-        if chain.is_empty() {
+        if self.sb.last_orphan == 0 {
             return Ok(0);
         }
+        let chain = self.orphan_chain_to_recover()?;
 
         let bs = self.sb.block_size();
-        let sectors_per_block = bs as u64 / 512;
-        let mut buf = BlockBuffer::new(bs);
-        let mut total_freed_blocks: u64 = 0;
         let mut reclaimed = 0usize;
+        // The member the previous commit moved the head past, and the
+        // `i_dtime` it should end with.
+        let mut unstamped: Option<(u32, u32)> = None;
 
-        for &orphan_ino in &chain {
-            // Read the orphan's raw bytes (skip csum verify — orphan
-            // inodes routinely carry stale csums by design).
-            let mut raw = self.read_inode_raw(orphan_ino)?;
-            let parsed = match Inode::parse(&raw) {
-                Ok(i) => i,
-                Err(_) => continue, // unparseable orphan — skip + leak rather than panic
-            };
-
-            // STILL NAMED BY A DIRECTORY. This is an interrupted
-            // truncate, not a deletion. Finish the truncate and leave
-            // the file alone.
-            if parsed.links_count != 0 {
-                total_freed_blocks +=
-                    self.buffer_finish_interrupted_truncate(&mut buf, orphan_ino, &parsed, raw)?;
-                continue;
-            }
-
-            // Free data blocks (extents path only — orphan recovery for
-            // legacy indirect inodes is a follow-up).
-            if parsed.has_extents() && parsed.size > 0 {
-                let (_sc, muts) = match crate::file_mut::plan_truncate_shrink(
-                    parsed.size,
-                    0,
-                    &parsed.block,
-                    bs,
-                ) {
-                    Ok(p) => p,
-                    Err(_) => continue,
-                };
-                for m in &muts {
-                    if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                        total_freed_blocks +=
-                            self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
-                    }
-                }
-            }
-            // Free the inode bitmap slot + BGD free_inodes++.
-            self.buffer_free_inode_slot(&mut buf, orphan_ino)?;
-
-            // Zero the inode body (preserve generation), set dtime.
-            let inode_size = self.sb.inode_size as usize;
-            let old_gen = parsed.generation;
-            for b in &mut raw[..inode_size] {
-                *b = 0;
-            }
-            let dtime = now_unix_seconds();
-            raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
-            raw[0x64..0x68].copy_from_slice(&old_gen.to_le_bytes());
-            self.finalize_inode_raw(orphan_ino, old_gen, &mut raw)?;
-            self.buffer_write_inode(&mut buf, orphan_ino, &raw)?;
-
-            reclaimed += 1;
+        if chain.is_empty() {
+            let mut buf = BlockBuffer::new(bs);
+            self.buffer_patch_sb_last_orphan(&mut buf, 0)?;
+            return self.commit_block_buffer(buf).map(|()| 0);
         }
 
-        // SB: free_blocks_count += total_freed, free_inodes_count +=
-        // reclaimed, s_last_orphan = 0.
-        self.buffer_patch_sb_counters(&mut buf, total_freed_blocks as i64, reclaimed as i32)?;
-        self.buffer_patch_sb_last_orphan(&mut buf, 0)?;
-
-        // i_blocks tracking on the freed inodes is moot (they're zero
-        // now); their per-extent sectors are accounted for in the
-        // BGD/SB counter updates above.
-        let _ = sectors_per_block;
-
-        self.commit_block_buffer(buf)?;
+        for (at, &orphan_ino) in chain.iter().enumerate() {
+            let next = chain.get(at + 1).copied().unwrap_or(0);
+            let mut buf = BlockBuffer::new(bs);
+            if let Some((ino, dtime)) = unstamped.take() {
+                self.buffer_stamp_dtime(&mut buf, ino, dtime)?;
+            }
+            let Some((blocks, final_dtime, deleted)) =
+                self.buffer_recover_orphan(&mut buf, orphan_ino, next)?
+            else {
+                // AN ORPHAN THIS CANNOT RECLAIM STAYS AT THE HEAD (CodeRabbit
+                // on #201). Its inode and blocks are left untouched and the
+                // chain is not advanced past it, so nothing is freed without
+                // its blocks and nothing leaves the chain still holding them;
+                // the members behind it wait with it. Only the previous
+                // member's pending `i_dtime` is written.
+                self.commit_block_buffer(buf)?;
+                break;
+            };
+            self.buffer_patch_sb_counters(&mut buf, blocks as i64, i32::from(deleted))?;
+            reclaimed += usize::from(deleted);
+            if next == 0 {
+                self.buffer_stamp_dtime(&mut buf, orphan_ino, final_dtime)?;
+            } else {
+                unstamped = Some((orphan_ino, final_dtime));
+            }
+            self.buffer_patch_sb_last_orphan(&mut buf, next)?;
+            self.commit_block_buffer(buf)?;
+        }
         Ok(reclaimed)
+    }
+
+    /// Set `ino`'s `i_dtime` in `buf`, keeping its checksum right.
+    fn buffer_stamp_dtime(&self, buf: &mut BlockBuffer, ino: u32, dtime: u32) -> Result<()> {
+        let (block, offset) = bgd::locate_inode(&self.sb, &self.groups, ino)?;
+        let inode_size = self.sb.inode_size as usize;
+        let bytes = buf.get_mut(self, block)?;
+        let raw = bytes
+            .get_mut(offset as usize..offset as usize + inode_size)
+            .ok_or(Error::Corrupt("inode slice exceeds block data"))?;
+        raw[0x14..0x18].copy_from_slice(&dtime.to_le_bytes());
+        let generation = u32::from_le_bytes(raw[0x64..0x68].try_into().unwrap());
+        let mut owned = raw.to_vec();
+        self.finalize_inode_raw(ino, generation, &mut owned)?;
+        raw.copy_from_slice(&owned);
+        Ok(())
+    }
+
+    /// Reclaim one chain member into `buf`, leaving `link` in its
+    /// `i_dtime`. Returns the blocks freed, the `i_dtime` the member ends
+    /// with, and whether the inode itself was freed; `None`, having touched
+    /// nothing, for a member this cannot reclaim whole -- one that does not
+    /// parse, one whose blocks are mapped the legacy indirect way, or one
+    /// whose extent tree the truncate planner does not handle.
+    fn buffer_recover_orphan(
+        &self,
+        buf: &mut BlockBuffer,
+        orphan_ino: u32,
+        link: u32,
+    ) -> Result<Option<(u64, u32, bool)>> {
+        let bs = self.sb.block_size();
+        // Read the orphan's raw bytes (skip csum verify — orphan
+        // inodes routinely carry stale csums by design).
+        let mut raw = self.read_inode_raw(orphan_ino)?;
+        let parsed = match Inode::parse(&raw) {
+            Ok(i) => i,
+            Err(_) => return Ok(None), // unparseable orphan — skip + leak rather than panic
+        };
+
+        // STILL NAMED BY A DIRECTORY. This is an interrupted
+        // truncate, not a deletion. Finish the truncate and leave
+        // the file alone.
+        if parsed.links_count != 0 {
+            let freed = self.buffer_finish_interrupted_truncate(buf, orphan_ino, &parsed, raw)?;
+            self.buffer_stamp_dtime(buf, orphan_ino, link)?;
+            return Ok(Some((freed, 0, false)));
+        }
+
+        // Free data blocks (extents path only — orphan recovery for
+        // legacy indirect inodes is a follow-up). An indirect inode that
+        // holds blocks is not reclaimed at all: freeing its inode without
+        // its blocks would strand them, allocated and named by nothing.
+        let mut freed = 0u64;
+        if !parsed.has_extents() && parsed.blocks > 0 {
+            return Ok(None);
+        }
+        if parsed.has_extents() && parsed.size > 0 {
+            let Ok((_sc, muts)) =
+                crate::file_mut::plan_truncate_shrink(parsed.size, 0, &parsed.block, bs)
+            else {
+                return Ok(None);
+            };
+            for m in &muts {
+                if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
+                    freed += self.buffer_free_block_run_and_bgd(buf, *start, *len as u64)?;
+                }
+            }
+        }
+        // Free the inode bitmap slot + BGD free_inodes++.
+        self.buffer_free_inode_slot(buf, orphan_ino)?;
+
+        // Zero the inode body (preserve generation). i_blocks is moot
+        // once zeroed; the freed extents are in the counters above.
+        let inode_size = self.sb.inode_size as usize;
+        let old_gen = parsed.generation;
+        for b in &mut raw[..inode_size] {
+            *b = 0;
+        }
+        raw[0x14..0x18].copy_from_slice(&link.to_le_bytes());
+        raw[0x64..0x68].copy_from_slice(&old_gen.to_le_bytes());
+        self.finalize_inode_raw(orphan_ino, old_gen, &mut raw)?;
+        self.buffer_write_inode(buf, orphan_ino, &raw)?;
+        Ok(Some((freed, now_unix_seconds(), true)))
     }
 
     /// Finish a `truncate()` that a crash interrupted, for an orphan that
@@ -2006,11 +2139,27 @@ impl Filesystem {
             publish(self);
             Ok(())
         } else {
+            // THE SUPERBLOCK GOES LAST, after everything else is flushed.
+            // It carries the markers that say work is finished --
+            // `s_last_orphan` cleared, the free counts credited -- and the
+            // map iterates by block number, which put block 0 first. A
+            // crash after it and before the inode table left an orphan
+            // still allocated, still holding its blocks, and named by
+            // nothing, so no later mount would retry it (#124). Written
+            // last, a crash anywhere before it leaves the old superblock,
+            // whose chain head sends the next mount back to finish.
             let bs = self.sb.block_size() as u64;
-            for (block, bytes) in buf.dirty {
+            let sb_block = crate::superblock::SUPERBLOCK_OFFSET / bs;
+            let mut dirty = buf.dirty;
+            let superblock = dirty.remove(&sb_block);
+            for (block, bytes) in dirty {
                 self.dev.write_at(block * bs, &bytes)?;
             }
             self.dev.flush()?;
+            if let Some(bytes) = superblock {
+                self.dev.write_at(sb_block * bs, &bytes)?;
+                self.dev.flush()?;
+            }
             publish(self);
             Ok(())
         }
@@ -5632,6 +5781,330 @@ mod tests {
         assert_eq!(inode.links_count, 0, "an unlinked orphan stays unlinked");
         assert_ne!(inode.dtime, 0, "and is stamped as deleted");
         assert_eq!(inode.size, 0, "its body is gone");
+    }
+
+    /// A device that drops every write after the first `budget`, as power
+    /// loss would, and reports success for them.
+    struct CrashDev {
+        inner: std::sync::Arc<MemDev>,
+        budget: usize,
+        writes: std::sync::atomic::AtomicUsize,
+    }
+
+    impl crate::block_io::BlockDevice for CrashDev {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+        fn size_bytes(&self) -> u64 {
+            self.inner.size_bytes()
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            let n = self
+                .writes
+                .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+            if n < self.budget {
+                self.inner.write_at(offset, buf)?;
+            }
+            Ok(())
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_writable(&self) -> bool {
+            true
+        }
+    }
+
+    /// Unjournaled orphan recovery, cut after every write, never disarms
+    /// itself before its work is on disk (#124).
+    ///
+    /// The unjournaled commit wrote its blocks in ascending block order, so
+    /// the superblock -- whose cleared `s_last_orphan` says the work is done
+    /// -- went first and the inode table last. A cut in between left an
+    /// orphan still allocated, still holding its blocks, and named by
+    /// nothing, so no mount would retry it; one cut later its blocks were
+    /// free in the bitmap while the inode still mapped them.
+    ///
+    /// Each cut is judged twice. Straight after the crash, read-only: a
+    /// cleared chain head must mean the inode really is deleted. Then after
+    /// the next writable mount has had its chance to retry: the orphan must
+    /// be gone and fsck must find nothing.
+    #[test]
+    fn unjournaled_orphan_recovery_survives_a_cut_after_every_write() {
+        let dev = formatted();
+        let planted = {
+            let fs = mount(&dev);
+            assert!(
+                fs.journal.is_none(),
+                "fixture: this path is the unjournaled one"
+            );
+            let ino = fs.apply_create("/gone.txt", 0o644).expect("create");
+            fs.apply_pwrite("/gone.txt", 0, &[0xAB; 4 * BS as usize])
+                .expect("write");
+            ino
+        };
+        {
+            // Unlinked while open: the name is gone, and only the chain
+            // holds the inode and its blocks.
+            let fs = mount(&dev);
+            let (root, _) = fs.read_inode_verified(2).expect("root");
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            fs.buffer_remove_dir_entry(&mut buf, 2, &root, b"gone.txt")
+                .expect("remove the name");
+            fs.commit_block_buffer(buf).expect("commit");
+            plant_orphan(&fs, planted, 0, None);
+        }
+        let snapshot = dev.bytes.lock().unwrap().clone();
+
+        let mut total = None;
+        for cut in 0.. {
+            let image = MemDev::new(VOL);
+            *image.bytes.lock().unwrap() = snapshot.clone();
+            let crash = std::sync::Arc::new(CrashDev {
+                inner: image.clone(),
+                budget: cut,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+            });
+            drop(Filesystem::mount(crash.clone()).expect("mount through the cut"));
+            let written = crash.writes.load(std::sync::atomic::Ordering::SeqCst);
+            total.get_or_insert(written);
+
+            {
+                let ro = std::sync::Arc::new(RoDev(image.clone()));
+                let fs = Filesystem::mount(ro).expect("read-only mount of the cut image");
+                let (inode, _) = fs.read_inode_verified(planted).expect("read orphan");
+                if fs.sb.last_orphan == 0 {
+                    assert!(
+                        inode.dtime != 0 && inode.size == 0,
+                        "cut {cut}: the chain head is cleared but the orphan is not deleted \
+                         (dtime {}, size {}); no mount will retry it",
+                        inode.dtime,
+                        inode.size
+                    );
+                }
+            }
+            {
+                // This mount retries recovery; the next one observes it,
+                // since `orphan_list` reads the superblock as mounted.
+                drop(mount(&image));
+                let fs = mount(&image);
+                assert!(
+                    fs.orphan_list()
+                        .unwrap_or_else(|e| panic!("cut {cut}: orphan_list: {e:?}"))
+                        .is_empty(),
+                    "cut {cut}: the next mount left the orphan on the chain"
+                );
+                // Free-count drift is allowed: a retry credits the counts a
+                // crashed attempt already credited, and `e2fsck -p` fixes
+                // "free blocks count wrong" silently. Anything else is not.
+                let report = crate::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
+                let serious: Vec<_> = report
+                    .anomalies
+                    .iter()
+                    .filter(|a| {
+                        !matches!(
+                            a,
+                            crate::fsck::Anomaly::BlockGroupFreeCountDrift { .. }
+                                | crate::fsck::Anomaly::SuperblockFreeCountDrift { .. }
+                        )
+                    })
+                    .collect();
+                assert!(
+                    serious.is_empty(),
+                    "cut {cut}: after the retry, fsck finds {serious:?}"
+                );
+                // Reclaimed means free in the inode bitmap. A crash between
+                // that bit and the inode table can leave the body unzeroed
+                // with no deletion time, which `e2fsck -p` stamps silently;
+                // with the bit clear nothing treats it as live.
+                assert!(
+                    !fs.inode_bit_is_set(planted).expect("inode bitmap"),
+                    "cut {cut}: after the retry the orphan is still allocated"
+                );
+            }
+            if cut >= written {
+                break;
+            }
+        }
+        assert!(
+            total.unwrap_or(0) > 1,
+            "the recovery commit must span several writes to cut"
+        );
+    }
+
+    /// A chain whose members sit in different block groups, cut after
+    /// every write, strands none of them (Greptile on #201).
+    ///
+    /// The chain's only link from one member to the next is the member's
+    /// own `i_dtime`, and reclaiming a member overwrites it. With the
+    /// whole chain in one commit, a cut after the head's group was written
+    /// and before the second member's left the head free with a deletion
+    /// time and the second still allocated; the next mount stopped at the
+    /// free head and cleared `s_last_orphan`, and the second member and its
+    /// blocks were named by nothing, for good.
+    #[test]
+    fn unjournaled_recovery_of_a_chain_across_groups_survives_a_cut_after_every_write() {
+        // Two groups: 32768 blocks per group at 4 KiB, and a second
+        // group this driver's mkfs only makes at a 4 KiB block size.
+        const TWO_GROUPS: u64 = 160 * 1024 * 1024;
+        let dev = MemDev::new(TWO_GROUPS);
+        crate::mkfs::format_filesystem(dev.as_ref(), Some("orphans"), None, TWO_GROUPS, BS)
+            .expect("format");
+        let members = {
+            let fs = mount(&dev);
+            assert!(fs.journal.is_none(), "fixture: the unjournaled path");
+            let ipg = fs.sb.inodes_per_group;
+            let mut by_group = std::collections::BTreeMap::new();
+            for d in 0..8 {
+                // Remounted each time, so the spread sees the counts the
+                // last directory left.
+                let fs = mount(&dev);
+                fs.apply_mkdir(&format!("/d{d}"), 0o755).expect("mkdir");
+                let path = format!("/d{d}/gone");
+                let ino = fs.apply_create(&path, 0o644).expect("create");
+                fs.apply_pwrite(&path, 0, &[0xCD; 3000]).expect("write");
+                by_group.entry((ino - 1) / ipg).or_insert((d, ino));
+            }
+            let members: Vec<(usize, u32)> = by_group.into_values().take(3).collect();
+            assert!(
+                members.len() >= 2,
+                "fixture: the orphans must sit in different groups, got {by_group_len}",
+                by_group_len = members.len()
+            );
+            members
+        };
+        {
+            // Unlink each while open, and chain them: the head's i_dtime
+            // names the second, and so on.
+            let fs = mount(&dev);
+            for &(d, _) in &members {
+                let dir = resolve_ino(&fs, &format!("/d{d}"));
+                let (parent, _) = fs.read_inode_verified(dir).expect("dir");
+                let mut buf = BlockBuffer::new(fs.sb.block_size());
+                fs.buffer_remove_dir_entry(&mut buf, dir, &parent, b"gone")
+                    .expect("remove the name");
+                fs.commit_block_buffer(buf).expect("commit");
+            }
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            for (i, &(_, ino)) in members.iter().enumerate() {
+                let next = members.get(i + 1).map_or(0, |&(_, n)| n);
+                let (inode, mut raw) = fs.read_inode_verified(ino).expect("read");
+                raw[0x1A..0x1C].copy_from_slice(&0u16.to_le_bytes());
+                raw[0x14..0x18].copy_from_slice(&next.to_le_bytes());
+                fs.finalize_inode_raw(ino, inode.generation, &mut raw)
+                    .expect("finalize");
+                fs.buffer_write_inode(&mut buf, ino, &raw).expect("write");
+            }
+            fs.buffer_patch_sb_last_orphan(&mut buf, members[0].1)
+                .expect("head");
+            fs.commit_block_buffer(buf).expect("commit");
+        }
+        let snapshot = dev.bytes.lock().unwrap().clone();
+
+        let mut total = None;
+        for cut in 0.. {
+            let image = MemDev::new(TWO_GROUPS);
+            *image.bytes.lock().unwrap() = snapshot.clone();
+            let crash = std::sync::Arc::new(CrashDev {
+                inner: image.clone(),
+                budget: cut,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+            });
+            drop(Filesystem::mount(crash.clone()).expect("mount through the cut"));
+            let written = crash.writes.load(std::sync::atomic::Ordering::SeqCst);
+            total.get_or_insert(written);
+
+            // The next writable mount retries; the one after observes.
+            drop(mount(&image));
+            let fs = mount(&image);
+            assert!(
+                fs.orphan_list()
+                    .unwrap_or_else(|e| panic!("cut {cut}: orphan_list: {e:?}"))
+                    .is_empty(),
+                "cut {cut}: the chain was not cleared"
+            );
+            for &(_, ino) in &members {
+                assert!(
+                    !fs.inode_bit_is_set(ino).expect("inode bitmap"),
+                    "cut {cut}: orphan {ino} is still allocated and named by nothing"
+                );
+            }
+            let report = crate::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
+            let serious: Vec<_> = report
+                .anomalies
+                .iter()
+                .filter(|a| {
+                    !matches!(
+                        a,
+                        crate::fsck::Anomaly::BlockGroupFreeCountDrift { .. }
+                            | crate::fsck::Anomaly::SuperblockFreeCountDrift { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                serious.is_empty(),
+                "cut {cut}: after the retry, fsck finds {serious:?}"
+            );
+            if cut >= written {
+                break;
+            }
+        }
+        assert!(total.unwrap_or(0) > 2, "recovery must span several writes");
+    }
+
+    /// An orphan whose blocks this cannot reclaim -- mapped the legacy
+    /// indirect way, as every ext3 file is -- is left whole and at the head
+    /// of the chain (CodeRabbit on #201). Freeing its inode without its
+    /// blocks, and moving the head past it, left the blocks allocated and
+    /// named by nothing, for good.
+    #[test]
+    fn an_orphan_whose_blocks_cannot_be_reclaimed_stays_whole_at_the_head() {
+        let dev = formatted();
+        let ino = {
+            let fs = mount(&dev);
+            let ino = fs.apply_create("/gone.txt", 0o644).expect("create");
+            fs.apply_pwrite("/gone.txt", 0, &[0xAB; 3 * BS as usize])
+                .expect("write");
+            ino
+        };
+        {
+            let fs = mount(&dev);
+            let (root, _) = fs.read_inode_verified(2).expect("root");
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            fs.buffer_remove_dir_entry(&mut buf, 2, &root, b"gone.txt")
+                .expect("remove the name");
+            // Mapped the legacy way, as far as recovery can tell: the
+            // driver cannot write an indirect file to make one.
+            let (inode, mut raw) = fs.read_inode_verified(ino).expect("read");
+            let flags = inode.flags & !crate::inode::InodeFlags::EXTENTS.bits();
+            raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+            fs.finalize_inode_raw(ino, inode.generation, &mut raw)
+                .expect("finalize");
+            fs.buffer_write_inode(&mut buf, ino, &raw)
+                .expect("write inode");
+            fs.commit_block_buffer(buf).expect("commit");
+            plant_orphan(&fs, ino, 0, None);
+            let (inode, _) = fs.read_inode_verified(ino).expect("read");
+            assert!(
+                !inode.has_extents() && inode.blocks > 0,
+                "fixture: a non-extent orphan holding blocks"
+            );
+        }
+        // This mount runs recovery; the next one observes what it left.
+        drop(mount(&dev));
+        let fs = mount(&dev);
+        assert_eq!(fs.sb.last_orphan, ino, "the orphan left the chain");
+        assert!(
+            fs.inode_bit_is_set(ino).expect("bitmap"),
+            "the orphan's inode was freed without its blocks"
+        );
+        let (inode, _) = fs.read_inode_verified(ino).expect("read");
+        assert!(inode.blocks > 0, "the orphan's body was zeroed");
+    }
+
+    fn resolve_ino(fs: &Filesystem, path: &str) -> u32 {
+        let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(inode, _)| inode);
+        crate::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, path).expect("resolve")
     }
 
     // ---------------------------------------------------------------
