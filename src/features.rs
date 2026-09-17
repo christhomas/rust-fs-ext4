@@ -71,9 +71,9 @@ pub const SUPPORTED_INCOMPAT: u32 = Incompat::FILETYPE.bits()
     | Incompat::BIT64.bits()
     | Incompat::FLEX_BG.bits()
     | Incompat::CSUM_SEED.bits()
-    // A dirty journal: replayed by a writable mount
-    // (`journal_apply::replay_if_dirty`); a read-only mount does not
-    // replay it and reads the volume as it stands (#72).
+    // A dirty journal: replayed onto the device by a writable mount
+    // (`journal_apply::replay_if_dirty`), and into the buffer cache by a
+    // read-only one (`journal_apply::replay_into_cache`, #72).
     | Incompat::RECOVER.bits()
     // Read-only only: see WRITE_BREAKING_INCOMPAT.
     | Incompat::MMP.bits()

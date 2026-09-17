@@ -333,10 +333,12 @@ impl Filesystem {
             journal: None,
         };
 
-        // Replay a dirty journal if the device is writable. Silently skips
-        // for read-only mounts — the read path tolerates a non-clean journal
-        // (pending transactions are invisible, which is correct for a
-        // read-only view).
+        // Replay a dirty journal: onto the device if it is writable (below,
+        // after the write-breaking check), into the cache if it is not. A
+        // dirty journal's transactions are committed, not pending, and a
+        // read-only view that skips them reads superseded metadata (#72).
+        // A lazy mount defers only the writes; reading the journal is no
+        // different from the rest of mount.
         //
         // Both the walker (`journal_block_to_physical`) and the writer
         // (`JournalWriter::open`) now dispatch on `indirect::map_logical_any`,
@@ -371,13 +373,18 @@ impl Filesystem {
             return Err(crate::error::Error::UnsupportedIncompat(write_breaking));
         }
 
-        if !defer_replay && fs.dev.is_writable() {
-            // Best-effort: a replay failure here is logged via the returned
-            // error but does NOT abort the mount, because many images have
-            // cosmetic journal issues that shouldn't prevent read access.
-            // The error surfaces up so the caller can decide whether to
-            // retry or proceed; we fail loud rather than silent.
-            crate::journal_apply::replay_if_dirty(&fs)?;
+        let replayed = if !fs.dev.is_writable() {
+            crate::journal_apply::replay_into_cache(&fs)?
+        } else if !defer_replay {
+            // A replay failure fails the mount: the error surfaces so the
+            // caller can decide whether to retry or proceed; we fail loud
+            // rather than silent.
+            crate::journal_apply::replay_if_dirty(&fs)?
+        } else {
+            0
+        };
+        if replayed > 0 {
+            fs.reload_geometry()?;
         }
 
         // Open the live-write journal writer once replay is done. Any
@@ -415,6 +422,23 @@ impl Filesystem {
         }
 
         Ok(fs)
+    }
+
+    /// Read the superblock and group descriptors again, through the cache.
+    /// Mount read both before replaying the journal, which may carry newer
+    /// copies of either (#72).
+    fn reload_geometry(&mut self) -> Result<()> {
+        let sb = Superblock::read(self.dev.as_ref())?;
+        features::check_mountable(sb.feature_incompat, sb.feature_ro_compat)?;
+        let csum = Checksummer::from_superblock(&sb);
+        if csum.enabled && !csum.verify_superblock(&sb.raw) {
+            return Err(Error::BadChecksum { what: "superblock" });
+        }
+        self.groups = bgd::read_all(self.dev.as_ref(), &sb, &csum)?;
+        self.flavor = features::FsFlavor::detect(sb.feature_compat, sb.feature_incompat);
+        self.csum = csum;
+        self.sb = sb;
+        Ok(())
     }
 
     /// Run journal replay now if the journal is dirty. Idempotent — calling

@@ -25,6 +25,12 @@
 - Replay marks the journal clean and clears `needs_recovery` once the
   writes are on disk. It left both set, so every mount replayed the same
   log again and `e2fsck` reported a journal still holding data.
+- A read-only mount of a filesystem with a dirty journal reads the
+  committed state. It skipped the journal and reported the superseded
+  metadata as fact; it now replays the journal into the buffer cache,
+  writing nothing, and re-reads the superblock and group descriptors
+  through it. A journal the replay refuses now fails the mount rather than
+  being read past.
 
 ## [0.5.1] — 2026-09-06
 

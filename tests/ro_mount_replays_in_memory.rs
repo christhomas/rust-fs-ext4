@@ -1,0 +1,188 @@
+//! A read-only mount of a dirty journal reads the committed state, as
+//! `e2fsck` recovers it, and writes nothing (#72).
+//!
+//! A crate `mkdir` is cut off after its journal is marked dirty: the
+//! transaction is committed in the log and none of its final-location
+//! writes landed. A read-only mount used to skip replay and report the
+//! directory absent and the counters as they were. It now replays into the
+//! buffer cache. The reference is the same image after `e2fsck -fy`, which
+//! recovers the journal with the kernel's code.
+//!
+//! Skips when e2fsprogs is not installed.
+
+#![cfg(unix)]
+
+use fs_ext4::block_io::{BlockDevice, FileDevice};
+use fs_ext4::error::Result;
+use fs_ext4::Filesystem;
+use std::process::Command;
+use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
+use std::sync::Arc;
+
+fn tool(name: &str) -> Option<String> {
+    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
+        .iter()
+        .map(|dir| format!("{dir}/{name}"))
+        .find(|p| std::path::Path::new(p).exists())
+}
+
+fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = Command::new(program)
+        .args(args)
+        .output()
+        .unwrap_or_else(|e| panic!("{program}: {e}"));
+    (
+        out.status.code(),
+        format!(
+            "{program} {args:?}: {}{}",
+            String::from_utf8_lossy(&out.stdout),
+            String::from_utf8_lossy(&out.stderr)
+        ),
+    )
+}
+
+/// Once armed, keeps writes only until the second flush: a commit's journal
+/// blocks (flush one) and its dirty journal superblock (flush two). Then the
+/// power goes.
+struct CutAfterDirtyJournal {
+    inner: Arc<dyn BlockDevice>,
+    armed: AtomicBool,
+    flushes: AtomicUsize,
+}
+
+impl BlockDevice for CutAfterDirtyJournal {
+    fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+        self.inner.read_at(offset, buf)
+    }
+    fn size_bytes(&self) -> u64 {
+        self.inner.size_bytes()
+    }
+    fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+        if self.armed.load(Ordering::SeqCst) && self.flushes.load(Ordering::SeqCst) >= 2 {
+            return Ok(());
+        }
+        self.inner.write_at(offset, buf)
+    }
+    fn flush(&self) -> Result<()> {
+        if self.armed.load(Ordering::SeqCst) {
+            self.flushes.fetch_add(1, Ordering::SeqCst);
+        }
+        self.inner.flush()
+    }
+    fn is_writable(&self) -> bool {
+        true
+    }
+}
+
+fn names(fs: &Filesystem, dir: &str) -> Vec<Vec<u8>> {
+    let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
+    let ino = fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, dir).expect("lookup");
+    let (inode, _) = fs.read_inode_verified(ino).unwrap();
+    let data = fs_ext4::file_io::read_all(fs, &inode).unwrap();
+    let bs = fs.sb.block_size() as usize;
+    let mut out: Vec<Vec<u8>> = data
+        .chunks(bs)
+        .flat_map(|b| fs_ext4::dir::parse_block(b, true).unwrap_or_default())
+        .map(|e| e.name)
+        .collect();
+    out.sort();
+    out
+}
+
+#[test]
+fn a_read_only_mount_reads_what_the_journal_committed() {
+    let (Some(mkfs), Some(e2fsck), Some(debugfs)) =
+        (tool("mkfs.ext4"), tool("e2fsck"), tool("debugfs"))
+    else {
+        eprintln!("skip: e2fsprogs not installed");
+        return;
+    };
+    let image = fs_ext4_test_support::temp_path!("fs_ext4_ro_replay_{}.img", std::process::id());
+    std::fs::File::create(&image)
+        .and_then(|f| f.set_len(64 * 1024 * 1024))
+        .unwrap();
+    let (code, log) = run(&mkfs, &["-q", "-F", "-b", "4096", &image]);
+    assert_eq!(code, Some(0), "{log}");
+    // A CSUM_V3 journal, as a kernel mount leaves it.
+    let script = format!("{image}.cmds");
+    std::fs::write(&script, "jo -c\njc\n").unwrap();
+    let (code, log) = run(&debugfs, &["-w", "-f", &script, &image]);
+    let _ = std::fs::remove_file(&script);
+    assert_eq!(code, Some(0), "{log}");
+    let (code, log) = run(&e2fsck, &["-fy", &image]);
+    assert!(matches!(code, Some(0 | 1)), "{log}");
+
+    {
+        let dev = Arc::new(CutAfterDirtyJournal {
+            inner: Arc::new(FileDevice::open_rw(&image).unwrap()),
+            armed: AtomicBool::new(false),
+            flushes: AtomicUsize::new(0),
+        });
+        let fs = Filesystem::mount(dev.clone()).expect("mount rw");
+        assert!(
+            fs.journal.is_some(),
+            "the mkdir must go through the journal"
+        );
+        dev.armed.store(true, Ordering::SeqCst);
+        fs.apply_mkdir("/committed", 0o755).expect("mkdir");
+    }
+
+    // The cut left the mkdir only in the journal: a writable lazy mount,
+    // which defers replay, reads the data area as it is.
+    {
+        let on_disk =
+            Filesystem::mount_lazy(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+        assert!(
+            !names(&on_disk, "/").contains(&b"committed".to_vec()),
+            "the cut came too late: the mkdir reached its final location"
+        );
+    }
+
+    let before = std::fs::read(&image).unwrap();
+    let ro = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).expect("mount ro");
+    let ro_root = names(&ro, "/");
+    assert!(
+        ro_root.contains(&b"committed".to_vec()),
+        "a read-only mount skipped the committed mkdir: {:?}",
+        ro_root
+            .iter()
+            .map(|n| String::from_utf8_lossy(n).into_owned())
+            .collect::<Vec<_>>()
+    );
+    let ro_counts = (
+        ro.groups[0].free_blocks_count,
+        ro.groups[0].free_inodes_count,
+        ro.groups[0].used_dirs_count,
+    );
+    drop(ro);
+    assert!(
+        std::fs::read(&image).unwrap() == before,
+        "a read-only mount wrote to the device"
+    );
+
+    // The reference: the kernel's recovery code on a copy.
+    let recovered = format!("{image}.recovered");
+    std::fs::copy(&image, &recovered).unwrap();
+    let (code, log) = run(&e2fsck, &["-fy", &recovered]);
+    assert!(matches!(code, Some(0 | 1)), "{log}");
+    let (code, log) = run(&e2fsck, &["-fn", &recovered]);
+    assert_eq!(code, Some(0), "{log}");
+    let reference = Filesystem::mount(Arc::new(FileDevice::open(&recovered).unwrap())).unwrap();
+    assert_eq!(ro_root, names(&reference, "/"));
+    let ro = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
+    assert_eq!(names(&ro, "/committed"), names(&reference, "/committed"));
+    drop(ro);
+    // Group 0's descriptor is journaled with the mkdir, and mount read the
+    // descriptor table before replay.
+    assert_eq!(
+        ro_counts,
+        (
+            reference.groups[0].free_blocks_count,
+            reference.groups[0].free_inodes_count,
+            reference.groups[0].used_dirs_count,
+        ),
+        "group 0's counters after in-memory replay"
+    );
+    let _ = std::fs::remove_file(&image);
+    let _ = std::fs::remove_file(&recovered);
+}

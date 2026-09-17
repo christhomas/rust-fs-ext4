@@ -134,7 +134,8 @@ impl BlockDevice for CrashDevice {
 /// its checksum. `mkfs.ext4` leaves a new journal's features empty and the
 /// kernel sets them at the first mount; this is that step.
 fn set_journal_incompat(image: &str, bits: u32) {
-    let fs = Filesystem::mount(Arc::new(FileDevice::open(image).unwrap())).unwrap();
+    // Lazy and writable: locate the journal without replaying it.
+    let fs = Filesystem::mount_lazy(Arc::new(FileDevice::open_rw(image).unwrap())).unwrap();
     let jinode = Inode::parse(&fs.read_inode_raw(fs.sb.journal_inode).unwrap()).unwrap();
     let phys = fs_ext4::jbd2::journal_block_to_physical(&fs, &jinode, 0)
         .unwrap()
@@ -246,7 +247,10 @@ fn debugfs_journal(tag: &str) -> Option<String> {
 
 /// Flip one byte of journal block `journal_block` at `offset`.
 fn damage_journal(image: &str, journal_block: u64, offset: u64) {
-    let fs = Filesystem::mount(Arc::new(FileDevice::open(image).unwrap())).unwrap();
+    // Lazy and writable, so the mount only locates the journal: a read-only
+    // mount replays a dirty journal into its cache (#72), and refuses one
+    // this test has already damaged.
+    let fs = Filesystem::mount_lazy(Arc::new(FileDevice::open_rw(image).unwrap())).unwrap();
     let jinode = Inode::parse(&fs.read_inode_raw(fs.sb.journal_inode).unwrap()).unwrap();
     let phys = fs_ext4::jbd2::journal_block_to_physical(&fs, &jinode, journal_block)
         .unwrap()
