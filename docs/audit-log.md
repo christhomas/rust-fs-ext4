@@ -12,6 +12,45 @@ Each pass is one entry, newest first. An entry names:
 - each finding with its issue;
 - what it didn't reach, so the next pass knows where to start.
 
+## 2026-09-17: growing every structure until it changes shape
+
+Read at `fac5c38` (#70), by running rather than by reading: a scale probe drove
+the public write paths until each structure had to change form, with
+`e2fsck -fn` after every phase. Three geometries: 4 KiB blocks, 1 KiB blocks,
+and `-O ^extent,^64bit,^metadata_csum` (block-mapped).
+
+| Phase | Result |
+|---|---|
+| 4,000 creates in one directory, past short, block and one-level index form | none found |
+| 5,000-byte writes into 1,000 of them, so allocation crosses groups | none found |
+| 1,500 extents in one file, a 512-byte run every 64 KiB, so the tree gains levels | none found |
+| punching 4 KiB out of every other run, then writing it back | refused: #258 |
+| 3,000 unlinks, shrinking the directory again | none found |
+
+`e2fsck -fn` accepted every volume at every phase on all three geometries, so
+no edit here was applied to a filesystem the driver had misread.
+
+**Findings, both refusals rather than corruption:**
+- **#258.** A punch is refused when what survives it does not fit the inode's
+  four inline entries, whatever the tree's depth. The probe's file held 1,500
+  extents and the punch took every other one, leaving 750, so all 750 punches
+  were refused on 4 KiB and on 1 KiB blocks. A punch that happens to leave
+  four or fewer entries still goes through. It is also raised as `Corrupt`,
+  which reads as a damaged volume.
+- **#147** (an external pull request). On 1 KiB blocks, 1,445 operations were
+  refused with `descriptor block overflow (too many tags)`, and 797 later ones
+  then failed with `NotFound` because their files were never created. A
+  5,000-byte write is five blocks there, so what overflows the single
+  descriptor block is the metadata a create or a write carries with it. On
+  4 KiB blocks it never fired.
+
+**Not reached, for the next pass:**
+- the journal itself: `src/journal_writer.rs` and `src/transaction.rs` are
+  exercised by every phase above but were not read, and #147 is a journal
+  limit that a reading would have found;
+- bigalloc and inline-data volumes, which this probe does not build;
+- `src/mkfs.rs` and `src/capi.rs`, as before.
+
 ## 2026-09-17: file data, extent-tree, xattr-block, name and block-map paths
 
 Read at `b7395bc` (#70).
