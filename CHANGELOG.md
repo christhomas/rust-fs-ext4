@@ -114,6 +114,11 @@
   with `apply_replace_file_content` now goes through the journaled buffer
   too. It wrote the block bitmap directly and without restamping its
   checksum, which e2fsck reported on a volume with `metadata_csum` (#249).
+- A name holding a NUL byte is refused. Names are taken as `&str`, which
+  can hold one, and create, mkdir, mknod, symlink, link and rename filed it
+  into the entry; e2fsck reports it as an illegal character. The kernel
+  never writes one, and `split_parent_and_base`, which every one of them
+  uses, now refuses it (#247).
 
 ## [0.5.1] — 2026-09-06
 
