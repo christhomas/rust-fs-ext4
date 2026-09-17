@@ -1,5 +1,5 @@
 //! Integration test: parse the JBD2 journal superblock from real images built
-//! by test-disks/build-ext4-feature-images.sh.
+//! by `chore fixtures` (recipes in test-disks/guest-build-images.sh).
 //!
 //! Spec reference for the superblock layout: see ext4rs/src/jbd2.rs.
 //!
@@ -12,25 +12,15 @@ use fs_ext4::jbd2::{self, JBD2_SUPERBLOCK_V1, JBD2_SUPERBLOCK_V2};
 use fs_ext4::Filesystem;
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn try_mount(image: &str) -> Option<Filesystem> {
-    let path = image_path(image);
-    if !std::path::Path::new(&path).exists() {
-        eprintln!("skip {image}: not found");
-        return None;
-    }
-    let dev = FileDevice::open(&path).ok()?;
-    Filesystem::mount(Arc::new(dev)).ok()
+fn mount_fixture(image: &str) -> Filesystem {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), image);
+    let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
+    Filesystem::mount(Arc::new(dev)).unwrap_or_else(|e| panic!("mount {path}: {e:?}"))
 }
 
 #[test]
 fn journal_sb_round_trips_on_basic_image() {
-    let Some(fs) = try_mount("ext4-basic.img") else {
-        return;
-    };
+    let fs = mount_fixture("ext4-basic.img");
 
     let sb = jbd2::read_superblock(&fs).expect("read_superblock");
 
@@ -71,12 +61,11 @@ fn journal_sb_round_trips_on_basic_image() {
 
 #[test]
 fn journal_sb_on_csum_seed_image() {
-    let Some(fs) = try_mount("ext4-csum-seed.img") else {
-        return;
-    };
-    let Ok(Some(jsb)) = jbd2::read_superblock(&fs) else {
-        return;
-    };
+    let fs = mount_fixture("ext4-csum-seed.img");
+    // ext4-csum-seed.img is built with has_journal.
+    let jsb = jbd2::read_superblock(&fs)
+        .expect("read_superblock")
+        .expect("ext4-csum-seed.img has no journal superblock");
     // On the Pi-style CSUM_SEED image we still expect a valid journal.
     assert!(matches!(
         jsb.block_type,
@@ -88,12 +77,11 @@ fn journal_sb_on_csum_seed_image() {
 
 #[test]
 fn journal_sb_on_htree_image() {
-    let Some(fs) = try_mount("ext4-htree.img") else {
-        return;
-    };
-    let Ok(Some(jsb)) = jbd2::read_superblock(&fs) else {
-        return;
-    };
+    let fs = mount_fixture("ext4-htree.img");
+    // ext4-htree.img is built with has_journal.
+    let jsb = jbd2::read_superblock(&fs)
+        .expect("read_superblock")
+        .expect("ext4-htree.img has no journal superblock");
     assert!(matches!(
         jsb.block_type,
         JBD2_SUPERBLOCK_V1 | JBD2_SUPERBLOCK_V2

@@ -14,21 +14,14 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_jw_unlink_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn jsb_seq(path: &str) -> Option<u32> {
@@ -48,9 +41,7 @@ fn path_exists(path: &str, target: &str) -> bool {
 
 #[test]
 fn unlink_atomically_removes_entry_and_advances_journal() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "atomic") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "atomic");
 
     assert!(
         path_exists(&path, "/test.txt"),
@@ -126,17 +117,13 @@ impl BlockDevice for CrashDevice {
 
 #[test]
 fn crash_during_unlink_yields_consistent_state() {
-    let Some(probe) = copy_to_tmp("ext4-basic.img", "probe") else {
-        return;
-    };
+    let probe = copy_to_tmp("ext4-basic.img", "probe");
     let pre_existed = path_exists(&probe, "/test.txt");
     fs::remove_file(probe).ok();
     assert!(pre_existed, "fixture sanity");
 
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp("ext4-basic.img", &format!("b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp("ext4-basic.img", &format!("b{budget}"));
         {
             let inner = FileDevice::open_rw(&path).expect("rw");
             let crash = Arc::new(CrashDevice::new(Arc::new(inner), budget));

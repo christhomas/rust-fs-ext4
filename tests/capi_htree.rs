@@ -7,21 +7,19 @@
 
 use fs_ext4::capi::*;
 use std::ffi::CString;
-use std::path::Path;
 
-const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-htree.img");
+const IMAGE: &str = "ext4-htree.img";
 
-fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
-    if !Path::new(IMAGE).exists() {
-        eprintln!("skip: {IMAGE} not built");
-        return None;
-    }
-    let p = CString::new(IMAGE).unwrap();
+fn mount_fixture() -> *mut fs_ext4_fs_t {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), IMAGE);
+    let p = CString::new(path.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
-    if fs.is_null() {
-        return None;
-    }
-    Some(fs)
+    assert!(
+        !fs.is_null(),
+        "fs_ext4_mount({path}) failed: {}",
+        unsafe { std::ffi::CStr::from_ptr(fs_ext4_last_error()) }.to_string_lossy()
+    );
+    fs
 }
 
 fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
@@ -47,9 +45,7 @@ fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
 
 #[test]
 fn bigdir_lists_all_256_files_plus_dot_entries() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let names = list_dir(fs, "/bigdir");
     // Expect . + .. + 256 file_*.txt entries
     let files: Vec<&String> = names.iter().filter(|n| n.starts_with("file_")).collect();
@@ -66,9 +62,7 @@ fn bigdir_lists_all_256_files_plus_dot_entries() {
 
 #[test]
 fn bigdir_has_no_duplicate_entries() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let names = list_dir(fs, "/bigdir");
     let mut sorted = names.clone();
     sorted.sort();
@@ -79,9 +73,7 @@ fn bigdir_has_no_duplicate_entries() {
 
 #[test]
 fn bigdir_stat_every_file_succeeds() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let names = list_dir(fs, "/bigdir");
     for name in names.iter().filter(|n| n.starts_with("file_")) {
         let path = format!("/bigdir/{name}");
@@ -99,9 +91,7 @@ fn specific_htree_lookups_hit_via_path() {
     // Probe a scattered sample — not just the first few — to exercise
     // different htree leaf blocks. Uses actual listed names to avoid
     // assumptions about naming (file_0 vs file_000 vs file_0.txt etc).
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let names = list_dir(fs, "/bigdir");
     let real: Vec<&String> = names.iter().filter(|n| !n.starts_with('.')).collect();
     assert!(real.len() >= 5, "expected many files, got {}", real.len());

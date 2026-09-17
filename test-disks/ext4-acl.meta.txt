@@ -7,7 +7,7 @@ contents:
   /acl_dir/       — access + default ACL (u::rwx g::r-x o::--x; d:u::rwx d:g::r-x d:o::---)
   /plain.txt      — no ACL
 test_targets:
-  - system.posix_acl_access on /mode_only.txt decodes to 3 short entries
+  - /mode_only.txt has no acl xattr: the kernel folds a mode-equivalent ACL into i_mode (0754)
   - system.posix_acl_access on /named.txt has User(1000) + Group(2000) entries
   - /acl_dir has both system.posix_acl_access and system.posix_acl_default
   - /plain.txt has neither acl xattr

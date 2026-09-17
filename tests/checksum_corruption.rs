@@ -13,13 +13,11 @@ use fs_ext4::fs::Filesystem;
 use std::io::{Read, Seek, SeekFrom, Write};
 use std::sync::Arc;
 
-const SRC_IMAGE: &str = "test-disks/ext4-basic.img";
+const SRC_IMAGE: &str = "ext4-basic.img";
 
-fn copy_image_to_temp(tag: &str) -> Option<std::path::PathBuf> {
-    let mut src = match std::fs::File::open(SRC_IMAGE) {
-        Ok(f) => f,
-        Err(_) => return None,
-    };
+fn copy_image_to_temp(tag: &str) -> std::path::PathBuf {
+    let src_path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), SRC_IMAGE);
+    let mut src = std::fs::File::open(&src_path).unwrap_or_else(|e| panic!("open {src_path}: {e}"));
     let tmp_path = fs_ext4_test_support::temp_dir().join(format!(
         "ext4rs-corrupt-{}-{}.img",
         std::process::id(),
@@ -29,39 +27,29 @@ fn copy_image_to_temp(tag: &str) -> Option<std::path::PathBuf> {
     let mut buf = Vec::new();
     src.read_to_end(&mut buf).expect("read src");
     dst.write_all(&buf).expect("write dst");
-    Some(tmp_path)
+    tmp_path
 }
 
 #[test]
 fn pristine_image_mounts_cleanly() {
-    let Some(tmp) = copy_image_to_temp("pristine") else {
-        eprintln!("skip: {SRC_IMAGE} not present");
-        return;
-    };
+    let tmp = copy_image_to_temp("pristine");
     let dev = Arc::new(FileDevice::open(tmp.to_str().unwrap()).expect("open temp image"));
     let fs = Filesystem::mount(dev).expect("mount pristine copy");
-    if !fs.csum.enabled {
-        eprintln!("skip: METADATA_CSUM not enabled in test image");
-    }
+    // ext4-basic.img is built with metadata_csum.
+    assert!(fs.csum.enabled, "METADATA_CSUM not enabled in {SRC_IMAGE}");
     let _ = std::fs::remove_file(tmp);
 }
 
 #[test]
 fn corrupted_superblock_is_rejected() {
-    let Some(tmp) = copy_image_to_temp("corrupt") else {
-        eprintln!("skip: {SRC_IMAGE} not present");
-        return;
-    };
+    let tmp = copy_image_to_temp("corrupt");
 
-    // Probe whether checksum is enabled before corrupting.
+    // Probe that checksum is enabled before corrupting (ext4-basic.img is
+    // built with metadata_csum).
     {
         let dev = Arc::new(FileDevice::open(tmp.to_str().unwrap()).expect("probe open"));
         let fs = Filesystem::mount(dev).expect("probe mount");
-        if !fs.csum.enabled {
-            eprintln!("skip: METADATA_CSUM not enabled in {SRC_IMAGE}");
-            let _ = std::fs::remove_file(tmp);
-            return;
-        }
+        assert!(fs.csum.enabled, "METADATA_CSUM not enabled in {SRC_IMAGE}");
     }
 
     // Flip one bit inside the superblock-checksum-covered region.

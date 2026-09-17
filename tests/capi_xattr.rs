@@ -1,6 +1,6 @@
 //! C ABI smoke tests for fs_ext4_listxattr + fs_ext4_getxattr.
 //!
-//! Image layout (built by test-disks/build-ext4-feature-images.sh):
+//! Image layout (built by `chore fixtures`; recipe in test-disks/guest-build-images.sh):
 //!   /tagged.txt    user.color=red, user.com.apple.FinderInfo=<4 raw bytes>
 //!   /tagged_dir    user.purpose=documents
 //!   /plain.txt     (no xattrs)
@@ -9,7 +9,7 @@ use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
-const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-xattr.img");
+const TEST_IMAGE: &str = "ext4-xattr.img";
 
 fn last_err_str() -> String {
     unsafe {
@@ -22,9 +22,10 @@ fn last_err_str() -> String {
 }
 
 fn mount() -> *mut fs_ext4_fs_t {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let image = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), TEST_IMAGE);
+    let path = CString::new(image.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    assert!(!fs.is_null(), "mount failed: {}", last_err_str());
+    assert!(!fs.is_null(), "mount {image} failed: {}", last_err_str());
     fs
 }
 

@@ -17,17 +17,14 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn copy(tag: &str) -> Option<String> {
+fn copy(tag: &str) -> String {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let src = format!("{}/test-disks/ext4-no-csum.img", env!("CARGO_MANIFEST_DIR"));
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-no-csum.img");
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_nocsum_{tag}_{}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn rw(path: &str) -> Filesystem {
@@ -51,7 +48,7 @@ fn done(path: &str, tag: &str) {
 
 #[test]
 fn nocsum_file_write_truncate() {
-    let Some(p) = copy("write_trunc") else { return };
+    let p = copy("write_trunc");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/f", 0o644).expect("create");
@@ -65,7 +62,7 @@ fn nocsum_file_write_truncate() {
 
 #[test]
 fn nocsum_multiblock_write() {
-    let Some(p) = copy("multiblock") else { return };
+    let p = copy("multiblock");
     {
         let fs = rw(&p);
         fs.apply_create("/big", 0o644).expect("create");
@@ -77,7 +74,7 @@ fn nocsum_multiblock_write() {
 
 #[test]
 fn nocsum_mkdir_rmdir() {
-    let Some(p) = copy("mkdir_rmdir") else { return };
+    let p = copy("mkdir_rmdir");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/d1", 0o755).expect("mkdir d1");
@@ -90,7 +87,7 @@ fn nocsum_mkdir_rmdir() {
 
 #[test]
 fn nocsum_hardlink_unlink() {
-    let Some(p) = copy("hardlink") else { return };
+    let p = copy("hardlink");
     {
         let fs = rw(&p);
         fs.apply_create("/a", 0o644).expect("create a");
@@ -102,7 +99,7 @@ fn nocsum_hardlink_unlink() {
 
 #[test]
 fn nocsum_rename() {
-    let Some(p) = copy("rename") else { return };
+    let p = copy("rename");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create x");
@@ -116,7 +113,7 @@ fn nocsum_rename() {
 
 #[test]
 fn nocsum_chmod_chown() {
-    let Some(p) = copy("chmod_chown") else { return };
+    let p = copy("chmod_chown");
     {
         let fs = rw(&p);
         fs.apply_create("/m", 0o644).expect("create");
@@ -128,7 +125,7 @@ fn nocsum_chmod_chown() {
 
 #[test]
 fn nocsum_xattr_inline_external_remove() {
-    let Some(p) = copy("xattr") else { return };
+    let p = copy("xattr");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create");
@@ -144,7 +141,7 @@ fn nocsum_xattr_inline_external_remove() {
 
 #[test]
 fn nocsum_removexattr_last_frees_block() {
-    let Some(p) = copy("xattr_free") else { return };
+    let p = copy("xattr_free");
     {
         let fs = rw(&p);
         fs.apply_create("/xr", 0o644).expect("create");
@@ -158,7 +155,7 @@ fn nocsum_removexattr_last_frees_block() {
 
 #[test]
 fn nocsum_fallocate_variants() {
-    let Some(p) = copy("fallocate") else { return };
+    let p = copy("fallocate");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/fa", 0o644).expect("create");
@@ -174,9 +171,7 @@ fn nocsum_fallocate_variants() {
 
 #[test]
 fn nocsum_slow_symlink_unlink() {
-    let Some(p) = copy("slow_symlink") else {
-        return;
-    };
+    let p = copy("slow_symlink");
     {
         let fs = rw(&p);
         let target = "/a/very/long/symlink/target/path/that/exceeds/sixty/bytes/for/sure/x";
@@ -188,7 +183,7 @@ fn nocsum_slow_symlink_unlink() {
 
 #[test]
 fn nocsum_htree_dir_growth() {
-    let Some(p) = copy("htree") else { return };
+    let p = copy("htree");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/h", 0o755).expect("mkdir h");
@@ -205,9 +200,7 @@ fn nocsum_htree_dir_growth() {
 
 #[test]
 fn nocsum_large_chunked_write() {
-    let Some(p) = copy("large_chunked") else {
-        return;
-    };
+    let p = copy("large_chunked");
     {
         let fs = rw(&p);
         fs.apply_create("/lc", 0o644).expect("create");
@@ -223,9 +216,7 @@ fn nocsum_large_chunked_write() {
 
 #[test]
 fn nocsum_fragmented_extent_tree() {
-    let Some(p) = copy("frag_extents") else {
-        return;
-    };
+    let p = copy("frag_extents");
     {
         let fs = rw(&p);
         fs.apply_create("/frag", 0o644).expect("create");

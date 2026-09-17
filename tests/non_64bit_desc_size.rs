@@ -5,7 +5,7 @@
 //! value of 64 passed and the descriptor table was read at a 64-byte
 //! stride. The image is a fresh `mkfs.ext4 -O ^64bit` (without
 //! metadata_csum, so the superblock checksum needs no restamping) with the
-//! field set to 64; skips without e2fsprogs.
+//! field set to 64; fails without e2fsprogs (`chore tools`).
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::Filesystem;
@@ -22,7 +22,7 @@ fn a_non_64bit_volume_with_a_64_byte_desc_size_field_reads_its_real_descriptors(
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
-    let Ok(made) = Command::new("mkfs.ext4")
+    let made = Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
         .args([
             "-q",
             "-F",
@@ -35,10 +35,7 @@ fn a_non_64bit_volume_with_a_64_byte_desc_size_field_reads_its_real_descriptors(
         ])
         .arg(&img)
         .output()
-    else {
-        eprintln!("no mkfs.ext4 -- skipping");
-        return;
-    };
+        .expect("run mkfs.ext4");
     assert!(
         made.status.success(),
         "{}",

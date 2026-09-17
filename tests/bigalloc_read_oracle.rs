@@ -6,7 +6,7 @@
 //! byte-identical to its source and to `debugfs cat`. A write must be
 //! refused naming the feature, since the allocator counts blocks where the
 //! bitmaps count clusters, and so must the audit, for the same reason.
-//! Skips when e2fsprogs is not installed.
+//! Fails when e2fsprogs is not installed (`chore tools`).
 
 #![cfg(unix)]
 
@@ -15,13 +15,6 @@ use fs_ext4::features::RoCompat;
 use fs_ext4::Filesystem;
 use std::process::Command;
 use std::sync::Arc;
-
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
 
 fn read(fs: &Filesystem, path: &str) -> Vec<u8> {
     let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
@@ -50,10 +43,8 @@ fn content(seed: u32, len: usize) -> Vec<u8> {
 }
 
 fn bigalloc_volume(block: u32, cluster: u32, size_mib: u64, min_groups: usize) {
-    let (Some(mkfs), Some(debugfs)) = (tool("mkfs.ext4"), tool("debugfs")) else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
+    let debugfs = fs_ext4_test_support::oracle_tool("debugfs");
     let tag = format!("bigalloc_{block}_{cluster}");
     let root = fs_ext4_test_support::temp_path!("fs_ext4_{tag}_{}", std::process::id());
     std::fs::create_dir_all(format!("{root}/d/e")).unwrap();

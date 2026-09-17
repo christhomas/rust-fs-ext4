@@ -11,21 +11,13 @@
 //! random sequence of operations checked with e2fsck.
 //!
 //! Volumes come from `mkfs.ext4`, and `e2fsck -fn` must accept each after
-//! the refused truncate.
+//! the refused truncate. Fails without e2fsprogs (`chore tools`).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::Error;
 use std::process::Command;
 use std::sync::Arc;
-
-fn tool(name: &str) -> String {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or_else(|| panic!("{name} is not installed; install e2fsprogs"))
-}
 
 #[test]
 fn truncate_refuses_directories_symlinks_and_device_nodes() {
@@ -52,7 +44,7 @@ fn truncate_refuses_directories_symlinks_and_device_nodes() {
             std::fs::File::create(&image)
                 .and_then(|f| f.set_len(64 * 1024 * 1024))
                 .unwrap();
-            let out = Command::new(tool("mkfs.ext4"))
+            let out = Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
                 .args(["-q", "-F", "-b", "4096"])
                 .arg(&image)
                 .output()
@@ -78,7 +70,7 @@ fn truncate_refuses_directories_symlinks_and_device_nodes() {
                 (_, Err(Error::InvalidArgument(_))) => {}
                 _ => panic!("[{kind} {what}] expected InvalidArgument, got {got:?}"),
             }
-            let fsck = Command::new(tool("e2fsck"))
+            let fsck = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
                 .args(["-fn", &image])
                 .output()
                 .unwrap();

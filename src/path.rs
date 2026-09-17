@@ -312,11 +312,6 @@ fn split_path(path: &str) -> Vec<&str> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::bgd;
-    use crate::block_io::FileDevice;
-    use crate::extent;
-    use crate::fs::Filesystem;
-    use std::sync::Arc;
 
     #[test]
     fn split_path_basic() {
@@ -329,110 +324,104 @@ mod tests {
         assert_eq!(split_path("///"), Vec::<&str>::new());
     }
 
-    /// Build a read_inode closure that reads raw bytes via Filesystem and
-    /// parses them through Inode::parse.
-    fn read_inode_fn(fs: &Filesystem) -> impl FnMut(u32) -> Result<Inode> + '_ {
-        move |ino: u32| {
-            let (block, offset) = bgd::locate_inode(&fs.sb, &fs.groups, ino)?;
-            let block_data = fs.read_block(block)?;
-            let inode_size = fs.sb.inode_size as usize;
-            let off = offset as usize;
-            Inode::parse(&block_data[off..off + inode_size])
+    /// Tests that read a fixture from `test-disks/` (`chore fixtures`).
+    mod needs_host {
+        use super::*;
+        use crate::bgd;
+        use crate::block_io::FileDevice;
+        use crate::extent;
+        use crate::fs::Filesystem;
+        use std::sync::Arc;
+
+        /// Build a read_inode closure that reads raw bytes via Filesystem and
+        /// parses them through Inode::parse.
+        fn read_inode_fn(fs: &Filesystem) -> impl FnMut(u32) -> Result<Inode> + '_ {
+            move |ino: u32| {
+                let (block, offset) = bgd::locate_inode(&fs.sb, &fs.groups, ino)?;
+                let block_data = fs.read_block(block)?;
+                let inode_size = fs.sb.inode_size as usize;
+                let off = offset as usize;
+                Inode::parse(&block_data[off..off + inode_size])
+            }
         }
-    }
 
-    #[test]
-    fn root_resolves_to_inode_2() {
-        let path = "test-disks/ext4-basic.img";
-        let file = match FileDevice::open(path) {
-            Ok(f) => f,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
+        #[test]
+        fn root_resolves_to_inode_2() {
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev: Arc<dyn BlockDevice> = Arc::new(file);
+            let fs = Filesystem::mount(dev.clone()).expect("mount");
+            let mut reader = read_inode_fn(&fs);
+
+            for root_path in ["/", "", "///"] {
+                let ino = lookup(dev.as_ref(), &fs.sb, &mut reader, root_path)
+                    .unwrap_or_else(|e| panic!("lookup({root_path:?}) failed: {e}"));
+                assert_eq!(ino, EXT4_ROOT_INODE, "path {root_path:?}");
             }
-        };
-        let dev: Arc<dyn BlockDevice> = Arc::new(file);
-        let fs = Filesystem::mount(dev.clone()).expect("mount");
-        let mut reader = read_inode_fn(&fs);
-
-        for root_path in ["/", "", "///"] {
-            let ino = lookup(dev.as_ref(), &fs.sb, &mut reader, root_path)
-                .unwrap_or_else(|e| panic!("lookup({root_path:?}) failed: {e}"));
-            assert_eq!(ino, EXT4_ROOT_INODE, "path {root_path:?}");
         }
-    }
 
-    #[test]
-    fn missing_path_returns_not_found() {
-        let path = "test-disks/ext4-basic.img";
-        let file = match FileDevice::open(path) {
-            Ok(f) => f,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let dev: Arc<dyn BlockDevice> = Arc::new(file);
-        let fs = Filesystem::mount(dev.clone()).expect("mount");
-        let mut reader = read_inode_fn(&fs);
+        #[test]
+        fn missing_path_returns_not_found() {
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev: Arc<dyn BlockDevice> = Arc::new(file);
+            let fs = Filesystem::mount(dev.clone()).expect("mount");
+            let mut reader = read_inode_fn(&fs);
 
-        let result = lookup(
-            dev.as_ref(),
-            &fs.sb,
-            &mut reader,
-            "/this-does-not-exist-xyz",
-        );
-        assert!(matches!(result, Err(Error::NotFound)), "got {result:?}");
-    }
+            let result = lookup(
+                dev.as_ref(),
+                &fs.sb,
+                &mut reader,
+                "/this-does-not-exist-xyz",
+            );
+            assert!(matches!(result, Err(Error::NotFound)), "got {result:?}");
+        }
 
-    #[test]
-    fn non_dir_component_returns_not_a_directory() {
-        let path = "test-disks/ext4-basic.img";
-        let file = match FileDevice::open(path) {
-            Ok(f) => f,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let dev: Arc<dyn BlockDevice> = Arc::new(file);
-        let fs = Filesystem::mount(dev.clone()).expect("mount");
-        let mut reader = read_inode_fn(&fs);
+        #[test]
+        fn non_dir_component_returns_not_a_directory() {
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev: Arc<dyn BlockDevice> = Arc::new(file);
+            let fs = Filesystem::mount(dev.clone()).expect("mount");
+            let mut reader = read_inode_fn(&fs);
 
-        // Find any regular file in root so we can stack a component after it.
-        let root = reader(EXT4_ROOT_INODE).expect("root inode");
-        let block_size = fs.sb.block_size();
-        let total_blocks = root.size.div_ceil(block_size as u64);
-        let has_filetype = fs.sb.feature_incompat & crate::features::Incompat::FILETYPE.bits() != 0;
+            // Find any regular file in root so we can stack a component after it.
+            let root = reader(EXT4_ROOT_INODE).expect("root inode");
+            let block_size = fs.sb.block_size();
+            let total_blocks = root.size.div_ceil(block_size as u64);
+            let has_filetype =
+                fs.sb.feature_incompat & crate::features::Incompat::FILETYPE.bits() != 0;
 
-        let mut reg_file_name: Option<Vec<u8>> = None;
-        'outer: for logical in 0..total_blocks {
-            if let Some(phys) = extent::map_logical(&root.block, dev.as_ref(), block_size, logical)
-                .expect("map logical")
-            {
-                let mut blk = vec![0u8; block_size as usize];
-                dev.read_at(phys * block_size as u64, &mut blk).unwrap();
-                for entry in dir::DirBlockIter::new(&blk, has_filetype) {
-                    let e = entry.expect("entry");
-                    if e.file_type == dir::DirEntryType::RegFile {
-                        reg_file_name = Some(e.name);
-                        break 'outer;
+            let mut reg_file_name: Option<Vec<u8>> = None;
+            'outer: for logical in 0..total_blocks {
+                if let Some(phys) =
+                    extent::map_logical(&root.block, dev.as_ref(), block_size, logical)
+                        .expect("map logical")
+                {
+                    let mut blk = vec![0u8; block_size as usize];
+                    dev.read_at(phys * block_size as u64, &mut blk).unwrap();
+                    for entry in dir::DirBlockIter::new(&blk, has_filetype) {
+                        let e = entry.expect("entry");
+                        if e.file_type == dir::DirEntryType::RegFile {
+                            reg_file_name = Some(e.name);
+                            break 'outer;
+                        }
                     }
                 }
             }
+
+            let name = reg_file_name.expect(
+                "ext4-basic.img has a regular file (test.txt) in its root \
+             (test-disks/guest-build-images.sh)",
+            );
+            let name_str = std::str::from_utf8(&name).expect("name utf8");
+            let bad_path = format!("/{name_str}/child");
+
+            let result = lookup(dev.as_ref(), &fs.sb, &mut reader, &bad_path);
+            assert!(
+                matches!(result, Err(Error::NotADirectory)),
+                "got {result:?} for path {bad_path}"
+            );
         }
-
-        let Some(name) = reg_file_name else {
-            eprintln!("skip: no regular file in root of ext4-basic.img");
-            return;
-        };
-        let name_str = std::str::from_utf8(&name).expect("name utf8");
-        let bad_path = format!("/{name_str}/child");
-
-        let result = lookup(dev.as_ref(), &fs.sb, &mut reader, &bad_path);
-        assert!(
-            matches!(result, Err(Error::NotADirectory)),
-            "got {result:?} for path {bad_path}"
-        );
     }
 }

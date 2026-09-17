@@ -13,33 +13,19 @@
 //! groups so directory spreading reaches groups that are still `INODE_UNINIT`
 //! and `BLOCK_UNINIT`, which is where the descriptor edits happen.
 //!
-//! Skips (with a note) when `mkfs.ext4` or `e2fsck` is not installed.
+//! Fails when `mkfs.ext4` or `e2fsck` is not installed (`chore tools`).
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::features::RoCompat;
 use fs_ext4::{Error, Filesystem};
+use fs_ext4_test_support::oracle_tool;
 use std::process::Command;
 use std::sync::Arc;
 
-const MKFS: &str = "mkfs.ext4";
-const E2FSCK: &str = "e2fsck";
-
-fn tool(name: &str) -> Option<String> {
-    for dir in ["/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/sbin"] {
-        let p = format!("{dir}/{name}");
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
 /// A fresh `mkfs.ext4` volume with `GDT_CSUM` and not `METADATA_CSUM`.
-fn make_volume(tag: &str, sixty_four: bool) -> Option<String> {
-    let (Some(mkfs), Some(_)) = (tool(MKFS), tool(E2FSCK)) else {
-        eprintln!("skip: {MKFS} or {E2FSCK} not installed");
-        return None;
-    };
+fn make_volume(tag: &str, sixty_four: bool) -> String {
+    let mkfs = oracle_tool("mkfs.ext4");
+    oracle_tool("e2fsck");
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_gdt_csum_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
@@ -69,11 +55,11 @@ fn make_volume(tag: &str, sixty_four: bool) -> Option<String> {
         "mkfs.ext4 failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 fn e2fsck_clean(path: &str) -> (bool, String) {
-    let out = Command::new(tool(E2FSCK).unwrap())
+    let out = Command::new(oracle_tool("e2fsck"))
         .args(["-fn", path])
         .output()
         .expect("run e2fsck");
@@ -88,9 +74,7 @@ fn e2fsck_clean(path: &str) -> (bool, String) {
 }
 
 fn write_and_check(tag: &str, sixty_four: bool) {
-    let Some(path) = make_volume(tag, sixty_four) else {
-        return;
-    };
+    let path = make_volume(tag, sixty_four);
     {
         let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&path).expect("open_rw")))
             .expect("mount");

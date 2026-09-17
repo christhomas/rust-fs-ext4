@@ -10,22 +10,21 @@ use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
-fn copy_to_tmp(name: &str) -> Option<String> {
+#[track_caller]
+fn copy_to_tmp(name: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_dgrow_{}_{n}_{}.img", std::process::id(), name);
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> Option<u32> {
@@ -35,9 +34,7 @@ fn resolve(fs: &Filesystem, path: &str) -> Option<u32> {
 
 #[test]
 fn apply_create_grows_parent_dir_past_first_block() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -72,9 +69,7 @@ fn apply_create_grows_parent_dir_past_first_block() {
 
 #[test]
 fn apply_mkdir_also_grows_parent() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -103,9 +98,7 @@ fn apply_mkdir_also_grows_parent() {
 
 #[test]
 fn grown_dir_survives_remount() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
 
     {
         let dev = FileDevice::open_rw(&path).expect("open rw");

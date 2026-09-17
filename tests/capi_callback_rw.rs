@@ -13,10 +13,9 @@ use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::fs;
 use std::os::raw::{c_int, c_void};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
+const IMAGE: &str = "ext4-basic.img";
 
 // ---------------------------------------------------------------------------
 // Mutex<Vec<u8>>-backed device with a dirty-flag we can probe from tests.
@@ -83,12 +82,9 @@ extern "C" fn flush_cb(ctx: *mut c_void) -> c_int {
     0
 }
 
-fn fixture_available() -> bool {
-    Path::new(IMAGE).exists()
-}
-
 fn fresh_dev() -> Arc<DevCtx> {
-    let bytes = fs::read(IMAGE).expect("read fixture image");
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), IMAGE);
+    let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read fixture image {path}: {e}"));
     Arc::new(DevCtx {
         bytes: Mutex::new(bytes),
         writes: Mutex::new(0),
@@ -114,12 +110,6 @@ fn make_cfg(dev: &Arc<DevCtx>, with_write: bool, with_flush: bool) -> fs_ext4_bl
 
 #[test]
 fn rw_callback_create_write_stat_read_unlink_round_trip() {
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true);
 
@@ -180,12 +170,6 @@ fn rw_callback_create_write_stat_read_unlink_round_trip() {
 
 #[test]
 fn rw_callback_mkdir_rmdir_chmod_rename() {
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, false);
 
@@ -223,12 +207,6 @@ fn rw_callback_mkdir_rmdir_chmod_rename() {
 
 #[test]
 fn rw_callback_null_write_callback_returns_einval() {
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     // read present, write missing — must reject.
     let cfg = make_cfg(&dev, false, false);
@@ -268,12 +246,6 @@ fn ro_callback_mount_unchanged_still_rejects_writes() {
     // The OLD `fs_ext4_mount_with_callbacks` is a documented RO entry point.
     // It must still mount RO even if the cfg has a write callback — and it
     // must still refuse mutating ops.
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true); // write+flush set, but RO call should ignore them.
 
@@ -297,12 +269,6 @@ fn rw_callback_writes_are_persisted_across_remount() {
     // Mutate via RW callback → unmount → re-mount RO and verify the change
     // survives. Confirms the write callback's bytes really land in the
     // backing buffer (not just an in-memory cache).
-    if !fixture_available() {
-        eprintln!(
-            "skipping: fixture {IMAGE} missing (did you run test-disks/build-ext4-feature-images.sh?)"
-        );
-        return;
-    }
     let dev = fresh_dev();
     let path = CString::new("/persist.txt").unwrap();
     let payload: &[u8] = b"persist me";

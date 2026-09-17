@@ -131,48 +131,72 @@ macro_rules! temp_path {
 /// The path of a generated fixture under `test-disks/`, or a panic that
 /// says how to build it (#137).
 ///
-/// The images are gitignored and built by
-/// `test-disks/build-ext4-feature-images.sh`. Without them a mount failed
-/// deep inside `open` with a bare `No such file or directory`, once per
-/// test, which read as that many defects in whatever branch was being
-/// checked. Only for suites that cannot say anything without the image;
-/// the ones that skip honestly when it is absent keep doing so.
+/// The images are gitignored and built by `chore fixtures` (the kernel
+/// populates them, inside the fs-linux-test-harness VM). THE ONLY WAY A
+/// TEST REACHES A FIXTURE: a test that found its image absent used to
+/// print "skip" and return, and a skipped test reads exactly like a
+/// passing one, so a checkout without fixtures ran most of the suite
+/// against nothing and reported green. `chore test:unit` also relies on
+/// this: a test binary that never calls it needs no fixture.
 #[track_caller]
 pub fn fixture(manifest_dir: &str, name: &str) -> String {
     let path = format!("{manifest_dir}/test-disks/{name}");
     assert!(
-        Path::new(&path).exists(),
+        Path::new(&path).is_file(),
         "test-disks/{name} is missing: the fixtures are gitignored and generated. \
-         Build them with `bash test-disks/build-ext4-feature-images.sh` (Linux, or \
-         the oracle VM) and run the tests again."
+         Build them with `chore fixtures` (it boots the fs-linux-test-harness VM; \
+         `chore siblings` checks the harness out) and run the tests again. \
+         Tests never skip on a missing fixture."
     );
     path
 }
 
+/// The path of oracle tool `name` (`mkfs.ext4`, `mke2fs`, `e2fsck`,
+/// `debugfs`, `dumpe2fs`, `tune2fs`), or a panic naming `chore tools`.
+///
+/// THE ONLY WAY A TEST REACHES AN ORACLE TOOL. The oracle suites used to
+/// print "skip: e2fsprogs not installed" and return, which passes having
+/// checked nothing. Now the tools are installed by `chore tools` and a
+/// missing one fails the test that needed it.
+///
+/// Looks on `PATH`, then in the sbin directories a non-root `PATH` on
+/// Debian leaves out, then in Homebrew's keg-only e2fsprogs on macOS.
+#[track_caller]
+pub fn oracle_tool(name: &str) -> String {
+    let mut dirs: Vec<PathBuf> = std::env::var_os("PATH")
+        .map(|path| std::env::split_paths(&path).collect())
+        .unwrap_or_default();
+    for dir in [
+        "/usr/sbin",
+        "/sbin",
+        "/usr/local/sbin",
+        "/opt/homebrew/opt/e2fsprogs/sbin",
+        "/opt/homebrew/opt/e2fsprogs/bin",
+        "/usr/local/opt/e2fsprogs/sbin",
+        "/usr/local/opt/e2fsprogs/bin",
+    ] {
+        dirs.push(PathBuf::from(dir));
+    }
+    match dirs.iter().map(|dir| dir.join(name)).find(|p| p.is_file()) {
+        Some(found) => found.to_string_lossy().into_owned(),
+        None => panic!(
+            "oracle tool `{name}` is not installed. Install the oracle tools with \
+             `chore tools` and run the tests again. Tests never skip on a missing tool."
+        ),
+    }
+}
 
 /// `e2fsck -fn` on `image` must exit 0, or the test fails with its report
 /// (#88).
 ///
 /// The oracle suites checked their images with this crate's own reader,
-/// which cannot see a wrong checksum, and left the external check to
-/// someone running `scripts/vm-e2fsck.sh` by hand, which nothing did.
-/// Where e2fsprogs is not installed this skips with a note, except under CI
-/// (`CI` set, as GitHub Actions sets it), which installs it: there a
-/// missing checker is a failure rather than a silent pass.
+/// which cannot see a wrong checksum. `-f` forces a full check, `-n`
+/// answers no to every repair, so it reports without touching the image.
+/// A missing e2fsck fails (see [`oracle_tool`]).
 #[track_caller]
 pub fn assert_e2fsck_clean(image: &str, tag: &str) {
-    let Some(e2fsck) = ["/usr/sbin/e2fsck", "/sbin/e2fsck", "/usr/bin/e2fsck", "/bin/e2fsck"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-    else {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "[{tag}] e2fsck is not installed, and CI must run the oracle"
-        );
-        eprintln!("[{tag}] skip e2fsck: e2fsprogs not installed");
-        return;
-    };
-    let out = std::process::Command::new(e2fsck)
+    let e2fsck = oracle_tool("e2fsck");
+    let out = std::process::Command::new(&e2fsck)
         .args(["-fn", image])
         .output()
         .unwrap_or_else(|error| panic!("[{tag}] run {e2fsck}: {error}"));

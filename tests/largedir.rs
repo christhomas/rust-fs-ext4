@@ -1,12 +1,11 @@
 //! LARGEDIR stress test against test-disks/ext4-largedir.img.
 //!
-//! Image layout (see build-ext4-feature-images.sh build_largedir):
+//! Image layout (see test-disks/guest-build-images.sh build_largedir):
 //!   /small.txt — "control\n"
 //!   /huge/     — 70000 zero-length files named file_00001.txt .. file_70000.txt
 //!                Enabled ro_compat LARGEDIR, which lifts the 2-level htree cap.
 //!
-//! These tests skip cleanly when the image is absent (needs docker to build),
-//! following the pattern established by other integration suites here.
+//! The image is built by `chore fixtures`; these tests fail when it is absent.
 
 use fs_ext4::bgd;
 use fs_ext4::block_io::{BlockDevice, FileDevice};
@@ -16,24 +15,17 @@ use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::Inode;
 use fs_ext4::path;
-use std::path::Path;
 use std::sync::Arc;
 
-const TEST_IMAGE: &str = "test-disks/ext4-largedir.img";
+const TEST_IMAGE: &str = "ext4-largedir.img";
 const EXPECTED_FILES: usize = 70000;
 
-fn open_or_skip() -> Option<(Arc<dyn BlockDevice>, Filesystem)> {
-    if !Path::new(TEST_IMAGE).exists() {
-        eprintln!(
-            "skip: {TEST_IMAGE} not built; \
-             run test-disks/build-ext4-feature-images.sh largedir"
-        );
-        return None;
-    }
-    let dev = Arc::new(FileDevice::open(TEST_IMAGE).expect("open largedir image"));
+fn open_fixture() -> (Arc<dyn BlockDevice>, Filesystem) {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), TEST_IMAGE);
+    let dev = Arc::new(FileDevice::open(&path).expect("open largedir image"));
     let dev_dyn: Arc<dyn BlockDevice> = dev.clone();
     let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
-    Some((dev_dyn, fs))
+    (dev_dyn, fs)
 }
 
 fn inode_reader(fs: &Filesystem) -> impl FnMut(u32) -> Result<Inode> + '_ {
@@ -61,9 +53,7 @@ fn find_huge_ino(fs: &Filesystem) -> u32 {
 /// `/huge` must be flagged as an htree-indexed directory.
 #[test]
 fn huge_dir_is_htree_indexed() {
-    let Some((_dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (_dev, fs) = open_fixture();
 
     let huge_ino = find_huge_ino(&fs);
     let huge = Inode::parse(&fs.read_inode_raw(huge_ino).unwrap()).unwrap();
@@ -86,9 +76,7 @@ fn huge_dir_is_htree_indexed() {
 /// version of this test had them confused.
 #[test]
 fn largedir_feature_is_present() {
-    let Some((_dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (_dev, fs) = open_fixture();
 
     const INCOMPAT_LARGEDIR: u32 = 0x4000;
     let present = (fs.sb.feature_incompat & INCOMPAT_LARGEDIR) != 0;
@@ -103,9 +91,7 @@ fn largedir_feature_is_present() {
 /// Path lookup through htree at three sample offsets exercises the whole tree.
 #[test]
 fn path_lookup_descends_htree_for_sampled_files() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     let dev_ref = dev.as_ref();
     let mut reader = inode_reader(&fs);
 
@@ -130,9 +116,7 @@ fn path_lookup_descends_htree_for_sampled_files() {
 /// A missing file inside /huge must fail NotFound, not return a random hit.
 #[test]
 fn missing_file_returns_not_found() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     let dev_ref = dev.as_ref();
     let mut reader = inode_reader(&fs);
 
@@ -145,9 +129,7 @@ fn missing_file_returns_not_found() {
 /// corruption or duplicate-emission bugs.
 #[test]
 fn linear_scan_of_all_leaf_blocks_counts_files() {
-    let Some((_dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (_dev, fs) = open_fixture();
     let huge_ino = find_huge_ino(&fs);
     let huge = Inode::parse(&fs.read_inode_raw(huge_ino).unwrap()).unwrap();
     let huge_data = file_io::read_all(&fs, &huge).unwrap();

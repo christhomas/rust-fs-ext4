@@ -16,29 +16,26 @@ fn resolve(fs: &Filesystem, path: &str) -> u32 {
 use std::fs;
 use std::sync::Arc;
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
-fn copy_to_tmp(name: &str) -> Option<String> {
+#[track_caller]
+fn copy_to_tmp(name: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_trunc_{}_{n}_{}.img", std::process::id(), name);
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 #[test]
 fn truncate_read_only_device_rejected() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open(&path).expect("open ro");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let ino = resolve(&fs, "/test.txt");
@@ -50,9 +47,7 @@ fn truncate_read_only_device_rejected() {
 
 #[test]
 fn truncate_zero_frees_blocks_and_clears_size() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
 
@@ -72,9 +67,7 @@ fn truncate_zero_frees_blocks_and_clears_size() {
 
 #[test]
 fn truncate_survives_remount() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
 
     // First mount: truncate /test.txt to 4 bytes (file was "hello from ext4.\n").
     {
@@ -96,9 +89,7 @@ fn truncate_survives_remount() {
 
 #[test]
 fn truncate_grow_direction_rejected() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let ino = resolve(&fs, "/test.txt");

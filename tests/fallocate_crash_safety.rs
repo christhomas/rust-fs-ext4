@@ -11,23 +11,16 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst = fs_ext4_test_support::temp_path!(
         "fs_ext4_falloc_crash_{}_{tag}_{n}.img",
         std::process::id()
     );
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 struct CrashDevice {
@@ -91,9 +84,7 @@ fn crash_during_fallocate_keep_size_yields_consistent_state() {
     // Post-remount: i_size must stay 0 (KEEP_SIZE invariant), and
     // i_blocks must be either 0 (op didn't apply) or +4*sectors_per_block
     // (op fully applied). Anything in between = torn.
-    let Some(probe) = copy_to_tmp("ext4-basic.img", "ks_probe") else {
-        return;
-    };
+    let probe = copy_to_tmp("ext4-basic.img", "ks_probe");
     {
         let dev = FileDevice::open_rw(&probe).expect("rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
@@ -107,9 +98,7 @@ fn crash_during_fallocate_keep_size_yields_consistent_state() {
     let expected_post_blocks = baseline + 4 * bs_sectors;
 
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp("ext4-basic.img", &format!("ks_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp("ext4-basic.img", &format!("ks_b{budget}"));
         // Fresh shrink — copy_to_tmp gives us back the un-modified fixture.
         {
             let dev = FileDevice::open_rw(&path).expect("rw setup");
@@ -148,9 +137,7 @@ fn crash_during_punch_hole_yields_consistent_state() {
     // op tries to split [0..8] into [0..2] + [4..8], freeing 2 blocks.
     // Atomicity: i_blocks must be either pre (8 blocks) or post (6
     // blocks) — never something in between.
-    let Some(probe) = copy_to_tmp("ext4-basic.img", "punch_probe") else {
-        return;
-    };
+    let probe = copy_to_tmp("ext4-basic.img", "punch_probe");
     {
         let dev = FileDevice::open_rw(&probe).expect("rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
@@ -166,9 +153,7 @@ fn crash_during_punch_hole_yields_consistent_state() {
     let post_blocks = pre_blocks - 2 * bs_sectors;
 
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp("ext4-basic.img", &format!("punch_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp("ext4-basic.img", &format!("punch_b{budget}"));
         {
             let dev = FileDevice::open_rw(&path).expect("rw setup");
             let fs = Filesystem::mount(Arc::new(dev)).expect("mount setup");
@@ -209,9 +194,7 @@ fn crash_during_zero_range_yields_consistent_state() {
     // valid (punch committed but alloc didn't); we only assert no
     // panic + clean remount.
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp("ext4-basic.img", &format!("zr_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp("ext4-basic.img", &format!("zr_b{budget}"));
         {
             let dev = FileDevice::open_rw(&path).expect("rw setup");
             let fs = Filesystem::mount(Arc::new(dev)).expect("mount setup");

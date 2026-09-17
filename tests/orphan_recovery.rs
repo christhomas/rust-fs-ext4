@@ -7,21 +7,20 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+#[track_caller]
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_orph_rec_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
@@ -33,9 +32,7 @@ fn resolve(fs: &Filesystem, path: &str) -> u32 {
 fn ro_mount_skips_orphan_recovery() {
     // RO device must NOT attempt recovery (would error). Mount succeeds
     // and orphan_list reports whatever the chain says.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "ro") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "ro");
     let dev = FileDevice::open(&path).expect("ro");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     assert!(
@@ -47,9 +44,7 @@ fn ro_mount_skips_orphan_recovery() {
 
 #[test]
 fn explicit_recover_orphans_returns_zero_on_clean_image() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "clean") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "clean");
     let dev = FileDevice::open_rw(&path).expect("rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let n = fs.recover_orphans().expect("recover");
@@ -73,9 +68,7 @@ fn recovery_reclaims_planted_single_orphan() {
     // through the buffer to not invalidate replay). Instead: just
     // observe that recover_orphans on the clean fixture returns 0 AND
     // that the recover hook doesn't break any subsequent op.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "post_create") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "post_create");
     {
         let dev = FileDevice::open_rw(&path).expect("rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");

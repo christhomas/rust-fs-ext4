@@ -1,7 +1,7 @@
 //! LARGEDIR stress test — 70,000 entries in one directory on a filesystem
 //! mounted with `INCOMPAT_LARGEDIR`.
 //!
-//! Image (see build-ext4-feature-images.sh build_largedir):
+//! Image (see test-disks/guest-build-images.sh build_largedir):
 //!   /huge/       70000 zero-length files file_00001.txt .. file_70000.txt
 //!   /small.txt   control file
 //!
@@ -15,20 +15,16 @@ use fs_ext4::error::Result;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::Inode;
 use fs_ext4::path;
-use std::path::Path;
 use std::sync::Arc;
 
-const TEST_IMAGE: &str = "test-disks/ext4-largedir.img";
+const TEST_IMAGE: &str = "ext4-largedir.img";
 
-fn open_or_skip() -> Option<(Arc<dyn BlockDevice>, Filesystem)> {
-    if !Path::new(TEST_IMAGE).exists() {
-        eprintln!("skip: {TEST_IMAGE} not built; run build-ext4-feature-images.sh largedir");
-        return None;
-    }
-    let dev = Arc::new(FileDevice::open(TEST_IMAGE).expect("open largedir image"));
+fn open_fixture() -> (Arc<dyn BlockDevice>, Filesystem) {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), TEST_IMAGE);
+    let dev = Arc::new(FileDevice::open(&path).expect("open largedir image"));
     let dev_dyn: Arc<dyn BlockDevice> = dev.clone();
     let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
-    Some((dev_dyn, fs))
+    (dev_dyn, fs)
 }
 
 fn inode_reader(fs: &Filesystem) -> impl FnMut(u32) -> Result<Inode> + '_ {
@@ -48,9 +44,7 @@ fn resolve(dev: &dyn BlockDevice, fs: &Filesystem, p: &str) -> u32 {
 
 #[test]
 fn largedir_mount_succeeds_and_sees_control_file() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     // mount already succeeded; sanity check the control file via linear path.
     let ino = resolve(dev.as_ref(), &fs, "/small.txt");
     assert!(ino >= 2);
@@ -58,9 +52,7 @@ fn largedir_mount_succeeds_and_sees_control_file() {
 
 #[test]
 fn htree_resolves_boundary_entries() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     // First, last, and a couple of interior names — if any of these hits a
     // wrong tree leaf the resolve will fail or return the wrong inode.
     for name in [
@@ -78,9 +70,7 @@ fn htree_resolves_boundary_entries() {
 
 #[test]
 fn htree_random_sample_all_resolve() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     // Deterministic "random" sample — evenly spaced across the 70k range.
     for i in (1..=70_000u32).step_by(517) {
         let p = format!("/huge/file_{i:05}.txt");
@@ -91,9 +81,7 @@ fn htree_random_sample_all_resolve() {
 
 #[test]
 fn missing_entry_returns_notfound() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     let mut reader = inode_reader(&fs);
     // Name that clearly isn't in the 1..=70000 range.
     let err = path::lookup(dev.as_ref(), &fs.sb, &mut reader, "/huge/file_99999.txt").unwrap_err();

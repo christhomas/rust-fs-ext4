@@ -1,6 +1,6 @@
 //! Format ext3 (and ext2) volumes with the driver's own mkfs and hand each to
-//! `e2fsck -fn`, which must exit 0. Where e2fsprogs is not installed the
-//! in-process checks still run and the external one is skipped with a note.
+//! `e2fsck -fn`, which must exit 0. Fails when e2fsprogs is not installed
+//! (`chore tools`).
 //!
 //! `mkfs_e2fsck_oracle` covers the default Ext4 flavor; this covers the legacy
 //! flavors, which take materially different code paths:
@@ -28,14 +28,16 @@ const UUID: [u8; 16] = [
     0xA1, 0xB2, 0xC3, 0xD4, 0xE5, 0xF6, 0x07, 0x18, 0x29, 0x3A, 0x4B, 0x5C, 0x6D, 0x7E, 0x8F, 0x90,
 ];
 
-fn format(tag: &str, size: u64, block_size: u32, flavor: FsFlavor) -> Option<String> {
+fn format(tag: &str, size: u64, block_size: u32, flavor: FsFlavor) -> String {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_mkfsflav_{tag}_{}_{n}.img", std::process::id());
     {
-        let f = std::fs::File::create(&path).ok()?;
-        f.set_len(size).ok()?;
+        let f = std::fs::File::create(&path)
+            .unwrap_or_else(|e| panic!("create scratch image {path}: {e}"));
+        f.set_len(size)
+            .unwrap_or_else(|e| panic!("size scratch image {path}: {e}"));
     }
     {
         let dev = FileDevice::open_rw(&path).expect("open_rw");
@@ -50,7 +52,7 @@ fn format(tag: &str, size: u64, block_size: u32, flavor: FsFlavor) -> Option<Str
         .expect("format_filesystem_with_flavor");
         dev.flush().expect("flush");
     }
-    Some(path)
+    path
 }
 
 fn check_and_done(path: &str, tag: &str, block_size: u32, expect_journal: bool) {
@@ -124,9 +126,7 @@ fn write_through_the_journal(path: &str, tag: &str) {
 
 #[test]
 fn mkfs_ext3_4k_blocks() {
-    let Some(p) = format("ext3_4k", 32 * 1024 * 1024, 4096, FsFlavor::Ext3) else {
-        return;
-    };
+    let p = format("ext3_4k", 32 * 1024 * 1024, 4096, FsFlavor::Ext3);
     check_and_done(&p, "ext3_4k", 4096, true);
 }
 
@@ -135,16 +135,12 @@ fn mkfs_ext3_4k_blocks() {
 /// too).
 #[test]
 fn mkfs_ext3_1k_blocks() {
-    let Some(p) = format("ext3_1k", 8 * 1024 * 1024, 1024, FsFlavor::Ext3) else {
-        return;
-    };
+    let p = format("ext3_1k", 8 * 1024 * 1024, 1024, FsFlavor::Ext3);
     check_and_done(&p, "ext3_1k", 1024, true);
 }
 
 #[test]
 fn mkfs_ext2_4k_blocks() {
-    let Some(p) = format("ext2_4k", 32 * 1024 * 1024, 4096, FsFlavor::Ext2) else {
-        return;
-    };
+    let p = format("ext2_4k", 32 * 1024 * 1024, 4096, FsFlavor::Ext2);
     check_and_done(&p, "ext2_4k", 4096, false);
 }

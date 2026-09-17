@@ -7,17 +7,15 @@
 //! seeded random sequence of operations checked with e2fsck.
 //!
 //! Volumes come from `mkfs.ext4`, extent-mapped and block-mapped, and
-//! `e2fsck -fn` judges each. Skips without e2fsprogs.
+//! `e2fsck -fn` judges each. Fails without e2fsprogs (`chore tools`).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
 use std::process::Command;
 use std::sync::Arc;
 
-fn mkfs(tag: &str, features: &str) -> Option<String> {
-    let mkfs = ["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())?;
+fn mkfs(tag: &str, features: &str) -> String {
+    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_replace_xattr_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
@@ -33,7 +31,7 @@ fn mkfs(tag: &str, features: &str) -> Option<String> {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 #[test]
@@ -43,10 +41,7 @@ fn replacing_content_keeps_the_xattr_block_counted() {
         ("blockmap", "^extent,^64bit,^metadata_csum"),
     ] {
         for (what, len) in [("data", 20_000usize), ("empty", 0)] {
-            let Some(path) = mkfs(&format!("{tag}_{what}"), features) else {
-                eprintln!("skip: e2fsprogs not installed");
-                return;
-            };
+            let path = mkfs(&format!("{tag}_{what}"), features);
             let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&path).unwrap())).unwrap();
             fs.apply_create("/a", 0o644).unwrap();
             fs.apply_replace_file_content("/a", &[5u8; 9000]).unwrap();
@@ -63,7 +58,7 @@ fn replacing_content_keeps_the_xattr_block_counted() {
             fs.apply_replace_file_content("/a", &vec![6u8; len])
                 .unwrap();
             drop(fs);
-            let out = Command::new("e2fsck")
+            let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
                 .args(["-fn", &path])
                 .output()
                 .unwrap();

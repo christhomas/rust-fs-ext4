@@ -13,8 +13,9 @@
 //! check, and the same seed reproduces it.
 //!
 //! Three geometries: 4 KiB extent-mapped (the default), 1 KiB blocks, and a
-//! block-mapped volume without extents. e2fsprogs is required; the test fails
-//! if it is missing, rather than passing without checking anything.
+//! block-mapped volume without extents. e2fsprogs is required (`chore tools`);
+//! the test fails if it is missing, rather than passing without checking
+//! anything.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
@@ -24,14 +25,6 @@ use std::sync::Arc;
 const STEPS: u64 = 150;
 const CHECK_EVERY: u64 = 25;
 const SEEDS: [u64; 2] = [1, 2];
-
-fn tool(name: &str) -> String {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or_else(|| panic!("{name} is not installed; install e2fsprogs"))
-}
 
 /// xorshift64: small, deterministic, and the same on every platform.
 struct Rng(u64);
@@ -47,7 +40,7 @@ impl Rng {
 
 /// e2fsck's complaint, or `None` for a clean volume.
 fn e2fsck(image: &str) -> Option<String> {
-    let out = Command::new(tool("e2fsck"))
+    let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
         .args(["-fn", image])
         .output()
         .unwrap();
@@ -215,7 +208,7 @@ fn random_operation_sequences_leave_volumes_e2fsck_accepts() {
             std::fs::File::create(&image)
                 .and_then(|f| f.set_len(64 * 1024 * 1024))
                 .unwrap();
-            let out = Command::new(tool("mkfs.ext4"))
+            let out = Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
                 .args(["-q", "-F"])
                 .args(args)
                 .arg(&image)

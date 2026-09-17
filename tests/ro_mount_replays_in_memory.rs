@@ -8,7 +8,7 @@
 //! buffer cache. The reference is the same image after `e2fsck -fy`, which
 //! recovers the journal with the kernel's code.
 //!
-//! Skips when e2fsprogs is not installed.
+//! Fails when e2fsprogs is not installed (`chore tools`).
 
 #![cfg(unix)]
 
@@ -18,13 +18,6 @@ use fs_ext4::Filesystem;
 use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
-
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
 
 fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
     let out = Command::new(program)
@@ -91,12 +84,9 @@ fn names(fs: &Filesystem, dir: &str) -> Vec<Vec<u8>> {
 
 #[test]
 fn a_read_only_mount_reads_what_the_journal_committed() {
-    let (Some(mkfs), Some(e2fsck), Some(debugfs)) =
-        (tool("mkfs.ext4"), tool("e2fsck"), tool("debugfs"))
-    else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
+    let e2fsck = fs_ext4_test_support::oracle_tool("e2fsck");
+    let debugfs = fs_ext4_test_support::oracle_tool("debugfs");
     let image = fs_ext4_test_support::temp_path!("fs_ext4_ro_replay_{}.img", std::process::id());
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(64 * 1024 * 1024))

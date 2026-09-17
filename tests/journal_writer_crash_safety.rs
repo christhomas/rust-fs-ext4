@@ -82,21 +82,14 @@ impl BlockDevice for CrashDevice {
     }
 }
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_jw_crash_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn read_mode(path: &str) -> u16 {
@@ -113,9 +106,7 @@ fn crash_device_with_unlimited_budget_matches_real_device() {
     // Sanity: with budget = usize::MAX the wrapper is a transparent
     // pass-through and the chmod must persist exactly as it would
     // through a normal FileDevice.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "unlimited") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "unlimited");
     let original = read_mode(&path);
     let new_mode = 0o644u16;
     let file_type = original & S_IFMT;
@@ -140,9 +131,7 @@ fn crash_device_with_unlimited_budget_matches_real_device() {
 fn crash_at_zero_writes_leaves_pre_state_intact() {
     // budget=0: every write is dropped. The chmod call itself returns Ok
     // (writes silently no-op'd), but on remount nothing changed on disk.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "budget0") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "budget0");
     let original = read_mode(&path);
 
     {
@@ -176,9 +165,7 @@ fn every_crash_budget_yields_consistent_state() {
     //
     // Sweep budgets 0..=20 (covers all four protocol fences for a single-
     // inode chmod). Each iteration uses a fresh image copy.
-    let Some(probe_path) = copy_to_tmp("ext4-basic.img", "probe") else {
-        return;
-    };
+    let probe_path = copy_to_tmp("ext4-basic.img", "probe");
     let original = read_mode(&probe_path);
     let new_mode = 0o600u16;
     let file_type = original & S_IFMT;
@@ -186,9 +173,7 @@ fn every_crash_budget_yields_consistent_state() {
     fs::remove_file(probe_path).ok();
 
     for budget in 0..=20 {
-        let Some(path) = copy_to_tmp("ext4-basic.img", &format!("b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp("ext4-basic.img", &format!("b{budget}"));
         let writes_used;
         {
             let inner = FileDevice::open_rw(&path).expect("rw");

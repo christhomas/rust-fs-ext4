@@ -16,17 +16,15 @@
 //!   reads an inline root.
 //!
 //! Volumes come from `mkfs.ext4`, and `e2fsck -fn` judges each result.
-//! Skips without e2fsprogs.
+//! Fails without e2fsprogs (`chore tools`).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
 use std::process::Command;
 use std::sync::Arc;
 
-fn mkfs(tag: &str) -> Option<String> {
-    let mkfs = ["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())?;
+fn mkfs(tag: &str) -> String {
+    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
     let path = fs_ext4_test_support::temp_path!("fs_ext4_leak_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
@@ -41,11 +39,14 @@ fn mkfs(tag: &str) -> Option<String> {
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 fn e2fsck_clean(path: &str, what: &str) {
-    let out = Command::new("e2fsck").args(["-fn", path]).output().unwrap();
+    let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+        .args(["-fn", path])
+        .output()
+        .unwrap();
     assert!(
         out.status.success(),
         "[{what}] e2fsck -fn rejected the volume:\n{}",
@@ -58,20 +59,20 @@ fn mount(path: &str) -> Filesystem {
 }
 
 /// A volume holding `/f`: empty, with 64 KiB preallocated past its end.
-fn preallocated(tag: &str) -> Option<(String, u32)> {
-    let path = mkfs(tag)?;
+fn preallocated(tag: &str) -> (String, u32) {
+    let path = mkfs(tag);
     let fs = mount(&path);
     let ino = fs.apply_create("/f", 0o644).unwrap();
     fs.apply_fallocate_keep_size(ino, 0, 64 * 1024).unwrap();
     drop(fs);
     e2fsck_clean(&path, tag);
-    Some((path, ino))
+    (path, ino)
 }
 
 /// A volume holding `/f` with twelve one-block extents, one every other
 /// block, so its extent tree is deeper than the inode's inline root.
-fn deep(tag: &str) -> Option<(String, u32)> {
-    let path = mkfs(tag)?;
+fn deep(tag: &str) -> (String, u32) {
+    let path = mkfs(tag);
     let fs = mount(&path);
     let ino = fs.apply_create("/f", 0o644).unwrap();
     for i in 0..12u64 {
@@ -84,23 +85,19 @@ fn deep(tag: &str) -> Option<(String, u32)> {
     );
     drop(fs);
     e2fsck_clean(&path, tag);
-    Some((path, ino))
+    (path, ino)
 }
 
 #[test]
 fn unlinking_an_empty_file_frees_its_preallocation() {
-    let Some((path, _)) = preallocated("unlink") else {
-        return;
-    };
+    let (path, _) = preallocated("unlink");
     mount(&path).apply_unlink("/f").expect("unlink");
     e2fsck_clean(&path, "unlink");
 }
 
 #[test]
 fn replacing_an_empty_files_content_frees_its_preallocation() {
-    let Some((path, _)) = preallocated("replace") else {
-        return;
-    };
+    let (path, _) = preallocated("replace");
     mount(&path)
         .apply_replace_file_content("/f", b"hello")
         .expect("replace");
@@ -109,9 +106,7 @@ fn replacing_an_empty_files_content_frees_its_preallocation() {
 
 #[test]
 fn renaming_over_an_empty_file_frees_its_preallocation() {
-    let Some((path, _)) = preallocated("rename") else {
-        return;
-    };
+    let (path, _) = preallocated("rename");
     let fs = mount(&path);
     fs.apply_create("/g", 0o644).unwrap();
     fs.apply_rename("/g", "/f", true).expect("rename over");
@@ -121,18 +116,14 @@ fn renaming_over_an_empty_file_frees_its_preallocation() {
 
 #[test]
 fn unlinking_a_file_with_a_deep_extent_tree_frees_the_tree() {
-    let Some((path, _)) = deep("unlink_deep") else {
-        return;
-    };
+    let (path, _) = deep("unlink_deep");
     mount(&path).apply_unlink("/f").expect("unlink");
     e2fsck_clean(&path, "unlink_deep");
 }
 
 #[test]
 fn punching_a_deep_tree_down_to_its_root_frees_the_tree() {
-    let Some((path, ino)) = deep("punch") else {
-        return;
-    };
+    let (path, ino) = deep("punch");
     mount(&path)
         .apply_fallocate_punch_hole(ino, 0, 16 * 4096)
         .expect("punch");

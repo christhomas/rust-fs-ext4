@@ -15,22 +15,21 @@ use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+#[track_caller]
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_xattr_ext_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
@@ -55,9 +54,7 @@ fn snapshot_state(path: &str, file: &str) -> (u64, u32, u64, u64, u64) {
 
 #[test]
 fn setxattr_overflow_allocates_external_block_and_round_trips() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "alloc_rt") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "alloc_rt");
 
     let (sb_before, bgd0_before, acl_before, blocks_before, _) = snapshot_state(&path, "/test.txt");
     assert_eq!(acl_before, 0, "fixture must start with no external block");
@@ -113,9 +110,7 @@ fn setxattr_overflow_allocates_external_block_and_round_trips() {
 
 #[test]
 fn removexattr_external_block_only_entry_frees_block() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "remove_frees") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "remove_frees");
 
     // Set up: spill one 512-byte entry to an external block.
     let value = vec![0x77u8; 512];
@@ -166,9 +161,7 @@ fn removexattr_external_block_only_entry_frees_block() {
 
 #[test]
 fn external_block_holds_multiple_entries() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "multi") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "multi");
 
     // Two large-ish entries, both spill to the same external block.
     let v1 = vec![0x11u8; 300];

@@ -227,18 +227,13 @@ fn every_version_matches_e2fsprogs() {
 }
 
 /// Re-derive every vector from `debugfs` itself, so the table above can only
-/// be regenerated, not hand-edited into agreement. Skips without debugfs.
+/// be regenerated, not hand-edited into agreement. Fails without debugfs
+/// (`chore tools`).
 // debugfs is an e2fsprogs tool, and the name is passed as raw bytes.
 #[cfg(unix)]
 #[test]
 fn live_debugfs_agrees() {
-    let Some(debugfs) = ["/usr/sbin/debugfs", "/sbin/debugfs", "/usr/bin/debugfs"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-    else {
-        eprintln!("skip: debugfs not installed");
-        return;
-    };
+    let debugfs = fs_ext4_test_support::oracle_tool("debugfs");
     for &(seed_name, version, name, major, minor) in VECTORS {
         let uuid = if seed_name == "zero" {
             "00000000-0000-0000-0000-000000000000"
@@ -249,7 +244,7 @@ fn live_debugfs_agrees() {
         request.extend_from_slice(name);
         request.push(b'"');
         use std::os::unix::ffi::OsStringExt;
-        let out = std::process::Command::new(debugfs)
+        let out = std::process::Command::new(&debugfs)
             .arg("-R")
             .arg(std::ffi::OsString::from_vec(request))
             .output()

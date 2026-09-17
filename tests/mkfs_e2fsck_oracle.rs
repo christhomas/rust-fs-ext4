@@ -51,14 +51,16 @@ const UUID: [u8; 16] = [
 ];
 
 /// Pre-size a tmp file, format it via the driver's mkfs, and return its path.
-fn format_to_tmp(tag: &str, size: u64, block_size: u32) -> Option<String> {
+fn format_to_tmp(tag: &str, size: u64, block_size: u32) -> String {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_mkfs_{tag}_{}_{n}.img", std::process::id());
     {
-        let f = std::fs::File::create(&path).ok()?;
-        f.set_len(size).ok()?;
+        let f = std::fs::File::create(&path)
+            .unwrap_or_else(|e| panic!("create scratch image {path}: {e}"));
+        f.set_len(size)
+            .unwrap_or_else(|e| panic!("size scratch image {path}: {e}"));
     }
     {
         let dev = FileDevice::open_rw(&path).expect("open_rw");
@@ -66,7 +68,7 @@ fn format_to_tmp(tag: &str, size: u64, block_size: u32) -> Option<String> {
             .expect("format_filesystem");
         dev.flush().expect("flush");
     } // drop closes the file → bytes are on disk
-    Some(path)
+    path
 }
 
 /// Mount the freshly-formatted image through the driver and sanity-check the
@@ -92,7 +94,7 @@ fn check_and_done(path: &str, tag: &str, block_size: u32, expect_groups: usize) 
         // Structural audit: the freshly-formatted block/inode bitmaps and the
         // stored free counters must already agree. This catches the
         // first_data_block=1 bitmap/count drift that e2fsck flags as "Free
-        // blocks count wrong" on 1 KiB-block images, without needing the VM.
+        // blocks count wrong" on 1 KiB-block images, before e2fsck runs.
         let report = fs_ext4::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
         assert!(
             report.is_clean(),
@@ -111,18 +113,14 @@ fn check_and_done(path: &str, tag: &str, block_size: u32, expect_groups: usize) 
 #[test]
 fn mkfs_4k_blocks_32m() {
     // 32 MiB / 4 KiB = 8192 blocks against a 32768-block group: one group.
-    let Some(p) = format_to_tmp("4k", 32 * 1024 * 1024, 4096) else {
-        return;
-    };
+    let p = format_to_tmp("4k", 32 * 1024 * 1024, 4096);
     check_and_done(&p, "4k", 4096, 1);
 }
 
 #[test]
 fn mkfs_2k_blocks_16m() {
     // 16 MiB / 2 KiB = 8192 blocks against a 16384-block group: one group.
-    let Some(p) = format_to_tmp("2k", 16 * 1024 * 1024, 2048) else {
-        return;
-    };
+    let p = format_to_tmp("2k", 16 * 1024 * 1024, 2048);
     check_and_done(&p, "2k", 2048, 1);
 }
 
@@ -130,9 +128,7 @@ fn mkfs_2k_blocks_16m() {
 fn mkfs_1k_blocks_8m() {
     // 1 KiB blocks → first_data_block=1, minimal (1024-block) journal: a
     // distinct on-disk layout from the 4 KiB default. One group.
-    let Some(p) = format_to_tmp("1k", 8 * 1024 * 1024, 1024) else {
-        return;
-    };
+    let p = format_to_tmp("1k", 8 * 1024 * 1024, 1024);
     check_and_done(&p, "1k", 1024, 1);
 }
 
@@ -148,9 +144,7 @@ fn mkfs_4k_blocks_320m_short_final_group() {
     //
     // Group 1 also carries the first superblock + GDT backup, so this is the
     // smallest case that runs the backup loop at all.
-    let Some(p) = format_to_tmp("mg3", 320 * 1024 * 1024, 4096) else {
-        return;
-    };
+    let p = format_to_tmp("mg3", 320 * 1024 * 1024, 4096);
     check_and_done(&p, "mg3", 4096, 3);
 }
 
@@ -162,8 +156,6 @@ fn mkfs_4k_blocks_640m_sparse_super_backups() {
     // 0, 1 and 3 and NOT in 2 or 4. e2fsck reads those backups and checks
     // each one's `s_block_group_nr` and recomputed superblock checksum, which
     // is the only external check the backup path has ever had.
-    let Some(p) = format_to_tmp("mg5", 640 * 1024 * 1024, 4096) else {
-        return;
-    };
+    let p = format_to_tmp("mg5", 640 * 1024 * 1024, 4096);
     check_and_done(&p, "mg5", 4096, 5);
 }

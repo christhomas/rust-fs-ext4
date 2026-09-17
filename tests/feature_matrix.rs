@@ -14,11 +14,11 @@
 //!
 //! # Why this builds its own image
 //!
-//! `test-disks/*.img` is gitignored, and the existing builder needs an
-//! Alpine VM because most fixtures require a real mount to populate.
-//! The images here need only `mke2fs` — nothing is written into them,
-//! the feature bits in the superblock are the whole point — so the test
-//! builds them itself and runs anywhere e2fsprogs is installed.
+//! `test-disks/*.img` is gitignored, and `chore fixtures` builds it in the
+//! fs-linux-test-harness VM because most fixtures require a real mount to
+//! populate. The images here need only `mke2fs` — nothing is written into
+//! them, the feature bits in the superblock are the whole point — so the
+//! test builds them itself. It fails without e2fsprogs (`chore tools`).
 
 use std::path::{Path, PathBuf};
 use std::process::Command;
@@ -30,24 +30,9 @@ use fs_ext4::Filesystem;
 /// ext4's root directory is always inode 2.
 const ROOT_INO: u32 = 2;
 
-/// Locate `mke2fs`. Homebrew keeps e2fsprogs keg-only on macOS, so it
-/// is present but not on PATH.
-fn mke2fs() -> Option<String> {
-    if Command::new("mke2fs").arg("-V").output().is_ok() {
-        return Some("mke2fs".into());
-    }
-    let brew = Command::new("brew")
-        .args(["--prefix", "e2fsprogs"])
-        .output()
-        .ok()?;
-    let prefix = String::from_utf8(brew.stdout).ok()?;
-    let path = format!("{}/sbin/mke2fs", prefix.trim());
-    Path::new(&path).exists().then_some(path)
-}
-
 /// Build a 16 MiB image with the given `mke2fs` options.
-fn build(name: &str, opts: &[&str]) -> Option<PathBuf> {
-    let mke2fs = mke2fs()?;
+fn build(name: &str, opts: &[&str]) -> PathBuf {
+    let mke2fs = fs_ext4_test_support::oracle_tool("mke2fs");
     let path =
         fs_ext4_test_support::temp_dir().join(format!("fs-ext4-fm-{}-{name}", std::process::id()));
     let _ = std::fs::remove_file(&path);
@@ -63,7 +48,7 @@ fn build(name: &str, opts: &[&str]) -> Option<PathBuf> {
         "mke2fs {opts:?} failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 fn mount(path: &Path) -> fs_ext4::error::Result<Filesystem> {
@@ -92,13 +77,10 @@ fn mount(path: &Path) -> fs_ext4::error::Result<Filesystem> {
 fn bigalloc_mounts_and_reads() {
     // `-b 1024` explicitly: whether a 16 MiB image gets 1 KiB blocks is the
     // local mke2fs.conf's choice, and CI's does not make it.
-    let Some(img) = build(
+    let img = build(
         "bigalloc",
         &["-t", "ext4", "-b", "1024", "-O", "bigalloc", "-C", "16384"],
-    ) else {
-        eprintln!("skip: mke2fs not available (apt/brew install e2fsprogs)");
-        return;
-    };
+    );
     let fs = mount(&img).expect("a bigalloc filesystem reads like any other");
     assert_eq!(fs.sb.block_size(), 1024, "the case this pins is 1 KiB");
     assert_eq!(fs.sb.first_data_block, 0);
@@ -115,10 +97,7 @@ fn bigalloc_mounts_and_reads() {
 /// requires it to still work.
 #[test]
 fn an_ordinary_ext4_still_mounts_and_reads() {
-    let Some(img) = build("plain", &["-t", "ext4"]) else {
-        eprintln!("skip: mke2fs not available");
-        return;
-    };
+    let img = build("plain", &["-t", "ext4"]);
     let fs = mount(&img).expect("a plain ext4 filesystem must mount");
     fs.read_inode_verified(ROOT_INO)
         .expect("the root inode must be readable after mounting");
@@ -132,10 +111,7 @@ fn an_ordinary_ext4_still_mounts_and_reads() {
 /// `project` is a real RO_COMPAT feature the reader does nothing with.
 #[test]
 fn a_tolerated_ro_compat_feature_still_mounts() {
-    let Some(img) = build("project", &["-t", "ext4", "-O", "project,quota"]) else {
-        eprintln!("skip: mke2fs not available");
-        return;
-    };
+    let img = build("project", &["-t", "ext4", "-O", "project,quota"]);
     let fs = mount(&img).expect("project/quota are ignorable on a read-only mount");
     fs.read_inode_verified(ROOT_INO).expect("root readable");
     let _ = std::fs::remove_file(&img);
@@ -157,10 +133,7 @@ fn a_tolerated_ro_compat_feature_still_mounts() {
 /// case that must keep working.
 #[test]
 fn an_mmp_filesystem_is_refused_for_writing_but_allowed_read_only() {
-    let Some(img) = build("mmp", &["-t", "ext4", "-O", "mmp"]) else {
-        eprintln!("skip: mke2fs not available");
-        return;
-    };
+    let img = build("mmp", &["-t", "ext4", "-O", "mmp"]);
 
     // Writable: must be refused.
     let dev = FileDevice::open_rw(img.to_str().unwrap()).expect("open read-write");

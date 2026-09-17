@@ -28,18 +28,15 @@ mod sb {
     pub const DESC_SIZE: u64 = 0xFE;
 }
 
-fn copy_to_tmp(tag: &str) -> Option<String> {
+fn copy_to_tmp(tag: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = format!("{}/test-disks/ext4-no-csum.img", env!("CARGO_MANIFEST_DIR"));
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-no-csum.img");
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_hostile_{}_{n}_{tag}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn patch(path: &str, field: u64, bytes: &[u8]) {
@@ -66,9 +63,7 @@ fn mount_error(path: &str) -> String {
 /// memory from a sparse image.
 #[test]
 fn a_block_larger_than_ext4_defines_is_refused() {
-    let Some(path) = copy_to_tmp("bigblock") else {
-        return;
-    };
+    let path = copy_to_tmp("bigblock");
     patch(&path, sb::LOG_BLOCK_SIZE, &20u32.to_le_bytes());
     let why = mount_error(&path);
     assert!(
@@ -82,9 +77,7 @@ fn a_block_larger_than_ext4_defines_is_refused() {
 /// when the field says 64. A smaller value indexes past the buffer.
 #[test]
 fn a_descriptor_size_smaller_than_a_descriptor_is_refused() {
-    let Some(path) = copy_to_tmp("descsize") else {
-        return;
-    };
+    let path = copy_to_tmp("descsize");
     patch(&path, sb::DESC_SIZE, &8u16.to_le_bytes());
     let why = mount_error(&path);
     assert!(
@@ -99,9 +92,7 @@ fn a_descriptor_size_smaller_than_a_descriptor_is_refused() {
 /// `group_count * desc_size` bytes read whole into one buffer.
 #[test]
 fn a_group_descriptor_table_larger_than_the_device_is_refused() {
-    let Some(path) = copy_to_tmp("bgt") else {
-        return;
-    };
+    let path = copy_to_tmp("bgt");
     // 2^32 blocks in groups of one: four billion descriptors.
     patch(&path, sb::BLOCKS_COUNT_LO, &0xFFFF_FFFFu32.to_le_bytes());
     patch(&path, sb::BLOCKS_PER_GROUP, &1u32.to_le_bytes());
@@ -151,9 +142,7 @@ fn set_size_high(path: &str, ino: u32, value: u32) {
 /// blocks are all really there.
 #[test]
 fn a_directory_larger_than_the_filesystem_is_refused() {
-    let Some(path) = copy_to_tmp("bigdir") else {
-        return;
-    };
+    let path = copy_to_tmp("bigdir");
     // Root inode, 2^44 bytes.
     set_size_high(&path, 2, 0x1000);
 
@@ -181,18 +170,12 @@ fn a_directory_larger_than_the_filesystem_is_refused() {
 /// boundary's `catch_unwind` never sees it.
 #[test]
 fn reading_a_file_whole_will_not_ask_for_more_memory_than_the_filesystem_holds() {
-    let Some(path) = copy_to_tmp("bigfile") else {
-        return;
-    };
+    let path = copy_to_tmp("bigfile");
     let dev = FileDevice::open(&path).expect("open");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
-    let Ok(ino) = fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, "/file.txt") else {
-        // The fixture does not carry that file; nothing to patch.
-        drop(fs);
-        fs::remove_file(path).ok();
-        return;
-    };
+    let ino = fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, "/file.txt")
+        .expect("ext4-no-csum.img carries /file.txt");
     drop(fs);
 
     set_size_high(&path, ino, 0x2000_0000);
@@ -252,9 +235,7 @@ fn a_group_descriptor_pointing_outside_the_filesystem_is_refused() {
         ("block bitmap", bgd::BLOCK_BITMAP_LO),
         ("inode table", bgd::INODE_TABLE_LO),
     ] {
-        let Some(path) = copy_to_tmp("bgdptr") else {
-            return;
-        };
+        let path = copy_to_tmp("bgdptr");
         patch_descriptor(&path, 0, field, 0x00FF_FFFF);
         let why = mount_error(&path);
         assert!(

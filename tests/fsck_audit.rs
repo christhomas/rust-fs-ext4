@@ -7,14 +7,8 @@ use std::sync::Arc;
 
 #[test]
 fn pristine_basic_image_audits_clean() {
-    let path = "test-disks/ext4-basic.img";
-    let file = match FileDevice::open(path) {
-        Ok(f) => f,
-        Err(_) => {
-            eprintln!("skip: {path} not present");
-            return;
-        }
-    };
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+    let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
     let dev: Arc<dyn fs_ext4::block_io::BlockDevice> = Arc::new(file);
     let fs = Filesystem::mount(dev).expect("mount");
 
@@ -36,14 +30,8 @@ fn pristine_basic_image_audits_clean() {
 
 #[test]
 fn htree_image_audits_clean() {
-    let path = "test-disks/ext4-htree.img";
-    let file = match FileDevice::open(path) {
-        Ok(f) => f,
-        Err(_) => {
-            eprintln!("skip: {path} not present");
-            return;
-        }
-    };
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-htree.img");
+    let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
     let dev: Arc<dyn fs_ext4::block_io::BlockDevice> = Arc::new(file);
     let fs = Filesystem::mount(dev).expect("mount");
 
@@ -58,14 +46,8 @@ fn htree_image_audits_clean() {
 
 #[test]
 fn audit_with_zero_bounds_still_succeeds() {
-    let path = "test-disks/ext4-basic.img";
-    let file = match FileDevice::open(path) {
-        Ok(f) => f,
-        Err(_) => {
-            eprintln!("skip: {path} not present");
-            return;
-        }
-    };
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+    let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
     let dev: Arc<dyn fs_ext4::block_io::BlockDevice> = Arc::new(file);
     let fs = Filesystem::mount(dev).expect("mount");
     let report = fs.audit(0, 0).expect("audit");
@@ -79,20 +61,17 @@ fn audit_with_zero_bounds_still_succeeds() {
 #[test]
 fn all_pristine_test_images_audit_clean() {
     let images = [
-        "test-disks/ext4-basic.img",
-        "test-disks/ext4-inline.img",
-        "test-disks/ext4-xattr.img",
-        "test-disks/ext4-acl.img",
-        "test-disks/ext4-deep-extents.img",
-        "test-disks/ext4-csum-seed.img",
-        "test-disks/ext4-no-csum.img",
+        "ext4-basic.img",
+        "ext4-inline.img",
+        "ext4-xattr.img",
+        "ext4-acl.img",
+        "ext4-deep-extents.img",
+        "ext4-csum-seed.img",
+        "ext4-no-csum.img",
     ];
-    let mut any_tested = false;
-    for path in images {
-        let Ok(file) = FileDevice::open(path) else {
-            continue;
-        };
-        any_tested = true;
+    for name in images {
+        let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
+        let file = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e:?}"));
         let dev: Arc<dyn fs_ext4::block_io::BlockDevice> = Arc::new(file);
         let fs = Filesystem::mount(dev).expect("mount");
         let report = fs.audit(1024, 10_000).expect("audit");
@@ -101,9 +80,6 @@ fn all_pristine_test_images_audit_clean() {
             "{path} should audit clean, got {:?}",
             report.anomalies
         );
-    }
-    if !any_tested {
-        eprintln!("skip: no pristine images present");
     }
 }
 

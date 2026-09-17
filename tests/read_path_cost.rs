@@ -16,8 +16,8 @@
 //! and on one with the default [`fs_ext4::fs::DEFAULT_CACHE_BLOCKS`], through
 //! `am-fs-core`'s `CountingDevice` below the cache, as the sibling drivers
 //! measure. The tree is built here with `mkfs.ext4 -d` to a fixed recipe, so
-//! the figures in `docs/read-path-cost.md` can be reproduced. Skips when
-//! e2fsprogs is not installed.
+//! the figures in `docs/read-path-cost.md` can be reproduced. Fails when
+//! e2fsprogs is not installed (`chore tools`).
 
 #![cfg(unix)]
 
@@ -69,17 +69,11 @@ struct Pass {
     read: Cost,
 }
 
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
-
 /// The measured tree: ten directories of 200 files of assorted sizes, three
 /// levels of nesting, and one directory of 3000 names indexed by `e2fsck -D`.
-fn build_image() -> Option<String> {
-    let (mkfs, e2fsck) = (tool("mkfs.ext4")?, tool("e2fsck")?);
+fn build_image() -> String {
+    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
+    let e2fsck = fs_ext4_test_support::oracle_tool("e2fsck");
     let root = fs_ext4_test_support::temp_path!("fs_ext4_read_cost_{}", std::process::id());
     for d in 0..10 {
         let dir = format!("{root}/d{d}");
@@ -109,7 +103,7 @@ fn build_image() -> Option<String> {
         Some(0 | 1)
     ));
     let _ = std::fs::remove_dir_all(&root);
-    Some(image)
+    image
 }
 
 fn entries(fs: &Filesystem, ino: u32) -> Vec<(Vec<u8>, u32)> {
@@ -241,10 +235,7 @@ fn measure_pass(image: &str, blocks: usize) -> Pass {
 
 #[test]
 fn what_a_read_costs_in_calls_to_the_device() {
-    let Some(image) = build_image() else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = build_image();
     eprintln!("--- no clean cache ---");
     let uncached = measure_pass(&image, 0);
     eprintln!("--- default cache ({DEFAULT_CACHE_BLOCKS} blocks) ---");

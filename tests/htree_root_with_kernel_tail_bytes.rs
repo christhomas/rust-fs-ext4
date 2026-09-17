@@ -15,23 +15,15 @@
 //! files, `e2fsck -fyD` indexes the root, and the root's `dt_reserved` is set
 //! to the kernel's value with the index checksum restamped. `e2fsck -fn` must
 //! accept that as built. Then a create, a write and two unlinks go through,
-//! and e2fsck accepts the result. e2fsprogs is required.
+//! and e2fsck accepts the result. e2fsprogs is required (`chore tools`).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
 use std::process::Command;
 use std::sync::Arc;
 
-fn tool(name: &str) -> String {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or_else(|| panic!("{name} is not installed; install e2fsprogs"))
-}
-
 fn e2fsck_clean(image: &str, what: &str) {
-    let out = Command::new(tool("e2fsck"))
+    let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
         .args(["-fn", image])
         .output()
         .unwrap();
@@ -53,7 +45,7 @@ fn indexed_root(tag: &str) -> (String, String) {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(16 * 1024 * 1024))
         .unwrap();
-    let mkfs = Command::new(tool("mkfs.ext4"))
+    let mkfs = Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
         .args([
             "-q",
             "-F",
@@ -72,7 +64,7 @@ fn indexed_root(tag: &str) -> (String, String) {
         "{}",
         String::from_utf8_lossy(&mkfs.stderr)
     );
-    let index = Command::new(tool("e2fsck"))
+    let index = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
         .args(["-fyD", &image])
         .output()
         .unwrap();

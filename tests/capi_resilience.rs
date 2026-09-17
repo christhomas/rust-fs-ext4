@@ -17,7 +17,10 @@ use std::fs;
 use std::os::raw::c_void;
 use std::path::PathBuf;
 
-const GOOD_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
+#[track_caller]
+fn good_image() -> String {
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img")
+}
 
 fn last_err() -> String {
     unsafe {
@@ -32,7 +35,7 @@ fn last_err() -> String {
 /// Make a tmp copy of ext4-basic.img, apply `mutate` to the bytes, write
 /// it back out, and return the tmp path (caller is responsible for drop).
 fn corrupted_copy(label: &str, mutate: impl FnOnce(&mut Vec<u8>)) -> PathBuf {
-    let mut bytes = fs::read(GOOD_IMAGE).expect("read source image");
+    let mut bytes = fs::read(good_image()).expect("read source image");
     mutate(&mut bytes);
     let mut p = fs_ext4_test_support::temp_dir().to_path_buf();
     p.push(format!(
@@ -111,7 +114,7 @@ fn hammer_all_entry_points(path: &str) {
 #[test]
 fn known_good_image_baseline() {
     // Sanity check — the unmodified image must mount cleanly.
-    let c = CString::new(GOOD_IMAGE).unwrap();
+    let c = CString::new(good_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(c.as_ptr()) };
     assert!(!fs.is_null(), "baseline mount failed: {}", last_err());
     assert_eq!(fs_ext4_last_errno(), 0);
@@ -251,7 +254,7 @@ fn mount_callback(bytes: &Vec<u8>) -> *mut fs_ext4_fs_t {
 
 #[test]
 fn callback_mount_succeeds_on_good_image() {
-    let bytes = fs::read(GOOD_IMAGE).unwrap();
+    let bytes = fs::read(good_image()).unwrap();
     let fs = mount_callback(&bytes);
     assert!(!fs.is_null(), "callback mount failed: {}", last_err());
     assert_eq!(fs_ext4_last_errno(), 0);
@@ -260,7 +263,7 @@ fn callback_mount_succeeds_on_good_image() {
 
 #[test]
 fn callback_mount_rejects_corrupted_bytes_cleanly() {
-    let mut bytes = fs::read(GOOD_IMAGE).unwrap();
+    let mut bytes = fs::read(good_image()).unwrap();
     // Kill the superblock magic (offset 1024 + 56).
     bytes[1024 + 56] = 0;
     bytes[1024 + 57] = 0;

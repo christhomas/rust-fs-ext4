@@ -17,22 +17,21 @@ use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+#[track_caller]
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_alloc_ctr_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
@@ -54,9 +53,7 @@ fn bgd_free_blocks(path: &str, gi: usize) -> u32 {
 
 #[test]
 fn truncate_shrink_updates_sb_and_bgd_free_blocks() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "trunc_sb_bgd") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "trunc_sb_bgd");
 
     let sb_before = sb_free_blocks(&path);
     let bgd0_before = bgd_free_blocks(&path, 0);
@@ -97,9 +94,7 @@ fn truncate_shrink_updates_sb_and_bgd_free_blocks() {
 
 #[test]
 fn unlink_round_trip_keeps_sb_and_bgd_in_sync() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "unlink_sb_bgd") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "unlink_sb_bgd");
 
     let sb_before = sb_free_blocks(&path);
     let bgd0_before = bgd_free_blocks(&path, 0);

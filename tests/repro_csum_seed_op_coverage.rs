@@ -13,19 +13,13 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn copy(tag: &str) -> Option<String> {
+fn copy(tag: &str) -> String {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
-    let src = format!(
-        "{}/test-disks/ext4-csum-seed.img",
-        env!("CARGO_MANIFEST_DIR")
-    );
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-csum-seed.img");
     let dst = fs_ext4_test_support::temp_path!("fs_ext4_wild_{tag}_{}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn rw(path: &str) -> Filesystem {
@@ -35,9 +29,11 @@ fn rw(path: &str) -> Filesystem {
 fn done(path: &str, tag: &str) {
     {
         let fs = Filesystem::mount(Arc::new(FileDevice::open(path).expect("ro"))).expect("remount");
-        if let Some(j) = fs_ext4::jbd2::read_superblock(&fs).expect("jsb") {
-            assert!(j.is_clean(), "[{tag}] journal not clean after ops");
-        }
+        // ext4-csum-seed.img is built with has_journal.
+        let j = fs_ext4::jbd2::read_superblock(&fs)
+            .expect("jsb")
+            .unwrap_or_else(|| panic!("[{tag}] ext4-csum-seed.img has no journal superblock"));
+        assert!(j.is_clean(), "[{tag}] journal not clean after ops");
     }
     // The authoritative check is an external e2fsck (see the file header) — the
     // in-process readers can't see metadata_csum mistakes. Keep the image only
@@ -53,7 +49,7 @@ fn done(path: &str, tag: &str) {
 
 #[test]
 fn op_file_write_truncate() {
-    let Some(p) = copy("write_trunc") else { return };
+    let p = copy("write_trunc");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/f", 0o644).expect("create");
@@ -67,7 +63,7 @@ fn op_file_write_truncate() {
 
 #[test]
 fn op_bigwrite_multiblock() {
-    let Some(p) = copy("bigwrite") else { return };
+    let p = copy("bigwrite");
     {
         let fs = rw(&p);
         fs.apply_create("/big", 0o644).expect("create");
@@ -79,7 +75,7 @@ fn op_bigwrite_multiblock() {
 
 #[test]
 fn op_mkdir_rmdir() {
-    let Some(p) = copy("mkdir_rmdir") else { return };
+    let p = copy("mkdir_rmdir");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/d1", 0o755).expect("mkdir d1");
@@ -92,7 +88,7 @@ fn op_mkdir_rmdir() {
 
 #[test]
 fn op_hardlink_unlink() {
-    let Some(p) = copy("hardlink") else { return };
+    let p = copy("hardlink");
     {
         let fs = rw(&p);
         fs.apply_create("/a", 0o644).expect("create a");
@@ -104,7 +100,7 @@ fn op_hardlink_unlink() {
 
 #[test]
 fn op_rename() {
-    let Some(p) = copy("rename") else { return };
+    let p = copy("rename");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create x");
@@ -118,7 +114,7 @@ fn op_rename() {
 
 #[test]
 fn op_chmod_chown() {
-    let Some(p) = copy("chmod_chown") else { return };
+    let p = copy("chmod_chown");
     {
         let fs = rw(&p);
         fs.apply_create("/m", 0o644).expect("create");
@@ -130,7 +126,7 @@ fn op_chmod_chown() {
 
 #[test]
 fn op_xattr_inline_and_external() {
-    let Some(p) = copy("xattr") else { return };
+    let p = copy("xattr");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create");
@@ -147,7 +143,7 @@ fn op_xattr_inline_and_external() {
 
 #[test]
 fn op_fallocate_variants() {
-    let Some(p) = copy("fallocate") else { return };
+    let p = copy("fallocate");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/fa", 0o644).expect("create");
@@ -165,7 +161,7 @@ fn op_fallocate_variants() {
 
 #[test]
 fn op_rename_dir_crossdir() {
-    let Some(p) = copy("rename_dir") else { return };
+    let p = copy("rename_dir");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/a", 0o755).expect("mkdir a");
@@ -181,7 +177,7 @@ fn op_rename_dir_crossdir() {
 
 #[test]
 fn op_htree_dir_growth() {
-    let Some(p) = copy("htree") else { return };
+    let p = copy("htree");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/h", 0o755).expect("mkdir h");
@@ -196,9 +192,7 @@ fn op_htree_dir_growth() {
 
 #[test]
 fn op_dir_multiblock_growth() {
-    let Some(p) = copy("dir_multiblock") else {
-        return;
-    };
+    let p = copy("dir_multiblock");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/m", 0o755).expect("mkdir m");
@@ -212,9 +206,7 @@ fn op_dir_multiblock_growth() {
 
 #[test]
 fn op_slow_symlink() {
-    let Some(p) = copy("slow_symlink") else {
-        return;
-    };
+    let p = copy("slow_symlink");
     {
         let fs = rw(&p);
         // > 60 bytes → "slow" symlink: target stored in a data block, not i_block.
@@ -226,7 +218,7 @@ fn op_slow_symlink() {
 
 #[test]
 fn op_large_file_extents() {
-    let Some(p) = copy("large_file") else { return };
+    let p = copy("large_file");
     {
         let fs = rw(&p);
         fs.apply_create("/lf", 0o644).expect("create");
@@ -245,7 +237,7 @@ fn op_large_file_extents() {
 
 #[test]
 fn op_replace_file_content() {
-    let Some(p) = copy("replace") else { return };
+    let p = copy("replace");
     {
         let fs = rw(&p);
         fs.apply_create("/rf", 0o644).expect("create");
@@ -260,7 +252,7 @@ fn op_replace_file_content() {
 
 #[test]
 fn op_removexattr_last_frees_block() {
-    let Some(p) = copy("xattr_free") else { return };
+    let p = copy("xattr_free");
     {
         let fs = rw(&p);
         fs.apply_create("/xr", 0o644).expect("create");
@@ -276,9 +268,7 @@ fn op_removexattr_last_frees_block() {
 
 #[test]
 fn op_slow_symlink_unlink() {
-    let Some(p) = copy("slow_symlink_unlink") else {
-        return;
-    };
+    let p = copy("slow_symlink_unlink");
     {
         let fs = rw(&p);
         let target = "/a/very/long/symlink/target/path/that/exceeds/sixty/bytes/for/sure/x";
@@ -291,9 +281,7 @@ fn op_slow_symlink_unlink() {
 
 #[test]
 fn op_fragmented_extent_tree() {
-    let Some(p) = copy("frag_extents") else {
-        return;
-    };
+    let p = copy("frag_extents");
     {
         let fs = rw(&p);
         fs.apply_create("/frag", 0o644).expect("create");

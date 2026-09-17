@@ -5,7 +5,8 @@
 //! file encrypted needs an fscrypt policy from a kernel, so `debugfs` sets
 //! `EXT4_ENCRYPT_FL` on them instead: what this driver must do with such an
 //! inode depends only on the flag, never on the ciphertext. The plain files'
-//! reference is `debugfs cat`. Skips when e2fsprogs is not installed.
+//! reference is `debugfs cat`. Fails when e2fsprogs is not installed
+//! (`chore tools`).
 
 #![cfg(unix)]
 
@@ -13,13 +14,6 @@ use fs_ext4::block_io::FileDevice;
 use fs_ext4::Filesystem;
 use std::process::Command;
 use std::sync::Arc;
-
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
 
 fn run(program: &str, args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
     let out = Command::new(program)
@@ -54,10 +48,8 @@ fn names_encryption(e: &fs_ext4::Error) -> bool {
 
 #[test]
 fn plain_files_read_and_encrypted_ones_are_refused() {
-    let (Some(mkfs), Some(debugfs)) = (tool("mkfs.ext4"), tool("debugfs")) else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
+    let debugfs = fs_ext4_test_support::oracle_tool("debugfs");
     let root = fs_ext4_test_support::temp_path!("fs_ext4_encrypt_{}", std::process::id());
     std::fs::create_dir_all(format!("{root}/plain")).unwrap();
     std::fs::create_dir_all(format!("{root}/secret")).unwrap();

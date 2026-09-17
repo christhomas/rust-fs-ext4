@@ -14,7 +14,8 @@
 //!
 //! The names include ones longer than a TEA block (16 bytes) and a half_md4
 //! block (32), and ones with bytes at or above 0x80, where the signed and
-//! unsigned variants differ. Skips when e2fsprogs is not installed.
+//! unsigned variants differ. Fails when e2fsprogs is not installed (`chore
+//! tools`).
 
 // e2fsprogs and byte-string file names: a Unix test.
 #![cfg(unix)]
@@ -24,16 +25,10 @@ use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::htree;
 use fs_ext4::inode::{Inode, InodeFlags};
+use fs_ext4_test_support::oracle_tool;
 use std::os::unix::ffi::OsStrExt;
 use std::process::Command;
 use std::sync::Arc;
-
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
 
 fn names() -> Vec<Vec<u8>> {
     let mut out = Vec::new();
@@ -55,12 +50,9 @@ fn names() -> Vec<Vec<u8>> {
 }
 
 fn run(hash_alg: &str, s_flags: u32) {
-    let (Some(mkfs), Some(e2fsck), Some(debugfs)) =
-        (tool("mkfs.ext4"), tool("e2fsck"), tool("debugfs"))
-    else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let mkfs = oracle_tool("mkfs.ext4");
+    let e2fsck = oracle_tool("e2fsck");
+    let debugfs = oracle_tool("debugfs");
     let tag = format!("{hash_alg}_{s_flags}");
     let root = fs_ext4_test_support::temp_path!("fs_ext4_htree_src_{tag}_{}", std::process::id());
     let bigdir = std::path::Path::new(&root).join("bigdir");
