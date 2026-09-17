@@ -6598,6 +6598,62 @@ mod tests {
             .expect("write sb");
     }
 
+    /// `fs_ext4_listxattr` into a short buffer writes whole names only,
+    /// as `include/fs_ext4.h` now says; it said "as much as fits".
+    #[test]
+    fn listxattr_into_a_short_buffer_writes_whole_names_only() {
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            fs.apply_create("/x.txt", 0o644).expect("create");
+            fs.apply_setxattr("/x.txt", "user.first", b"1")
+                .expect("set");
+            fs.apply_setxattr("/x.txt", "user.second", b"2")
+                .expect("set");
+        }
+        let image = fs_ext4_test_support::temp_path!("fs_ext4_lx_whole_{}.img", std::process::id());
+        std::fs::write(&image, &*dev.bytes.lock().unwrap()).expect("write image");
+        let c_image = std::ffi::CString::new(image.clone()).unwrap();
+        let c_path = std::ffi::CString::new("/x.txt").unwrap();
+        unsafe {
+            let handle = crate::capi::fs_ext4_mount(c_image.as_ptr());
+            assert!(!handle.is_null(), "C mount");
+            let needed =
+                crate::capi::fs_ext4_listxattr(handle, c_path.as_ptr(), std::ptr::null_mut(), 0);
+            let mut full = vec![0u8; needed as usize];
+            crate::capi::fs_ext4_listxattr(
+                handle,
+                c_path.as_ptr(),
+                full.as_mut_ptr().cast(),
+                full.len(),
+            );
+            let first_len = full.iter().position(|&b| b == 0).unwrap() + 1;
+            assert!((first_len as i64) < needed, "fixture: two names");
+
+            // Room for the first name and three bytes of the second.
+            let mut short = vec![0xEEu8; first_len + 3];
+            let got = crate::capi::fs_ext4_listxattr(
+                handle,
+                c_path.as_ptr(),
+                short.as_mut_ptr().cast(),
+                short.len(),
+            );
+            assert_eq!(got, needed, "the required size is still returned");
+            assert_eq!(
+                &short[..first_len],
+                &full[..first_len],
+                "the first name, whole"
+            );
+            assert_eq!(
+                &short[first_len..],
+                &[0xEE; 3],
+                "no part of the second name"
+            );
+            crate::capi::fs_ext4_umount(handle);
+        }
+        let _ = std::fs::remove_file(&image);
+    }
+
     /// fsck repair is a write, and refuses what every other write refuses
     /// (#119).
     ///
