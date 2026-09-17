@@ -74,84 +74,108 @@ pub struct NameHash {
 }
 
 /// Compute the htree hash of `name` using `version` and the superblock seed.
-/// Returns `None` if the version is unrecognised.
+///
+/// A transcription of the kernel's `ext4fs_dirhash` (`fs/ext4/hash.c`),
+/// checked value for value against e2fsprogs' `dx_hash` in
+/// `tests/htree_hash_vectors.rs`.
 pub fn name_hash(name: &[u8], version: HashVersion, seed: &[u32; 4]) -> NameHash {
     let signed = !version.is_unsigned();
-    let (mut major, minor) = match version {
+    let (major, minor) = match version {
         HashVersion::Legacy | HashVersion::LegacyUnsigned => (legacy_hash(name, signed), 0),
         HashVersion::HalfMd4 | HashVersion::HalfMd4Unsigned => half_md4(name, signed, seed),
         HashVersion::Tea | HashVersion::TeaUnsigned => tea_hash(name, signed, seed),
     };
 
-    // Clear the low bit so the hash never equals HTREE_EOF (or HTREE_EOF-1).
-    major &= !1;
-    if major == HTREE_EOF.wrapping_sub(1) {
-        major = HTREE_EOF.wrapping_sub(1) ^ 1;
-    }
-
+    let major = clear_eof(major);
     NameHash { major, minor }
+}
+
+/// Clear the low bit, and move the one value that would still equal the
+/// end-of-directory marker (`EXT4_HTREE_EOF_32BIT << 1`) down a step.
+fn clear_eof(major: u32) -> u32 {
+    let major = major & !1;
+    if major == HTREE_EOF {
+        HTREE_EOF - 2
+    } else {
+        major
+    }
+}
+
+/// The hash version a directory actually uses.
+///
+/// `dx_root_info.hash_version` only ever records the signed codes 0-2.
+/// Whether the filesystem hashed names as signed or unsigned bytes is the
+/// superblock's `s_flags` (`EXT2_FLAGS_UNSIGNED_HASH`, 0x2), fixed by
+/// `mke2fs` from the platform's `char`: signed on x86, unsigned on ARM. The
+/// kernel adds 3 to a signed code when that flag is set, and so does this.
+pub fn effective_version(root_version: HashVersion, unsigned_hash: bool) -> HashVersion {
+    match (root_version, unsigned_hash) {
+        (HashVersion::Legacy, true) => HashVersion::LegacyUnsigned,
+        (HashVersion::HalfMd4, true) => HashVersion::HalfMd4Unsigned,
+        (HashVersion::Tea, true) => HashVersion::TeaUnsigned,
+        (v, _) => v,
+    }
 }
 
 // ---------------------------------------------------------------------------
 // Legacy hash
 // ---------------------------------------------------------------------------
 
-/// dx_hash_string — the original ext3 hash. Single 32-bit output.
+/// `dx_hack_hash` — the original ext3 hash. Single 32-bit output.
 fn legacy_hash(name: &[u8], signed: bool) -> u32 {
-    let mut hash: u32 = 0x12A3FE2D;
-    let mut prev: u32 = 0x37ABE8F9;
+    let mut hash0: u32 = 0x12A3_FE2D;
+    let mut hash1: u32 = 0x37AB_E8F9;
     for &b in name {
         let c = if signed { (b as i8) as i32 } else { b as i32 };
-        // hash = prev + (hash * 7 + c)
-        let new = prev.wrapping_add((hash.wrapping_mul(7)).wrapping_add(c as u32));
-        prev = hash;
-        hash = new;
+        let mut hash = hash1.wrapping_add(hash0 ^ (c.wrapping_mul(7_152_373) as u32));
+        if hash & 0x8000_0000 != 0 {
+            hash = hash.wrapping_sub(0x7FFF_FFFF);
+        }
+        hash1 = hash0;
+        hash0 = hash;
     }
-    hash
+    hash0 << 1
 }
 
 // ---------------------------------------------------------------------------
 // Helpers shared by half_md4 + tea
 // ---------------------------------------------------------------------------
 
-/// Pack `len` (capped to `pad_len` bytes) into a u32 array for hashing.
-/// Each output u32 is little-endian-ish: byte 0 → low 8 bits, byte 1 → next, etc.
-/// Pads with the input length so equal-prefix names still hash differently.
-fn str_to_le32(name: &[u8], buf: &mut [u32], signed: bool) {
-    let pad_byte = name.len() as u32 & 0xFF;
-    let pad = if signed {
-        // sign-extend the pad value
-        ((pad_byte << 24) | (pad_byte << 16) | (pad_byte << 8) | pad_byte) as i32 as u32
-    } else {
-        (pad_byte << 24) | (pad_byte << 16) | (pad_byte << 8) | pad_byte
-    };
-
-    for slot in buf.iter_mut() {
-        *slot = pad;
+/// `str2hashbuf`: pack up to `buf.len() * 4` bytes of `msg` into words.
+///
+/// Each byte is shifted in from the bottom (`val = c + (val << 8)`), so the
+/// FIRST byte of a word ends up in its HIGH eight bits. Every word starts from
+/// the pad, built from the length of the name remaining from `msg` onwards,
+/// and a final partial word keeps the pad's bytes above the name's. Words
+/// after the name are the pad itself. (Only the last chunk of a name can be
+/// partial, so the remaining length and the chunk's length never give
+/// different hashes.)
+fn str2hashbuf(msg: &[u8], buf: &mut [u32], signed: bool) {
+    let len = msg.len() as u32;
+    let mut pad = len | (len << 8);
+    pad |= pad << 16;
+    let mut val = pad;
+    let take = msg.len().min(buf.len() * 4);
+    let mut slot = 0;
+    for (i, &b) in msg[..take].iter().enumerate() {
+        let c = if signed {
+            (b as i8) as i32 as u32
+        } else {
+            b as u32
+        };
+        val = c.wrapping_add(val << 8);
+        if i % 4 == 3 {
+            buf[slot] = val;
+            slot += 1;
+            val = pad;
+        }
     }
-
-    let buf_capacity_bytes = buf.len() * 4;
-    let mut byte_idx = 0;
-    for slot in buf.iter_mut() {
-        let mut word: u32 = 0;
-        for shift in (0..32).step_by(8) {
-            if byte_idx < name.len() {
-                let b = name[byte_idx];
-                let val = if signed {
-                    (b as i8) as i32 as u32
-                } else {
-                    b as u32
-                };
-                word = (word & !(0xFFu32 << shift)) | ((val & 0xFF) << shift);
-            } else {
-                word = (word & !(0xFFu32 << shift)) | ((pad_byte & 0xFF) << shift);
-            }
-            byte_idx += 1;
-        }
-        *slot = word;
-        if byte_idx >= name.len() && byte_idx >= buf_capacity_bytes {
-            break;
-        }
+    if slot < buf.len() {
+        buf[slot] = val;
+        slot += 1;
+    }
+    for word in &mut buf[slot..] {
+        *word = pad;
     }
 }
 
@@ -183,20 +207,10 @@ fn tea_transform(hash: &mut [u32; 4], data: &[u32; 4]) {
 
 fn tea_hash(name: &[u8], signed: bool, seed: &[u32; 4]) -> (u32, u32) {
     let mut hash = init_state(seed);
-    let mut remaining = name;
     let mut block = [0u32; 4];
-    while !remaining.is_empty() {
-        let take = remaining.len().min(16);
-        str_to_le32(&remaining[..take], &mut block, signed);
-        tea_transform(&mut hash, &block);
-        if take >= remaining.len() {
-            break;
-        }
-        remaining = &remaining[take..];
-    }
-    if name.is_empty() {
-        // Even an empty name needs one round so the initial seed is consumed.
-        str_to_le32(&[], &mut block, signed);
+    // The kernel's `while (len > 0)`: an empty name runs no rounds.
+    for start in (0..name.len()).step_by(16) {
+        str2hashbuf(&name[start..], &mut block, signed);
         tea_transform(&mut hash, &block);
     }
     (hash[0], hash[1])
@@ -217,7 +231,7 @@ fn f(x: u32, y: u32, z: u32) -> u32 {
 }
 #[inline]
 fn g(x: u32, y: u32, z: u32) -> u32 {
-    (x & y) + ((x ^ y) & z)
+    (x & y).wrapping_add((x ^ y) & z)
 }
 #[inline]
 fn h(x: u32, y: u32, z: u32) -> u32 {
@@ -287,24 +301,12 @@ fn half_md4_transform(hash: &mut [u32; 4], data: [u32; 8]) -> u32 {
 
 fn half_md4(name: &[u8], signed: bool, seed: &[u32; 4]) -> (u32, u32) {
     let mut hash = init_state(seed);
-    let mut remaining = name;
     let mut block = [0u32; 8];
-    let mut major = 0u32;
-    while !remaining.is_empty() {
-        let take = remaining.len().min(32);
-        str_to_le32(&remaining[..take], &mut block, signed);
-        major = half_md4_transform(&mut hash, block);
-        if take >= remaining.len() {
-            break;
-        }
-        remaining = &remaining[take..];
+    for start in (0..name.len()).step_by(32) {
+        str2hashbuf(&name[start..], &mut block, signed);
+        half_md4_transform(&mut hash, block);
     }
-    if name.is_empty() {
-        str_to_le32(&[], &mut block, signed);
-        major = half_md4_transform(&mut hash, block);
-    }
-    let minor = hash[2];
-    (major, minor)
+    (hash[1], hash[2])
 }
 
 // ---------------------------------------------------------------------------
@@ -476,9 +478,10 @@ mod tests {
 
     #[test]
     fn legacy_hash_empty_returns_initial() {
-        // No iterations: hash stays at 0x12A3FE2D.
-        assert_eq!(legacy_hash(b"", true), 0x12A3FE2D);
-        assert_eq!(legacy_hash(b"", false), 0x12A3FE2D);
+        // No iterations: the initial accumulator, shifted left one as the
+        // kernel's `dx_hack_hash` returns it.
+        assert_eq!(legacy_hash(b"", true), 0x12A3_FE2D << 1);
+        assert_eq!(legacy_hash(b"", false), 0x12A3_FE2D << 1);
     }
 
     #[test]
@@ -498,31 +501,69 @@ mod tests {
         assert_ne!(legacy_hash(name, true), legacy_hash(name, false));
     }
 
-    // --- str_to_le32 ---
+    // --- str2hashbuf ---
 
     #[test]
-    fn str_to_le32_packs_bytes_lsb_first() {
+    fn str2hashbuf_packs_the_first_byte_highest() {
         let mut buf = [0u32; 1];
-        str_to_le32(b"abcd", &mut buf, false);
-        // 'a'=0x61, 'b'=0x62, 'c'=0x63, 'd'=0x64 → little-endian u32 = 0x64636261
-        assert_eq!(buf[0], 0x6463_6261);
+        str2hashbuf(b"abcd", &mut buf, false);
+        // `val = c + (val << 8)`: 'a' is shifted up past 'b', 'c' and 'd'.
+        assert_eq!(buf[0], 0x6162_6364);
     }
 
     #[test]
-    fn str_to_le32_pads_short_input_with_len() {
-        let mut buf = [0u32; 1];
-        // "ab" → 2 bytes; pad_byte = 2; pad fills remaining byte slots.
-        str_to_le32(b"ab", &mut buf, false);
-        // bytes: [0x61, 0x62, 0x02, 0x02] → 0x02026261
-        assert_eq!(buf[0], 0x0202_6261);
+    fn str2hashbuf_keeps_the_pad_above_a_partial_word() {
+        let mut buf = [0u32; 2];
+        // "ab": the pad is the length, 2, in every byte. The partial word
+        // starts from it, so the pad's low two bytes survive above "ab".
+        str2hashbuf(b"ab", &mut buf, false);
+        assert_eq!(buf, [0x0202_6162, 0x0202_0202]);
     }
 
     #[test]
-    fn str_to_le32_empty_fills_with_zero_pad() {
+    fn str2hashbuf_a_partial_word_carries_the_names_length() {
+        let mut buf = [0u32; 2];
+        str2hashbuf(b"abcdef", &mut buf, false);
+        assert_eq!(buf, [0x6162_6364, 0x0606_6566]);
+    }
+
+    #[test]
+    fn the_end_of_directory_value_is_never_a_hash() {
+        assert_eq!(clear_eof(0xFFFF_FFFF), 0xFFFF_FFFC);
+        assert_eq!(clear_eof(0xFFFF_FFFE), 0xFFFF_FFFC);
+        assert_eq!(clear_eof(0xFFFF_FFFD), 0xFFFF_FFFC);
+        assert_eq!(clear_eof(0x1234_5679), 0x1234_5678);
+    }
+
+    #[test]
+    fn str2hashbuf_empty_is_all_pad() {
         let mut buf = [0u32; 1];
-        // Empty name: pad_byte = 0 (len=0). All bytes = 0.
-        str_to_le32(b"", &mut buf, false);
+        str2hashbuf(b"", &mut buf, false);
         assert_eq!(buf[0], 0x0000_0000);
+    }
+
+    #[test]
+    fn a_signed_code_becomes_unsigned_only_under_the_superblock_flag() {
+        assert_eq!(
+            effective_version(HashVersion::HalfMd4, false),
+            HashVersion::HalfMd4
+        );
+        assert_eq!(
+            effective_version(HashVersion::HalfMd4, true),
+            HashVersion::HalfMd4Unsigned
+        );
+        assert_eq!(
+            effective_version(HashVersion::Legacy, true),
+            HashVersion::LegacyUnsigned
+        );
+        assert_eq!(
+            effective_version(HashVersion::Tea, true),
+            HashVersion::TeaUnsigned
+        );
+        assert_eq!(
+            effective_version(HashVersion::TeaUnsigned, false),
+            HashVersion::TeaUnsigned
+        );
     }
 
     // --- tea_transform ---

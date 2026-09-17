@@ -228,17 +228,39 @@ pub fn target_hash(name: &[u8], root_block: &[u8], hash_seed: &[u32; 4]) -> Resu
 /// `read_dx_block` is a closure the caller provides to read a logical block
 /// of the directory file (since this module has no view of the inode/extent
 /// tree). Signature: `fn(logical_block: u32) -> Result<Vec<u8>>`.
+///
+/// Hashes with the root's version exactly as recorded, which is the signed
+/// variant. A filesystem whose superblock says unsigned needs
+/// [`lookup_leaf_with`], or the descent picks leaves by the wrong hash for
+/// any name with a byte at or above 0x80.
 pub fn lookup_leaf<R>(
     name: &[u8],
     root_block: &[u8],
     hash_seed: &[u32; 4],
+    read_dx_block: R,
+) -> Result<Option<u32>>
+where
+    R: FnMut(u32) -> Result<Vec<u8>>,
+{
+    lookup_leaf_with(name, root_block, hash_seed, false, read_dx_block)
+}
+
+/// [`lookup_leaf`], with the superblock's `EXT2_FLAGS_UNSIGNED_HASH` applied
+/// to the root's hash version the way the kernel applies it
+/// ([`crate::hash::effective_version`]).
+pub fn lookup_leaf_with<R>(
+    name: &[u8],
+    root_block: &[u8],
+    hash_seed: &[u32; 4],
+    unsigned_hash: bool,
     mut read_dx_block: R,
 ) -> Result<Option<u32>>
 where
     R: FnMut(u32) -> Result<Vec<u8>>,
 {
     let info = parse_root_info(root_block)?;
-    let hash = name_hash(name, info.hash_version, hash_seed);
+    let version = crate::hash::effective_version(info.hash_version, unsigned_hash);
+    let hash = name_hash(name, version, hash_seed);
 
     // Root: parse + pick the entry whose range covers this hash.
     let (_cl, entries) = parse_root_entries(root_block)?;
