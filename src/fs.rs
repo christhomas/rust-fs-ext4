@@ -292,6 +292,11 @@ pub(crate) enum BgdUninitFlag {
     Block,
 }
 
+/// Clean blocks the buffer cache of a [`Filesystem::mount`] keeps: about
+/// 1 MiB at 4 KiB blocks. `docs/read-path-cost.md` records what it buys on a
+/// measured tree (#68).
+pub const DEFAULT_CACHE_BLOCKS: usize = 256;
+
 impl Filesystem {
     /// Mount the ext4 filesystem on `dev`. Read-only unless the device reports
     /// `is_writable()`, in which case a dirty journal is replayed before
@@ -300,7 +305,16 @@ impl Filesystem {
     /// When `RO_COMPAT_METADATA_CSUM` is set, the superblock checksum is
     /// verified — failure aborts the mount with `Error::BadChecksum`.
     pub fn mount(dev: Arc<dyn BlockDevice>) -> Result<Self> {
-        Self::mount_inner(dev, false)
+        Self::mount_inner(dev, false, DEFAULT_CACHE_BLOCKS)
+    }
+
+    /// [`Filesystem::mount`] with a buffer cache of `blocks` clean blocks
+    /// rather than [`DEFAULT_CACHE_BLOCKS`]. Zero keeps none, so every read
+    /// reaches the device: the baseline `tests/read_path_cost.rs` measures the
+    /// cache against (#68). Journaled blocks awaiting checkpoint are held
+    /// whatever the capacity.
+    pub fn mount_with_cache(dev: Arc<dyn BlockDevice>, blocks: usize) -> Result<Self> {
+        Self::mount_inner(dev, false, blocks)
     }
 
     /// Like `mount`, but skips the mount-time journal replay even when the
@@ -316,10 +330,14 @@ impl Filesystem {
     /// dirty). This is the lazy/deferred-replay sibling of `mount`; for
     /// most callers `mount` is correct.
     pub fn mount_lazy(dev: Arc<dyn BlockDevice>) -> Result<Self> {
-        Self::mount_inner(dev, true)
+        Self::mount_inner(dev, true, DEFAULT_CACHE_BLOCKS)
     }
 
-    fn mount_inner(dev: Arc<dyn BlockDevice>, defer_replay: bool) -> Result<Self> {
+    fn mount_inner(
+        dev: Arc<dyn BlockDevice>,
+        defer_replay: bool,
+        cache_blocks: usize,
+    ) -> Result<Self> {
         let sb = Superblock::read(dev.as_ref())?;
         features::check_mountable(sb.feature_incompat, sb.feature_ro_compat)?;
         let flavor = features::FsFlavor::detect(sb.feature_compat, sb.feature_incompat);
@@ -334,14 +352,13 @@ impl Filesystem {
         // entries with journaled-but-not-yet-checkpointed bytes so
         // allocator scans don't re-read stale on-disk bitmaps. This is
         // the role Linux's buffer cache plays for journaled
-        // filesystems. Capacity 256 ≈ 1 MiB at 4 KiB blocks — enough
-        // to cover hot metadata (BGD, bitmaps, recently-touched inode
-        // blocks) for typical sessions; pinned entries are unbounded
-        // until journal replay calls `unpin_all`.
+        // filesystems. The clean capacity is `DEFAULT_CACHE_BLOCKS` unless the
+        // caller chose; pinned entries are unbounded until journal replay
+        // calls `unpin_all`.
         let dev: Arc<dyn BlockDevice> = Arc::new(crate::block_cache::CachedDevice::new(
             dev,
             sb.block_size(),
-            256,
+            cache_blocks,
         ));
         let mut fs = Self {
             dev,

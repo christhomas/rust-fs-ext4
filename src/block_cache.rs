@@ -103,6 +103,12 @@ impl CacheState {
             e.insert(bytes);
             return;
         }
+        // Capacity zero keeps no clean blocks: every read reaches the
+        // device, which is the uncached baseline `read_path_cost` measures
+        // (#68). Pinned blocks are unaffected.
+        if self.capacity == 0 {
+            return;
+        }
         if self.entries.len() >= self.capacity {
             if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, (_, seq))| *seq) {
                 self.entries.remove(&victim);
@@ -126,6 +132,9 @@ impl CacheState {
         // capacity-bound eviction kicks in if the LRU was already full.
         let drained: Vec<(u64, Vec<u8>)> = self.pinned.drain().collect();
         for (block, bytes) in drained {
+            if self.capacity == 0 {
+                continue;
+            }
             if self.entries.len() >= self.capacity {
                 if let Some((&victim, _)) = self.entries.iter().min_by_key(|(_, (_, seq))| *seq) {
                     self.entries.remove(&victim);
@@ -153,7 +162,7 @@ impl CachedDevice {
         Self {
             inner,
             block_size,
-            state: Mutex::new(CacheState::new(capacity.max(1))),
+            state: Mutex::new(CacheState::new(capacity)),
         }
     }
 

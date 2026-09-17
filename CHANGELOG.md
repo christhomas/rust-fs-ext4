@@ -20,6 +20,11 @@
   encrypted directory, now fail with an error naming encryption
   (`file_io::refuse_encrypted`); everything else reads as usual. Writable
   mounts stay refused, since no write path checks the flag.
+- `Filesystem::mount_with_cache(dev, blocks)` mounts with a chosen buffer
+  cache capacity, and `DEFAULT_CACHE_BLOCKS` (256) is what `mount` uses;
+  zero keeps no clean blocks. `tests/read_path_cost.rs` measures mount,
+  walk, stat and read in device calls at no cache, the default and four
+  times it, and `docs/read-path-cost.md` records the figures.
 
 ### Fixed
 
