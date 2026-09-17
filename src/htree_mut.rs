@@ -16,6 +16,10 @@
 //!   return `NEEDS_PARENT_SPLIT` so the caller can split the parent too
 //!   (or, for depth-1 root → depth-2 promotion, fail clearly).
 //!
+//! `Filesystem::split_htree_leaf_and_add_entry` composes the two for a
+//! create into a full leaf (#195); where the parent is full it drops the
+//! index instead.
+//!
 //! Deferred to future iterations:
 //! - Intermediate-node split (parent full while root still has room).
 //! - Depth-0 → depth-1 promotion (inline root out of room; no intermediate
@@ -176,8 +180,17 @@ pub fn plan_leaf_split(
     // Sort stably by major hash.
     entries.sort_by_key(|(h, _)| h.major);
 
-    // Split at midpoint; promote the right-half's lowest hash as the bound.
-    let mid = entries.len() / 2;
+    // Split nearest the midpoint, but never between two names with the same
+    // hash: a lookup for that hash descends to the right leaf only, and the
+    // kernel marks such a split with the continuation bit so readers also
+    // try the left. Cutting at a hash change needs no bit (#195).
+    let half = entries.len() / 2;
+    let mid = (0..entries.len())
+        .flat_map(|d| [half + d, half.wrapping_sub(d)])
+        .find(|&m| m > 0 && m < entries.len() && entries[m - 1].0.major != entries[m].0.major)
+        .ok_or(Error::Corrupt(
+            "htree leaf split: every name in the leaf has the same hash",
+        ))?;
     let split_out_hash = entries[mid].0.major;
     let (left, right) = entries.split_at(mid);
     let left_bytes = write_packed_leaf(
@@ -229,46 +242,49 @@ fn plan_insert_dx_entry_generic(
     new_hash: u32,
     new_block: u32,
 ) -> Result<Vec<u8>> {
-    if cl_offset + 4 > block.len() {
+    if cl_offset + DxEntry::SIZE > block.len() {
         return Err(Error::Corrupt("dx cl_offset out of range"));
     }
     let cl = DxCountLimit::parse(&block[cl_offset..cl_offset + 4])?;
     if cl.count >= cl.limit {
         return Err(Error::CorruptExtentTree("NEEDS_PARENT_SPLIT: dx node full"));
     }
+    if cl.count == 0 {
+        return Err(Error::Corrupt("dx node has zero entries"));
+    }
 
-    let entries_start = cl_offset + 4;
-    let existing = {
-        let mut out = Vec::with_capacity(cl.count as usize);
-        for i in 0..cl.count as usize {
-            let off = entries_start + i * DxEntry::SIZE;
-            if off + DxEntry::SIZE > block.len() {
-                return Err(Error::Corrupt("dx entries overrun block"));
-            }
-            out.push(DxEntry::parse(&block[off..off + DxEntry::SIZE])?);
+    // THE ARRAY STARTS AT THE COUNT/LIMIT PAIR. Entry 0's hash slot holds
+    // (limit, count) and its block follows, as `htree::parse_root_entries`
+    // reads it and the kernel writes it. This planned the array from four
+    // bytes later, one hash/block pair out of step, which only its own
+    // synthetic tests agreed with (#195).
+    let entry = |i: usize| -> Result<DxEntry> {
+        let off = cl_offset + i * DxEntry::SIZE;
+        if off + DxEntry::SIZE > block.len() {
+            return Err(Error::Corrupt("dx entries overrun block"));
         }
-        out
+        DxEntry::parse(&block[off..off + DxEntry::SIZE])
     };
+    let mut entries = (0..cl.count as usize)
+        .map(entry)
+        .collect::<Result<Vec<_>>>()?;
+    entries[0].hash = 0;
 
     // Reject duplicate hash (kernel allows it by convention but here we want
     // strict uniqueness for tests — real callers get unique hashes from a
     // fresh leaf split).
-    for e in &existing {
-        if e.hash == new_hash {
-            return Err(Error::CorruptExtentTree("duplicate dx hash insert"));
-        }
+    if entries[1..].iter().any(|e| e.hash == new_hash) {
+        return Err(Error::CorruptExtentTree("duplicate dx hash insert"));
     }
 
-    // Insert at sorted position. The first entry's hash is a lower-bound
-    // sentinel (always 0) and is preserved at index 0.
-    let pos = existing
+    // Insert at sorted position after the slot-0 sentinel.
+    let pos = entries
         .iter()
         .skip(1)
         .position(|e| e.hash > new_hash)
         .map(|p| p + 1)
-        .unwrap_or(existing.len());
-    let mut merged = existing.clone();
-    merged.insert(
+        .unwrap_or(entries.len());
+    entries.insert(
         pos,
         DxEntry {
             hash: new_hash,
@@ -276,19 +292,18 @@ fn plan_insert_dx_entry_generic(
         },
     );
 
-    // Emit updated block: preserve everything before cl_offset, bump count,
-    // serialize the new entry array.
     let mut out = block.to_vec();
-    let new_count = cl.count + 1;
-    out[cl_offset + 2..cl_offset + 4].copy_from_slice(&new_count.to_le_bytes());
-    for (i, e) in merged.iter().enumerate() {
-        let off = entries_start + i * DxEntry::SIZE;
-        if off + DxEntry::SIZE > out.len() {
-            return Err(Error::Corrupt("dx serialized entries exceed block"));
+    if cl_offset + entries.len() * DxEntry::SIZE > out.len() {
+        return Err(Error::Corrupt("dx serialized entries exceed block"));
+    }
+    for (i, e) in entries.iter().enumerate() {
+        let off = cl_offset + i * DxEntry::SIZE;
+        if i > 0 {
+            out[off..off + 4].copy_from_slice(&e.hash.to_le_bytes());
         }
-        out[off..off + 4].copy_from_slice(&e.hash.to_le_bytes());
         out[off + 4..off + 8].copy_from_slice(&e.block.to_le_bytes());
     }
+    out[cl_offset + 2..cl_offset + 4].copy_from_slice(&(cl.count + 1).to_le_bytes());
     Ok(out)
 }
 
@@ -370,6 +385,47 @@ mod tests {
     }
 
     /// Build a synthetic dx root with `count` entries.
+    /// A leaf holding `names`, in order.
+    fn leaf_of(names: &[&[u8]]) -> Vec<u8> {
+        let mut buf = vec![0u8; 4096];
+        buf[4..6].copy_from_slice(&4096u16.to_le_bytes());
+        for (i, name) in names.iter().enumerate() {
+            add_entry_to_block(
+                &mut buf,
+                100 + i as u32,
+                name,
+                DirEntryType::RegFile,
+                true,
+                0,
+            )
+            .unwrap();
+        }
+        buf
+    }
+
+    /// The cut never falls between two names with one hash: a lookup for
+    /// that hash reads the right leaf only (#195).
+    #[test]
+    fn leaf_split_does_not_divide_a_hash() {
+        let seed = [0u32; 4];
+        // Four copies of one name (one hash) and one other: the midpoint is
+        // inside the run, so the cut moves to its edge.
+        let leaf = leaf_of(&[b"same", b"same", b"same", b"same", b"other"]);
+        let split = plan_leaf_split(&leaf, HashVersion::HalfMd4, &seed, true, 4096, 0).unwrap();
+        let same = name_hash(b"same", HashVersion::HalfMd4, &seed).major;
+        let left = crate::dir::parse_block(&split.left_bytes, true).unwrap();
+        let right = crate::dir::parse_block(&split.right_bytes, true).unwrap();
+        let sides =
+            |entries: &[crate::dir::DirEntry]| entries.iter().filter(|e| e.name == b"same").count();
+        assert!(
+            sides(&left) == 0 || sides(&right) == 0,
+            "the four names with hash {same:#x} were divided between the leaves"
+        );
+
+        let leaf = leaf_of(&[b"same", b"same", b"same"]);
+        assert!(plan_leaf_split(&leaf, HashVersion::HalfMd4, &seed, true, 4096, 0).is_err());
+    }
+
     fn make_dx_root(count: u16, limit: u16) -> Vec<u8> {
         let mut buf = vec![0u8; 4096];
         // Fake "." at 0..12
@@ -388,15 +444,13 @@ mod tests {
         // dx_root_info at 24..32: reserved(4)=0, hash_version=1, info_length=8, levels=0, flags=0
         buf[28] = HashVersion::HalfMd4 as u8;
         buf[29] = 8;
-        // dx_count_limit at 32..36
+        // dx_entry[0] at 32..40: (limit, count) in its hash slot, block = 1.
         buf[32..34].copy_from_slice(&limit.to_le_bytes());
         buf[34..36].copy_from_slice(&count.to_le_bytes());
-        // dx_entry[0] at 36..44: hash=0 (sentinel), block=1
-        buf[36..40].copy_from_slice(&0u32.to_le_bytes());
-        buf[40..44].copy_from_slice(&1u32.to_le_bytes());
-        // dx_entry[1..count]: fill with synthetic hashes
+        buf[36..40].copy_from_slice(&1u32.to_le_bytes());
+        // dx_entry[1..count] at 32 + 8i: synthetic hashes.
         for i in 1..count as usize {
-            let off = 36 + i * DxEntry::SIZE;
+            let off = 32 + i * DxEntry::SIZE;
             let hash: u32 = (i as u32) * 1000;
             buf[off..off + 4].copy_from_slice(&hash.to_le_bytes());
             buf[off + 4..off + 8].copy_from_slice(&((i as u32) + 1).to_le_bytes());
@@ -404,28 +458,34 @@ mod tests {
         buf
     }
 
+    /// Read back through the crate's reader, which lays the array out as
+    /// the kernel does.
+    fn entries(root: &[u8]) -> Vec<(u32, u32)> {
+        let (_, entries) = crate::htree::parse_root_entries(root).unwrap();
+        entries.iter().map(|e| (e.hash, e.block)).collect()
+    }
+
     #[test]
     fn dx_entry_insert_root_preserves_sort() {
         // count=3 entries: hash=0, 1000, 2000 → insert 1500 → should land at slot 2.
         let root = make_dx_root(3, 500);
         let updated = plan_insert_dx_entry_root(&root, 32, 1500, 42).unwrap();
-        let count = u16::from_le_bytes(updated[34..36].try_into().unwrap());
-        assert_eq!(count, 4);
-        let hash_at_2 = u32::from_le_bytes(updated[36 + 2 * 8..40 + 2 * 8].try_into().unwrap());
-        let block_at_2 = u32::from_le_bytes(updated[40 + 2 * 8..44 + 2 * 8].try_into().unwrap());
-        assert_eq!(hash_at_2, 1500);
-        assert_eq!(block_at_2, 42);
+        assert_eq!(
+            entries(&updated),
+            [(0, 1), (1000, 2), (1500, 42), (2000, 3)]
+        );
+        let limit = u16::from_le_bytes(updated[32..34].try_into().unwrap());
+        assert_eq!(limit, 500, "the limit in entry 0's hash slot is kept");
     }
 
     #[test]
     fn dx_entry_insert_at_end() {
         let root = make_dx_root(3, 500);
         let updated = plan_insert_dx_entry_root(&root, 32, 9999, 77).unwrap();
-        let count = u16::from_le_bytes(updated[34..36].try_into().unwrap());
-        assert_eq!(count, 4);
-        // New last entry at index 3 (0-based).
-        let hash_at_3 = u32::from_le_bytes(updated[36 + 3 * 8..40 + 3 * 8].try_into().unwrap());
-        assert_eq!(hash_at_3, 9999);
+        assert_eq!(
+            entries(&updated),
+            [(0, 1), (1000, 2), (2000, 3), (9999, 77)]
+        );
     }
 
     #[test]
