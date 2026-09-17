@@ -123,6 +123,10 @@ fn a_read_only_mount_reads_what_the_journal_committed() {
             fs.journal.is_some(),
             "the mkdir must go through the journal"
         );
+        // The first write of a mount marks the volume not clean, with a
+        // flush of its own (#85). Made here, before the cut is armed, so the
+        // flushes the cut counts are the mkdir's commit and nothing else.
+        fs.apply_mkdir("/warmup", 0o755).expect("warm-up mkdir");
         dev.armed.store(true, Ordering::SeqCst);
         fs.apply_mkdir("/committed", 0o755).expect("mkdir");
     }
