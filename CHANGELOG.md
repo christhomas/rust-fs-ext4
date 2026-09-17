@@ -66,6 +66,9 @@
 - The dx entry planner (`htree_mut::plan_insert_dx_entry_*`) lays the entry
   array out where the kernel does, starting at the count/limit pair. It was
   one hash/block pair out of step.
+- Writing an xattr block sets `COMPAT_EXT_ATTR` when the volume lacks it, as
+  the kernel does. This crate's `mkfs` does not set the feature, and
+  `e2fsck` clears every xattr block on a volume without it.
 
 ## [0.5.1] — 2026-09-06
 

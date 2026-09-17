@@ -84,38 +84,16 @@ fn check_and_done(path: &str, tag: &str, block_size: u32, expect_journal: bool) 
             report.anomalies
         );
     }
-    e2fsck_clean(path, tag);
+    fs_ext4_test_support::assert_e2fsck_clean(path, tag);
     if expect_journal {
         write_through_the_journal(path, tag);
-        e2fsck_clean(path, &format!("{tag} after writes"));
+        fs_ext4_test_support::assert_e2fsck_clean(path, &format!("{tag} after writes"));
     }
     if std::env::var_os("RFE_KEEP_IMAGES").is_some() {
         eprintln!("[{tag}] image: {path}");
     } else {
         let _ = fs::remove_file(path);
     }
-}
-
-/// `e2fsck -fn` must find nothing to say. Skips where it is not installed.
-fn e2fsck_clean(path: &str, tag: &str) {
-    let Some(e2fsck) = ["/usr/sbin/e2fsck", "/sbin/e2fsck", "/usr/bin/e2fsck"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())
-    else {
-        eprintln!("[{tag}] skip e2fsck: e2fsprogs not installed");
-        return;
-    };
-    let out = std::process::Command::new(e2fsck)
-        .args(["-fn", path])
-        .output()
-        .expect("run e2fsck");
-    assert_eq!(
-        out.status.code(),
-        Some(0),
-        "[{tag}] e2fsck -fn: {}{}",
-        String::from_utf8_lossy(&out.stdout),
-        String::from_utf8_lossy(&out.stderr)
-    );
 }
 
 /// A directory, a file with content and a rename, each committed through the
