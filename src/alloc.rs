@@ -473,11 +473,12 @@ fn blocks_in_group(sb: &Superblock, gi: u32) -> u32 {
     if gi + 1 < ngroups {
         return sb.blocks_per_group;
     }
-    // Saturating: `s_first_data_block` is not among the fields
-    // `Superblock::parse` bounds, and a value above `blocks_count`
-    // wrapped this subtraction -- which made the last group's bit
-    // ceiling far larger than the group, so the allocator handed out
-    // blocks outside the filesystem.
+    // Saturating, though `Superblock::parse` now refuses a
+    // `s_first_data_block` at or past `blocks_count` (#181). Before that
+    // bound a larger value wrapped this subtraction, which made the last
+    // group's bit ceiling far larger than the group, so the allocator
+    // handed out blocks outside the filesystem. A `Superblock` built some
+    // other way than `parse` still gets the safe answer.
     let remainder =
         sb.blocks_count.saturating_sub(sb.first_data_block as u64) % sb.blocks_per_group as u64;
     if remainder == 0 {
