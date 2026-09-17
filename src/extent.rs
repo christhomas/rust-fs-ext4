@@ -326,8 +326,44 @@ pub fn collect_all(root: &[u8], dev: &dyn BlockDevice, block_size: u32) -> Resul
         ));
     }
     let mut out = Vec::new();
-    walk(root, &header, dev, block_size, &mut out, header.depth)?;
+    walk(
+        root,
+        &header,
+        dev,
+        block_size,
+        &mut out,
+        &mut Vec::new(),
+        header.depth,
+    )?;
     Ok(out)
+}
+
+/// Every leaf extent, and every block holding a node of the tree below the
+/// inode's inline root: the index and leaf blocks a file owns besides its
+/// data. Freeing a file has to free both.
+pub fn collect_all_with_nodes(
+    root: &[u8],
+    dev: &dyn BlockDevice,
+    block_size: u32,
+) -> Result<(Vec<Extent>, Vec<u64>)> {
+    let header = ExtentHeader::parse(root)?;
+    if header.depth > EXT4_EXT_MAX_DEPTH {
+        return Err(Error::CorruptExtentTree(
+            "extent tree depth exceeds spec maximum",
+        ));
+    }
+    let mut out = Vec::new();
+    let mut nodes = Vec::new();
+    walk(
+        root,
+        &header,
+        dev,
+        block_size,
+        &mut out,
+        &mut nodes,
+        header.depth,
+    )?;
+    Ok((out, nodes))
 }
 
 fn walk(
@@ -336,6 +372,7 @@ fn walk(
     dev: &dyn BlockDevice,
     block_size: u32,
     out: &mut Vec<Extent>,
+    nodes: &mut Vec<u64>,
     descents_remaining: u16,
 ) -> Result<()> {
     if header.is_leaf() {
@@ -369,6 +406,7 @@ fn walk(
                     "extent walk: child block offset overflow",
                 ))?;
         dev.read_at(child_offset, &mut buf)?;
+        nodes.push(idx.leaf_block);
         let child_header = ExtentHeader::parse(&buf)?;
         walk(
             &buf,
@@ -376,6 +414,7 @@ fn walk(
             dev,
             block_size,
             out,
+            nodes,
             descents_remaining - 1,
         )?;
     }
