@@ -90,7 +90,7 @@ fn cross_validate_each_test_image(dir: &std::path::Path) {
 /// lane that sets `LWEXT4_DIR` cannot go green on an empty body.
 #[test]
 fn enabling_the_harness_fails_until_it_compares_something() {
-    let fake = std::env::temp_dir().join(format!("lwext4-fake-{}", std::process::id()));
+    let fake = fs_ext4_test_support::temp_dir().join(format!("lwext4-fake-{}", std::process::id()));
     std::fs::create_dir_all(fake.join("build_generic/src")).unwrap();
     std::fs::write(fake.join("build_generic/src/liblwext4.a"), b"").unwrap();
     let outcome = std::panic::catch_unwind(|| cross_validate_each_test_image(&fake));

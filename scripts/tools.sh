@@ -7,9 +7,10 @@
 #
 # The oracle tests (`chore test:oracle`) run on the HOST: e2fsprogs'
 # mke2fs builds images, debugfs reads content and metadata back, e2fsck
-# checks consistency, dumpe2fs and tune2fs read the superblock. Tests
-# never skip when one is missing — they fail and name this task — so
-# this is the one place that knows how to get them.
+# checks consistency, dumpe2fs and tune2fs read the superblock. The script
+# tests (`chore test:scripts`) search the tree with ripgrep. Tests never
+# skip when one is missing — they fail and name this task — so this is the
+# one place that knows how to get them.
 #
 #   Linux   apt-get (with sudo when not root). e2fsprogs is also what
 #           the harness VM installs for the fixture builder, so host and
@@ -29,7 +30,10 @@ MODE=install
 # does not write); older releases refuse the option outright. It is also
 # what Debian 12 and Ubuntu 24.04 ship.
 MIN_E2FSPROGS=1.47.0
-TOOLS="mke2fs mkfs.ext4 e2fsck fsck.ext4 debugfs dumpe2fs tune2fs"
+# tool:debian-package:homebrew-formula
+TOOLS="mke2fs:e2fsprogs:e2fsprogs mkfs.ext4:e2fsprogs:e2fsprogs e2fsck:e2fsprogs:e2fsprogs
+fsck.ext4:e2fsprogs:e2fsprogs debugfs:e2fsprogs:e2fsprogs dumpe2fs:e2fsprogs:e2fsprogs
+tune2fs:e2fsprogs:e2fsprogs rg:ripgrep:ripgrep"
 
 # Find a tool the way tests/common/mod.rs (oracle_tool) does.
 find_tool() {
@@ -41,12 +45,27 @@ find_tool() {
     return 1
 }
 
+# The entries whose tool is missing.
 missing() {
-    local t out=""
-    for t in $TOOLS; do
-        find_tool "$t" >/dev/null || out="$out $t"
+    local entry out=""
+    for entry in $TOOLS; do
+        find_tool "${entry%%:*}" >/dev/null || out="$out $entry"
     done
     echo "${out# }"
+}
+
+# The distinct package names (field 2 or 3) of some entries.
+packages() {
+    local field="$1" entry
+    shift
+    for entry in "$@"; do
+        echo "$entry" | cut -d: -f"$field"
+    done | sort -u | tr '\n' ' '
+}
+
+names() {
+    local entry
+    for entry in "$@"; do printf '%s ' "${entry%%:*}"; done
 }
 
 version_ge() {
@@ -54,15 +73,18 @@ version_ge() {
 }
 
 install_linux() {
-    local sudo=""
+    local sudo="" pkgs
+    # shellcheck disable=SC2046  # one word per package
+    pkgs="$(packages 2 $(missing))"
     [ "$(id -u)" -eq 0 ] || sudo="sudo"
     if ! command -v apt-get >/dev/null 2>&1; then
-        echo "tools: no apt-get on this Linux host; install e2fsprogs >= $MIN_E2FSPROGS with its package manager." >&2
+        echo "tools: no apt-get on this Linux host; install with its package manager: $pkgs(e2fsprogs >= $MIN_E2FSPROGS)" >&2
         exit 1
     fi
-    echo "tools: installing e2fsprogs with apt-get"
-    $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq e2fsprogs >/dev/null ||
-        { $sudo apt-get update -qq && $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq e2fsprogs >/dev/null; }
+    echo "tools: installing with apt-get: $pkgs"
+    # shellcheck disable=SC2086  # the package list splits into words
+    $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >/dev/null ||
+        { $sudo apt-get update -qq && $sudo env DEBIAN_FRONTEND=noninteractive apt-get install -y -qq $pkgs >/dev/null; }
 }
 
 gap="$(missing)"
@@ -70,8 +92,10 @@ if [ -n "$gap" ] && [ "$MODE" = install ]; then
     case "$(uname -s)" in
         Linux) install_linux ;;
         Darwin)
-            echo "tools: missing on this Mac: $gap" >&2
-            echo "       brew install e2fsprogs" >&2
+            # shellcheck disable=SC2086
+            echo "tools: missing on this Mac: $(names $gap)" >&2
+            # shellcheck disable=SC2086
+            echo "       brew install $(packages 3 $gap)" >&2
             echo "       (keg-only: the tests find it under \$(brew --prefix e2fsprogs)/sbin)" >&2
             exit 1
             ;;
@@ -81,7 +105,8 @@ if [ -n "$gap" ] && [ "$MODE" = install ]; then
 fi
 
 if [ -n "$gap" ]; then
-    echo "tools: missing: $gap — run 'chore tools'" >&2
+    # shellcheck disable=SC2086
+    echo "tools: missing: $(names $gap)— run 'chore tools'" >&2
     exit 1
 fi
 
@@ -90,7 +115,7 @@ if [ -z "$version" ] || ! version_ge "$version" "$MIN_E2FSPROGS"; then
     echo "tools: e2fsprogs ${version:-of unknown version} is older than $MIN_E2FSPROGS" >&2
     exit 1
 fi
-for t in $TOOLS; do
-    printf '  %-9s %s\n' "$t" "$(find_tool "$t")"
+for entry in $TOOLS; do
+    printf '  %-9s %s\n' "${entry%%:*}" "$(find_tool "${entry%%:*}")"
 done
-echo "tools: e2fsprogs $version — all oracle tools present"
+echo "tools: e2fsprogs $version, $(rg --version | head -1) — all present"

@@ -16,4 +16,6 @@ export DEBIAN_FRONTEND=noninteractive
 apt-get update -qq
 apt-get install -y -qq e2fsprogs attr acl fdisk >/dev/null
 modprobe loop
-mkfs.ext4 -V 2>&1 | head -1
+# sed, not head: head exits after one line, mke2fs gets SIGPIPE writing
+# its second, and pipefail turns that into a failed setup (seen on CI).
+mkfs.ext4 -V 2>&1 | sed -n 1p

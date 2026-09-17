@@ -8455,7 +8455,7 @@ mod tests {
 
             // And e2fsck: a block left allocated with nothing mapping it is
             // exactly what its pass 5 reports.
-            let image = std::env::temp_dir().join(format!(
+            let image = fs_ext4_test_support::temp_dir().join(format!(
                 "fs_ext4_indirect_orphan_{}.img",
                 std::process::id()
             ));
