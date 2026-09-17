@@ -6403,6 +6403,108 @@ mod tests {
         );
     }
 
+    /// Journaled orphan recovery, cut after every write, leaves an image
+    /// whose next mount finishes the job (#125).
+    ///
+    /// `tests/orphan_recovery_crash_safety.rs`, the file this replaces, cut
+    /// a no-op: its fixture had no orphans, so every budget interrupted a
+    /// recovery that wrote nothing, and it skipped when the fixture was
+    /// missing. Here the chain holds a
+    /// real orphan on a volume with a journal, so the recovery is one
+    /// journaled transaction, and every cut lands inside it or its
+    /// checkpoint. Whatever the cut, the next writable mount -- replaying
+    /// the journal and retrying the chain -- must end with the orphan
+    /// reclaimed, fsck clean, and the volume still taking writes.
+    ///
+    /// The volume is this crate's ext3 flavour, the one it formats with a
+    /// journal. Without extents, recovery reclaims an orphan's inode but
+    /// declines to free indirect-mapped blocks (#124), so the orphan is
+    /// planted empty.
+    #[test]
+    fn journaled_orphan_recovery_survives_a_cut_after_every_write() {
+        const JVOL: u64 = 64 * 1024 * 1024;
+        let dev = MemDev::new(JVOL);
+        crate::mkfs::format_filesystem_with_flavor(
+            dev.as_ref(),
+            Some("jorphan"),
+            None,
+            JVOL,
+            BS,
+            crate::features::FsFlavor::Ext3,
+        )
+        .expect("format");
+        let planted = {
+            let fs = mount(&dev);
+            assert!(
+                fs.journal.is_some(),
+                "fixture: this path is the journaled one"
+            );
+            let ino = fs.apply_create("/gone.txt", 0o644).expect("create");
+            let (root, _) = fs.read_inode_verified(2).expect("root");
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            fs.buffer_remove_dir_entry(&mut buf, 2, &root, b"gone.txt")
+                .expect("remove the name");
+            fs.commit_block_buffer(buf).expect("commit");
+            plant_orphan(&fs, ino, 0, None);
+            ino
+        };
+        let snapshot = dev.bytes.lock().unwrap().clone();
+
+        let mut total = None;
+        for cut in 0.. {
+            let image = MemDev::new(JVOL);
+            *image.bytes.lock().unwrap() = snapshot.clone();
+            let crash = std::sync::Arc::new(CrashDev {
+                inner: image.clone(),
+                budget: cut,
+                writes: std::sync::atomic::AtomicUsize::new(0),
+            });
+            drop(Filesystem::mount(crash.clone()).expect("mount through the cut"));
+            let written = crash.writes.load(std::sync::atomic::Ordering::SeqCst);
+            total.get_or_insert(written);
+
+            // The retry, then a mount that observes it.
+            drop(mount(&image));
+            let fs = mount(&image);
+            assert!(
+                fs.orphan_list()
+                    .unwrap_or_else(|e| panic!("cut {cut}: orphan_list: {e:?}"))
+                    .is_empty(),
+                "cut {cut}: the next mount left the orphan on the chain"
+            );
+            assert!(
+                !fs.inode_bit_is_set(planted).expect("inode bitmap"),
+                "cut {cut}: after the retry the orphan is still allocated"
+            );
+            let report = crate::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
+            let serious: Vec<_> = report
+                .anomalies
+                .iter()
+                .filter(|a| {
+                    !matches!(
+                        a,
+                        crate::fsck::Anomaly::BlockGroupFreeCountDrift { .. }
+                            | crate::fsck::Anomaly::SuperblockFreeCountDrift { .. }
+                    )
+                })
+                .collect();
+            assert!(
+                serious.is_empty(),
+                "cut {cut}: after the retry, fsck finds {serious:?}"
+            );
+            // And the journal still takes a transaction after recovery.
+            fs.apply_create("/after.txt", 0o644)
+                .unwrap_or_else(|e| panic!("cut {cut}: a write after recovery failed: {e:?}"));
+            if cut >= written {
+                break;
+            }
+        }
+        assert!(
+            total.unwrap_or(0) > 1,
+            "the recovery commit must span several writes to cut"
+        );
+    }
+
     /// A chain whose members sit in different block groups, cut after
     /// every write, strands none of them (Greptile on #201).
     ///
