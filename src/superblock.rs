@@ -442,6 +442,80 @@ impl Superblock {
         classic_sparse_super(g)
     }
 
+    /// Group descriptors per descriptor-table block.
+    pub fn descs_per_block(&self) -> u64 {
+        u64::from(self.block_size()) / u64::from(self.desc_size.max(1))
+    }
+
+    /// `s_first_meta_bg` (0x104): the first meta group whose descriptors
+    /// live in the meta group rather than the contiguous table. Zero
+    /// without `META_BG`.
+    pub fn first_meta_bg(&self) -> u64 {
+        if self.feature_incompat & crate::features::Incompat::META_BG.bits() == 0 {
+            return 0;
+        }
+        self.raw
+            .get(0x104..0x108)
+            .map_or(0, |f| u64::from(u32::from_le_bytes(f.try_into().unwrap())))
+    }
+
+    fn in_meta_bg(&self, group: u64) -> bool {
+        self.feature_incompat & crate::features::Incompat::META_BG.bits() != 0
+            && group / self.descs_per_block() >= self.first_meta_bg()
+    }
+
+    /// Where group `group`'s descriptor lives: the block, and the byte
+    /// offset within it. The kernel's `descriptor_loc` (#73).
+    ///
+    /// Without `META_BG` -- or for a meta group before `s_first_meta_bg` --
+    /// the descriptors are one table starting the block after the
+    /// superblock. With it, meta group `m` (the `descs_per_block` groups
+    /// from `m * descs_per_block`) keeps its one descriptor block at the head
+    /// of its own first group, after that group's superblock backup if it has
+    /// one. The copies in the meta group's second and last groups are
+    /// backups.
+    pub fn descriptor_location(&self, group: u64) -> (u64, usize) {
+        let dpb = self.descs_per_block();
+        let metagroup = group / dpb;
+        let offset = ((group % dpb) * u64::from(self.desc_size)) as usize;
+        if !self.in_meta_bg(group) {
+            return (u64::from(self.first_data_block) + 1 + metagroup, offset);
+        }
+        let first = metagroup * dpb;
+        let mut has_super = u64::from(self.group_has_super(first));
+        // A 1 KiB filesystem whose groups start at block 0 has the primary
+        // superblock in block 1.
+        if self.block_size() == 1024 && metagroup == 0 && self.first_data_block == 0 {
+            has_super += 1;
+        }
+        let group_start =
+            u64::from(self.first_data_block) + first * u64::from(self.blocks_per_group);
+        (group_start + has_super, offset)
+    }
+
+    /// Blocks at the head of `group` that belong to the superblock backup,
+    /// the descriptor table and its reserved growth: the kernel's
+    /// `ext4_num_base_meta_clusters` less the bitmaps and inode table.
+    pub fn group_head_metadata_blocks(&self, group: u64) -> u64 {
+        let has_super = u64::from(self.group_has_super(group));
+        if self.in_meta_bg(group) {
+            let dpb = self.descs_per_block();
+            let first = (group / dpb) * dpb;
+            let gdt = u64::from(group == first || group == first + 1 || group == first + dpb - 1);
+            return has_super + gdt;
+        }
+        if has_super == 0 {
+            return 0;
+        }
+        let gdt = if self.feature_incompat & crate::features::Incompat::META_BG.bits() != 0 {
+            self.first_meta_bg()
+        } else {
+            (self.block_group_count() * u64::from(self.desc_size))
+                .div_ceil(u64::from(self.block_size()))
+        };
+        1 + gdt + u64::from(self.reserved_gdt_blocks)
+    }
+
     /// Whether directory names are hashed as unsigned bytes: `s_flags`
     /// (0x160) carries `EXT2_FLAGS_UNSIGNED_HASH` (0x2). See
     /// [`crate::hash::effective_version`].
