@@ -659,6 +659,12 @@ pub fn plan_insert_extent_deep(
     debug_assert!(leaf_header.is_leaf());
     let mut leaf_entries = parse_leaf_entries(&leaf_frame.bytes, &leaf_header)?;
     check_no_overlap(&leaf_entries, &new)?;
+    // THE KEY A PARENT HOLDS FOR THIS LEAF, which is the leaf's first
+    // logical block. An insert in front of everything moves it, and a parent
+    // still naming the old one describes a tree e2fsck rejects:
+    // "Logical start N does not match logical start M at next level" (#260).
+    // The kernel corrects the same keys in `ext4_ext_correct_indexes`.
+    let first_key_before = leaf_entries.first().map(|e| e.logical_block);
     insert_into_leaf_sorted(&mut leaf_entries, new);
 
     // Capacity for this leaf depends on whether it's the inline root or a
@@ -676,6 +682,9 @@ pub fn plan_insert_extent_deep(
     // Initially set by the leaf-split branch below; replaced by the in-loop
     // split branch each time a non-root index node also overflows.
     let mut propagated: Option<PropagatedSplit>;
+    // `(child block, its new first key)`, while a parent still names the old
+    // one.
+    let mut correction: Option<(u64, u32)> = None;
 
     if (leaf_entries.len() as u16) <= leaf_cap {
         // Leaf fits — emit it.
@@ -688,15 +697,21 @@ pub fn plan_insert_extent_deep(
                 allocated_blocks,
             });
         }
-        // Non-root leaf absorbed cleanly — every level above is unchanged,
-        // so the inline root bytes go back verbatim.
         let new_leaf = build_full_leaf_block(generation, &leaf_entries, bs);
         block_writes.push((leaf_frame.block, new_leaf));
-        return Ok(DeepInsertPlan {
-            new_root: root_bytes.to_vec(),
-            block_writes,
-            allocated_blocks,
-        });
+        let first_key = leaf_entries[0].logical_block;
+        if first_key_before == Some(first_key) {
+            // Every level above is unchanged, so the inline root bytes go
+            // back verbatim.
+            return Ok(DeepInsertPlan {
+                new_root: root_bytes.to_vec(),
+                block_writes,
+                allocated_blocks,
+            });
+        }
+        // The leaf's first key moved, so the keys naming it have to follow.
+        propagated = None;
+        correction = Some((leaf_frame.block, first_key));
     } else {
         // Leaf overflowed — split it 50/50.
         if is_root_leaf {
@@ -737,6 +752,10 @@ pub fn plan_insert_extent_deep(
             new_logical: right_first_logical,
             new_child: new_right_block,
         });
+        let left_first = left_entries[0].logical_block;
+        if first_key_before != Some(left_first) {
+            correction = Some((leaf_frame.block, left_first));
+        }
     }
 
     // ---- Walk up internal levels, absorbing the propagated split. ----
@@ -744,17 +763,32 @@ pub fn plan_insert_extent_deep(
     // a level absorbs without overflow (sets propagated=None) only on a
     // path that returns immediately, since every higher level is unchanged.
     while let Some(frame) = path.pop() {
-        let split = propagated
-            .take()
-            .expect("deep insert invariant: propagated must be Some at every loop iter");
-
         let header = ExtentHeader::parse(&frame.bytes)?;
         debug_assert!(!header.is_leaf());
         let mut indices: Vec<(u32, u64)> = parse_index_entries(&frame.bytes, &header)?
             .into_iter()
             .map(|i| (i.logical_block, i.leaf_block))
             .collect();
-        insert_into_index_sorted(&mut indices, split.new_logical, split.new_child);
+
+        // A child whose first key moved is named here; correct it, and pass
+        // the correction on only while it is this node's own first key,
+        // which is what the node above holds for it.
+        if let Some((child, key)) = correction.take() {
+            let at = indices
+                .iter()
+                .position(|(_, block)| *block == child)
+                .ok_or(Error::CorruptExtentTree(
+                    "the index entry naming a child this insert changed is missing",
+                ))?;
+            indices[at].0 = key;
+            if at == 0 && frame.block != 0 {
+                correction = Some((frame.block, key));
+            }
+        }
+
+        if let Some(split) = propagated.take() {
+            insert_into_index_sorted(&mut indices, split.new_logical, split.new_child);
+        }
 
         let is_root_here = path.is_empty();
         let cap = if is_root_here {
@@ -774,6 +808,11 @@ pub fn plan_insert_extent_deep(
             }
             let bytes = build_full_index_block(generation, header.depth, &indices, bs);
             block_writes.push((frame.block, bytes));
+            if correction.is_some() {
+                // This node is written, but the key naming it above moved
+                // too, so the level above still has to be rewritten.
+                continue;
+            }
             // No more propagation — every level above this is unchanged, so
             // the inline root bytes can be returned verbatim.
             return Ok(DeepInsertPlan {
