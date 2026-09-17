@@ -877,17 +877,11 @@ impl Filesystem {
                 freed += self.buffer_free_block_run_and_bgd(buf, block, 1)?;
             }
         }
-        if parsed.has_extents() && parsed.size > 0 {
-            let Ok((_sc, muts)) =
-                crate::file_mut::plan_truncate_shrink(parsed.size, 0, &parsed.block, bs)
-            else {
+        if parsed.has_extents() {
+            let Ok(runs) = self.extent_tree_runs(&parsed.block) else {
                 return Ok(None);
             };
-            for m in &muts {
-                if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                    freed += self.buffer_free_block_run_and_bgd(buf, *start, *len as u64)?;
-                }
-            }
+            freed += self.buffer_free_runs(buf, &runs)?;
         }
         // Free the inode bitmap slot + BGD free_inodes++.
         self.buffer_free_inode_slot(buf, orphan_ino)?;
@@ -1455,7 +1449,8 @@ impl Filesystem {
             ));
         }
 
-        let extents = crate::extent::collect_all(&inode.block, self.dev.as_ref(), bs_u32)?;
+        let (extents, tree_nodes) =
+            crate::extent::collect_all_with_nodes(&inode.block, self.dev.as_ref(), bs_u32)?;
         let mut new_entries: Vec<crate::extent::Extent> = Vec::new();
         let mut freed_blocks: u64 = 0;
         let mut buf = BlockBuffer::new(bs_u32);
@@ -1510,6 +1505,14 @@ impl Filesystem {
             return Err(Error::Corrupt(
                 "punch_hole: surviving entries exceed inline-root capacity (4); needs depth>=1",
             ));
+        }
+
+        // THE TREE BELOW THE ROOT GOES TOO. What survives is written back
+        // into the inode's inline root, so on a deeper tree the index and
+        // leaf blocks that held these extents are no longer referenced.
+        // They were left allocated and counted in `i_blocks`.
+        for &node in &tree_nodes {
+            freed_blocks += self.buffer_free_block_run_and_bgd(&mut buf, node, 1)?;
         }
 
         // Rebuild the inline root with the surviving entries.
@@ -1640,6 +1643,35 @@ impl Filesystem {
         let off = offset as usize;
         it_buf[off..off + inode_raw.len()].copy_from_slice(inode_raw);
         Ok(())
+    }
+
+    /// Every block an extent-mapped inode holds, as runs: its data extents,
+    /// and the index and leaf blocks below its inline root.
+    ///
+    /// Read from the tree, not from `i_size`. A file of size zero can hold
+    /// blocks (a `KEEP_SIZE` preallocation), and blocks can lie past the
+    /// size of any file. A caller that frees a whole file frees these.
+    pub(crate) fn extent_tree_runs(&self, block: &[u8]) -> Result<Vec<(u64, u64)>> {
+        let (extents, nodes) =
+            crate::extent::collect_all_with_nodes(block, self.dev.as_ref(), self.sb.block_size())?;
+        Ok(extents
+            .iter()
+            .map(|e| (e.physical_block, e.length as u64))
+            .chain(nodes.into_iter().map(|n| (n, 1)))
+            .collect())
+    }
+
+    /// Free every run `extent_tree_runs` lists, returning the block count.
+    pub(crate) fn buffer_free_runs(
+        &self,
+        buf: &mut BlockBuffer,
+        runs: &[(u64, u64)],
+    ) -> Result<u64> {
+        let mut freed = 0;
+        for &(start, len) in runs {
+            freed += self.buffer_free_block_run_and_bgd(buf, start, len)?;
+        }
+        Ok(freed)
     }
 
     /// Buffer-side equivalent of `free_block_run_and_bgd`: clears the
@@ -3116,19 +3148,9 @@ impl Filesystem {
         // transaction so a crash either keeps everything or undoes everything.
         let mut freed_sectors: u64 = 0;
         let sectors_per_block = bs as u64 / 512;
-        if target_inode.has_extents() && target_inode.size > 0 {
-            let (_sc, muts) = crate::file_mut::plan_truncate_shrink(
-                target_inode.size,
-                0,
-                &target_inode.block,
-                bs,
-            )?;
-            for m in &muts {
-                if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                    self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
-                    freed_sectors += *len as u64 * sectors_per_block;
-                }
-            }
+        if target_inode.has_extents() {
+            let runs = self.extent_tree_runs(&target_inode.block)?;
+            freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
         }
 
         // Inode bitmap + BGD free_inodes_count; SB counter for both
@@ -3672,17 +3694,8 @@ impl Filesystem {
 
         // Phase 1: free existing data blocks. Each freed run credits its
         // own group's BGD via `buffer_free_block_run_and_bgd`.
-        let mut freed_fs_blocks: u64 = 0;
-        if inode.size > 0 {
-            let (_sc, muts) =
-                crate::file_mut::plan_truncate_shrink(inode.size, 0, &inode.block, bs)?;
-            for m in &muts {
-                if let crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } = m {
-                    freed_fs_blocks +=
-                        self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
-                }
-            }
-        }
+        let runs = self.extent_tree_runs(&inode.block)?;
+        let freed_fs_blocks = self.buffer_free_runs(&mut buf, &runs)?;
 
         // Reset the inode's extent root to an empty leaf.
         let mut root = vec![0u8; 60];
@@ -5206,42 +5219,9 @@ impl Filesystem {
                 let bs = self.sb.block_size();
                 let sectors_per_block = bs as u64 / 512;
                 let mut freed_sectors: u64 = 0;
-                if dst_old_inode.has_extents() && dst_old_inode.size > 0 {
-                    if dst_is_dir {
-                        // Directory data blocks aren't tracked through
-                        // plan_truncate_shrink (that path expects regular
-                        // files); use extent::collect_all + free per run.
-                        let extents = crate::extent::collect_all(
-                            &dst_old_inode.block,
-                            self.dev.as_ref(),
-                            bs,
-                        )?;
-                        for e in &extents {
-                            self.buffer_free_block_run_and_bgd(
-                                &mut buf,
-                                e.physical_block,
-                                e.length as u64,
-                            )?;
-                            freed_sectors += e.length as u64 * sectors_per_block;
-                        }
-                    } else {
-                        let (_sc, muts) = crate::file_mut::plan_truncate_shrink(
-                            dst_old_inode.size,
-                            0,
-                            &dst_old_inode.block,
-                            bs,
-                        )?;
-                        for m in &muts {
-                            if let crate::extent_mut::ExtentMutation::FreePhysicalRun {
-                                start,
-                                len,
-                            } = m
-                            {
-                                self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
-                                freed_sectors += *len as u64 * sectors_per_block;
-                            }
-                        }
-                    }
+                if dst_old_inode.has_extents() {
+                    let runs = self.extent_tree_runs(&dst_old_inode.block)?;
+                    freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
                 }
 
                 self.buffer_free_inode_slot(&mut buf, dst_old_ino)?;
@@ -6170,12 +6150,8 @@ impl Filesystem {
 
         // Free target's data blocks. Each freed run credits its own group's
         // BGD; SB credit accumulates and lands once below.
-        let extents = crate::extent::collect_all(&target_inode.block, self.dev.as_ref(), bs)?;
-        let mut freed_blocks: u64 = 0;
-        for e in &extents {
-            freed_blocks +=
-                self.buffer_free_block_run_and_bgd(&mut buf, e.physical_block, e.length as u64)?;
-        }
+        let runs = self.extent_tree_runs(&target_inode.block)?;
+        let freed_blocks = self.buffer_free_runs(&mut buf, &runs)?;
 
         // Free the inode slot. A removed dir decrements `bg_used_dirs_count`
         // — buffer_free_inode_slot already credits free_inodes by +1, so we

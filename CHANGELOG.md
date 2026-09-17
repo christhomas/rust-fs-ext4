@@ -83,6 +83,14 @@
 - Writing an xattr block sets `COMPAT_EXT_ATTR` when the volume lacks it, as
   the kernel does. This crate's `mkfs` does not set the feature, and
   `e2fsck` clears every xattr block on a volume without it.
+- Freeing a file frees every block its extent tree holds. Unlink,
+  replace-content, rename-over and orphan release freed blocks only when
+  `i_size > 0`, so an empty file with a `KEEP_SIZE` preallocation kept its
+  blocks with nothing pointing at them. Punch-hole and rmdir freed only
+  data extents, so a tree deeper than the inline root left its index and
+  leaf blocks allocated, and counted in `i_blocks` for a punch. An unlink
+  of such a file was refused. These paths now free what
+  `extent::collect_all_with_nodes` reads from the tree (#242).
 
 ## [0.5.1] — 2026-09-06
 
