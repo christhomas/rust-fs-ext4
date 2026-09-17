@@ -199,3 +199,44 @@ fn mkfs_multi_group_reads_root() {
     assert_eq!(entries[0].name, b".", "first entry must be `.`");
     assert_eq!(entries[1].name, b"..", "second entry must be `..`");
 }
+
+/// The directory hash seed is written where the superblock keeps it, and
+/// the two fields in front of it are left zero (#225).
+///
+/// It was written eight bytes early, over `s_journal_dev` and
+/// `s_last_orphan`: every fresh volume had an orphan chain headed by
+/// inode 3,588,683,688, which the first mount then "recovered", rewriting
+/// the superblock of a volume nobody had touched. Checked for every
+/// flavour, by the raw bytes and by what a mount does with them.
+#[test]
+fn the_hash_seed_is_at_0xec_and_nothing_is_written_before_it() {
+    for flavor in [
+        fs_ext4::features::FsFlavor::Ext2,
+        fs_ext4::features::FsFlavor::Ext3,
+        fs_ext4::features::FsFlavor::Ext4,
+    ] {
+        let size: u64 = 64 * 1024 * 1024;
+        let dev = MemDev::new(size);
+        mkfs::format_filesystem_with_flavor(dev.as_ref(), Some("seed"), None, size, 4096, flavor)
+            .expect("format");
+        let sb = dev.bytes.lock().unwrap()[1024..2048].to_vec();
+        let field = |at: usize| u32::from_le_bytes(sb[at..at + 4].try_into().unwrap());
+        assert_eq!(field(0xE4), 0, "{flavor:?}: s_journal_dev");
+        assert_eq!(field(0xE8), 0, "{flavor:?}: s_last_orphan");
+        let seed = [field(0xEC), field(0xF0), field(0xF4), field(0xF8)];
+        assert!(
+            seed.iter().all(|&w| w != 0),
+            "{flavor:?}: every word of s_hash_seed is set: {seed:08x?}"
+        );
+
+        let dyn_dev: Arc<dyn BlockDevice> = dev.clone();
+        let fs = Filesystem::mount(dyn_dev).expect("mount");
+        assert_eq!(fs.sb.last_orphan, 0, "{flavor:?}: parsed s_last_orphan");
+        assert_eq!(fs.sb.hash_seed, seed, "{flavor:?}: parsed s_hash_seed");
+        drop(fs);
+        assert!(
+            dev.bytes.lock().unwrap()[1024..2048] == sb[..],
+            "{flavor:?}: mounting a fresh volume rewrote its superblock"
+        );
+    }
+}

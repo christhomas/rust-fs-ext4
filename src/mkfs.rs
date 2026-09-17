@@ -858,16 +858,22 @@ fn build_superblock(
     // immediately above them and this crate's own reader, which parses
     // the journal inode from 0xE0 and documents s_last_orphan at 0xE8.
     //
-    // s_journal_dev (0xDC) and s_last_orphan (0xE8) are both left zero;
+    // s_journal_dev (0xE4) and s_last_orphan (0xE8) are both left zero;
     // neither is written here.
     sb[0xE0..0xE4].copy_from_slice(&journal_inum.to_le_bytes());
-    // 0xE4..0xF4 s_hash_seed[4] — pick a stable nonzero seed. (Only matters
+    // 0xEC..0xFC s_hash_seed[4] — pick a stable nonzero seed. (Only matters
     // if HTree is in play; we don't set DIR_INDEX, but ext4 formatter still seeds
     // these so tools don't whine.)
-    sb[0xE4..0xE8].copy_from_slice(&0xC1A2B3C4u32.to_le_bytes());
-    sb[0xE8..0xEC].copy_from_slice(&0xD5E6F7A8u32.to_le_bytes());
-    sb[0xEC..0xF0].copy_from_slice(&0xB9CADBECu32.to_le_bytes());
-    sb[0xF0..0xF4].copy_from_slice(&0xFD0E1F2Au32.to_le_bytes());
+    //
+    // AT 0xEC, NOT 0xE4 (#225). Written eight bytes early, the seed put
+    // 0xC1A2B3C4 in s_journal_dev and 0xD5E6F7A8 in s_last_orphan -- an
+    // orphan chain headed by inode 3,588,683,688 on every fresh volume,
+    // which the first mount then "recovered" -- and left the last half of
+    // the seed zero.
+    sb[0xEC..0xF0].copy_from_slice(&0xC1A2B3C4u32.to_le_bytes());
+    sb[0xF0..0xF4].copy_from_slice(&0xD5E6F7A8u32.to_le_bytes());
+    sb[0xF4..0xF8].copy_from_slice(&0xB9CADBECu32.to_le_bytes());
+    sb[0xF8..0xFC].copy_from_slice(&0xFD0E1F2Au32.to_le_bytes());
 
     sb[0xFC] = 1; // s_def_hash_version = HALF_MD4
                   // 0xFD reserved_char_pad
