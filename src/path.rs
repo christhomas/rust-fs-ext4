@@ -111,6 +111,7 @@ fn find_entry(
     name: &[u8],
     csum: &crate::checksum::Checksummer,
 ) -> Result<u32> {
+    crate::file_io::refuse_encrypted_names(dir_inode)?;
     // Both extent-backed and legacy direct/indirect-backed directories are
     // supported here — `find_entry_linear` and `find_entry_htree` use
     // `indirect::map_logical_any` for flavor-aware logical→physical mapping.

@@ -86,6 +86,9 @@ bitflags::bitflags! {
         const NODUMP       = 0x0000_0040;
         /// Do not update access time.
         const NOATIME      = 0x0000_0080;
+        /// fscrypt-encrypted (`EXT4_ENCRYPT_FL`): the contents, or a
+        /// directory's entry names, are ciphertext.
+        const ENCRYPT      = 0x0000_0800;
         /// Hash-tree-indexed directory.
         const INDEX        = 0x0000_1000;
         /// File data stored in extended attributes.

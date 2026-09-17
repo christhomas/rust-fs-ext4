@@ -14,6 +14,12 @@
   descriptors' free counts are in clusters. Writes stay refused (the
   feature is not maintained), and `fsck::audit` and `verify::verify`
   refuse the volume by name.
+- A volume with the `ENCRYPT` feature mounts read-only. The bit means some
+  inode may be encrypted, and the volume was refused whole. Reading an
+  encrypted file or symlink, and looking up or listing names in an
+  encrypted directory, now fail with an error naming encryption
+  (`file_io::refuse_encrypted`); everything else reads as usual. Writable
+  mounts stay refused, since no write path checks the flag.
 
 ### Fixed
 

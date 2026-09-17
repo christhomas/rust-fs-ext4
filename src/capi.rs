@@ -1051,6 +1051,7 @@ pub unsafe extern "C" fn fs_ext4_dir_open(
 
 /// Read all directory entries from an inode into `fs_ext4_dirent_t`s.
 fn collect_dir_entries(fs: &Filesystem, inode: &Inode) -> Result<Vec<fs_ext4_dirent_t>> {
+    file_io::refuse_encrypted_names(inode)?;
     if !inode.has_extents() {
         return Err(Error::Corrupt("legacy (non-extent) dirs not yet supported"));
     }
@@ -1281,6 +1282,12 @@ pub unsafe extern "C" fn fs_ext4_readlink(
                     "readlink {path_str}: target of {} bytes is longer than any path",
                     inode.size
                 ));
+                return -1;
+            }
+            // A fast symlink's target is ciphertext too, and never reaches
+            // file_io's refusal (#76).
+            if let Err(e) = file_io::refuse_encrypted(&inode) {
+                set_err_from(&e, &format!("readlink {path_str}"));
                 return -1;
             }
             let target = if inode.size < 60 {
