@@ -170,6 +170,11 @@ fn now_unix_seconds() -> u32 {
 // identical copies of timestamps, generation, extra_isize, and checksum.
 
 use std::sync::atomic::{AtomicU32, Ordering};
+
+/// `EXT4_CASEFOLD_FL`: names in this directory hash casefolded.
+const EXT4_CASEFOLD_FL: u32 = 0x4000_0000;
+/// `EXT4_ENCRYPT_FL`: names in this directory are stored encrypted.
+const EXT4_ENCRYPT_FL: u32 = 0x0000_0800;
 /// Process-lifetime counter shared by all inode builders so successive
 /// creates within the same session produce distinct i_generation values.
 static INODE_GEN_COUNTER: AtomicU32 = AtomicU32::new(1);
@@ -2072,8 +2077,22 @@ impl Filesystem {
         if block.len() < 24 {
             return Err(Error::Corrupt("buffer_update_dotdot: dir block too small"));
         }
+        let block_dotdot_before: [u8; 4] = block[12..16].try_into().unwrap();
         block[12..16].copy_from_slice(&new_parent_ino.to_le_bytes());
-        if self.csum.enabled && crate::dir::has_csum_tail(block) {
+        if dir_inode.flags & crate::inode::InodeFlags::INDEX.bits() != 0 {
+            // Checked before it is changed: a fresh checksum over a root
+            // that was already corrupt would hide the corruption.
+            {
+                let mut original = block.to_vec();
+                original[12..16].copy_from_slice(&block_dotdot_before);
+                self.check_dx_block(dir_ino, dir_inode, &original, true)?;
+            }
+            // A dx_root's checksum is its dx_tail's, over a different range
+            // by a different rule. It can end in bytes that look like a
+            // dirent tail, and writing one there corrupted the index.
+            self.csum
+                .patch_dx_tail(dir_ino, dir_inode.generation, block, 32);
+        } else if self.csum.enabled && crate::dir::has_csum_tail(block) {
             self.csum
                 .patch_dir_entry_tail(dir_ino, dir_inode.generation, block);
         }
@@ -2100,6 +2119,17 @@ impl Filesystem {
     ) -> Result<()> {
         let bs = self.sb.block_size();
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+        if parent_inode.flags & crate::inode::InodeFlags::INDEX.bits() != 0 {
+            return self.buffer_add_dir_entry_indexed(
+                buf,
+                parent_ino,
+                parent_inode,
+                name,
+                target_ino,
+                file_type,
+                has_ft,
+            );
+        }
         let n_blocks = parent_inode.size.div_ceil(bs as u64);
         for logical in 0..n_blocks {
             let Some(phys) = self.map_inode_logical(parent_inode, logical)? else {
@@ -2133,6 +2163,196 @@ impl Filesystem {
         // No existing block has room — caller must extend the directory
         // (or fall back to the un-journaled extend path).
         Err(Error::OutOfBounds)
+    }
+
+    /// [`Self::buffer_add_dir_entry_inplace`] for a directory with
+    /// `EXT4_INDEX_FL`.
+    ///
+    /// Block 0 of such a directory is the `dx_root`, and interior nodes are
+    /// blocks too. None of them is a place for an entry: the root's fake
+    /// `..` spans the rest of its block, so treating it as a linear block
+    /// wrote the new entry over `dx_root_info` and zeroed the `dx_entry`
+    /// array (#97). The entry goes where the index says a lookup will look,
+    /// the leaf covering its hash, or nowhere.
+    ///
+    /// `Error::OutOfBounds` when that leaf is full, or when the names here
+    /// are hashed some way this crate does not (casefolded or encrypted).
+    /// The extend path then drops the index, as the kernel does, rather than
+    /// append a block the index does not route to.
+    #[allow(clippy::too_many_arguments)]
+    fn buffer_add_dir_entry_indexed(
+        &self,
+        buf: &mut BlockBuffer,
+        parent_ino: u32,
+        parent_inode: &Inode,
+        name: &[u8],
+        target_ino: u32,
+        file_type: crate::dir::DirEntryType,
+        has_ft: bool,
+    ) -> Result<()> {
+        if parent_inode.flags & (EXT4_CASEFOLD_FL | EXT4_ENCRYPT_FL) != 0 {
+            return Err(Error::OutOfBounds);
+        }
+        let mut read_logical = |logical: u64| -> Result<Vec<u8>> {
+            let phys = self
+                .map_inode_logical(parent_inode, logical)?
+                .ok_or(Error::CorruptDirEntry("htree block is not mapped"))?;
+            Ok(buf.get_mut(self, phys)?.to_vec())
+        };
+        // Every index block that routes this write is checked before it
+        // is believed: a corrupt root or node sends the entry to the
+        // wrong leaf, which then reads as a name the index cannot find.
+        let root = read_logical(0)?;
+        self.check_dx_block(parent_ino, parent_inode, &root, true)?;
+        let leaf = crate::htree::lookup_leaf_with(
+            name,
+            &root,
+            &self.sb.hash_seed,
+            self.sb.unsigned_hash(),
+            |logical| {
+                let node = read_logical(u64::from(logical))?;
+                self.check_dx_block(parent_ino, parent_inode, &node, false)?;
+                Ok(node)
+            },
+        )?
+        .ok_or(Error::CorruptDirEntry("htree root has no entries"))?;
+        if leaf == 0 {
+            return Err(Error::CorruptDirEntry(
+                "htree routes a name to its own root",
+            ));
+        }
+        let phys = self
+            .map_inode_logical(parent_inode, u64::from(leaf))?
+            .ok_or(Error::CorruptDirEntry("htree leaf is not mapped"))?;
+        let block = buf.get_mut(self, phys)?;
+        let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(block) {
+            12
+        } else {
+            0
+        };
+        crate::dir::add_entry_to_block(block, target_ino, name, file_type, has_ft, reserved_tail)?;
+        if self.csum.enabled && reserved_tail == 12 {
+            self.csum
+                .patch_dir_entry_tail(parent_ino, parent_inode.generation, block);
+        }
+        Ok(())
+    }
+
+    /// Refuse an htree root (`root`) or interior node whose `dx_tail`
+    /// checksum does not match, before it is used or rewritten.
+    ///
+    /// Restamping a block, or routing a write by it, without this blessed
+    /// whatever corruption it held with a fresh checksum (Greptile on #196).
+    /// No-op without metadata_csum, or for a block with no tail to check.
+    fn check_dx_block(&self, dir_ino: u32, dir: &Inode, block: &[u8], root: bool) -> Result<()> {
+        let count_offset = if root {
+            // `dx_root_info` starts at 24; its length is the byte at 29,
+            // and the format fixes it at 8. Anything else is a root whose
+            // count and limit this would read from the wrong place, so it
+            // is refused before its checksum is trusted or it is written
+            // through, as the kernel refuses it (CodeRabbit on #196).
+            match block.get(29) {
+                Some(8) => 32,
+                _ => return Err(Error::Corrupt("htree root info_length is not 8")),
+            }
+        } else {
+            8
+        };
+        match self
+            .csum
+            .verify_dx_tail(dir_ino, dir.generation, block, count_offset)
+        {
+            Some(false) => Err(Error::BadChecksum {
+                what: "htree index block",
+            }),
+            _ => Ok(()),
+        }
+    }
+
+    /// Turn an indexed directory back into a linear one, which is what the
+    /// kernel's `ext4_add_entry` does when it cannot insert through the
+    /// index (`dx_fallback`).
+    ///
+    /// Every leaf is already an ordinary directory block, and so, read
+    /// linearly, is the root (`.`, then a `..` spanning the rest) and each
+    /// interior node (one unused record spanning the block). Only the
+    /// inode's flag has to go. With metadata_csum a linear block must also
+    /// end in a dirent tail, which those blocks do not, so the spanning
+    /// record is shortened by twelve bytes and a tail written after it.
+    ///
+    /// The kernel refuses this on metadata_csum volumes because it cannot
+    /// trust a broken index; here the index is intact and the tails are
+    /// rebuilt. The flag is cleared first: a crash before the blocks are
+    /// rewritten leaves a linear directory e2fsck can re-tail, where the
+    /// other order would leave an index whose root no longer parses.
+    ///
+    /// Not journaled, like the extend path that calls it.
+    fn drop_htree_index(&self, dir_ino: u32) -> Result<()> {
+        let (inode, mut raw) = self.read_inode_verified(dir_ino)?;
+        if inode.flags & crate::inode::InodeFlags::INDEX.bits() == 0 {
+            return Ok(());
+        }
+        let bs = self.sb.block_size() as usize;
+        let physical = |logical: u64| {
+            self.map_inode_logical(&inode, logical)?
+                .ok_or(Error::CorruptDirEntry("htree block is not mapped"))
+        };
+
+        // The root and every interior node, by physical block, each
+        // checked before it is converted and re-tailed.
+        let root_phys = physical(0)?;
+        let root = self.read_block(root_phys)?;
+        self.check_dx_block(dir_ino, &inode, &root, true)?;
+        let mut nodes = Vec::new();
+        if let (Ok(info), Ok((_, entries))) = (
+            crate::htree::parse_root_info(&root),
+            crate::htree::parse_root_entries(&root),
+        ) {
+            let mut level: Vec<u32> = entries.iter().map(|e| e.block).collect();
+            for _ in 0..info.indirect_levels {
+                let mut next = Vec::new();
+                for logical in level {
+                    let phys = physical(u64::from(logical))?;
+                    let block = self.read_block(phys)?;
+                    self.check_dx_block(dir_ino, &inode, &block, false)?;
+                    let (_, entries) = crate::htree::parse_node_entries(&block)?;
+                    next.extend(entries.iter().map(|e| e.block));
+                    nodes.push(phys);
+                }
+                level = next;
+            }
+        }
+
+        let flags = inode.flags & !crate::inode::InodeFlags::INDEX.bits();
+        raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+        if self.csum.enabled {
+            if let Some((lo, hi)) =
+                self.csum
+                    .compute_inode_checksum(dir_ino, inode.generation, &raw)
+            {
+                raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if raw.len() >= 0x84 {
+                    raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(dir_ino, &raw)?;
+        self.dev.flush()?;
+
+        if self.csum.enabled {
+            // Each block, with the offset of the record that spans to its end.
+            let spanning =
+                std::iter::once((root_phys, 12)).chain(nodes.into_iter().map(|p| (p, 0)));
+            for (phys, at) in spanning {
+                let mut block = self.read_block(phys)?;
+                block[at + 4..at + 6].copy_from_slice(&((bs - at - 12) as u16).to_le_bytes());
+                self.csum
+                    .patch_dir_entry_tail(dir_ino, inode.generation, &mut block);
+                self.dev.write_at(phys * bs as u64, &block)?;
+            }
+            self.dev.flush()?;
+        }
+        Ok(())
     }
 
     /// Commit a `BlockBuffer` atomically. Routes through the journal
@@ -5011,6 +5231,11 @@ impl Filesystem {
         let bs = self.sb.block_size();
         let bs_u64 = bs as u64;
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
+
+        // An indexed directory reaches here when the leaf its index picks
+        // is full. A block appended below would be one the index never
+        // routes to, so the index goes first.
+        self.drop_htree_index(parent_ino)?;
 
         // Re-read parent so we operate on the freshest on-disk bytes.
         let (parent_inode, mut parent_raw) = self.read_inode_verified(parent_ino)?;
