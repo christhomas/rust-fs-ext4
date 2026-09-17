@@ -136,7 +136,9 @@ pub const SUPPORTED_RO_COMPAT: u32 = RoCompat::SPARSE_SUPER.bits()
     | RoCompat::QUOTA.bits()
     | RoCompat::METADATA_CSUM.bits()
     | RoCompat::PROJECT.bits()
-    | RoCompat::ORPHAN_PRESENT.bits();
+    | RoCompat::ORPHAN_PRESENT.bits()
+    // Read like any volume; not maintained, so not written (#75).
+    | RoCompat::BIGALLOC.bits();
 
 /// Filesystem dialect — derived from the on-disk feature flags at mount time.
 /// Drives runtime behaviour where ext2 / ext3 / ext4 differ:
@@ -202,28 +204,23 @@ impl FsFlavor {
 }
 
 /// RO_COMPAT bits that change how the filesystem is *read*, and so
-/// cannot be ignored even by a read-only mount.
+/// cannot be ignored even by a read-only mount. None, today.
 ///
 /// The compatibility model says an unknown RO_COMPAT bit is safe to
-/// mount read-only, and for almost every bit that is true: they
-/// describe things a reader may ignore (quota accounting, project
-/// IDs, the orphan list). This crate relied on that blanket rule.
+/// mount read-only: it describes something a reader may ignore. A bit
+/// that invalidated how this reader locates bytes would be the exception
+/// and would belong here.
 ///
-/// **BIGALLOC is the exception, and it is not a small one.** It
-/// changes the allocation unit from the block to the *cluster*:
-/// `s_log_cluster_size` exceeds `s_log_block_size`, the block bitmaps
-/// track clusters, and `s_clusters_per_group` replaces
-/// `s_blocks_per_group` as the group stride. A reader that assumes
-/// cluster == block computes every block-group offset wrong and
-/// returns whatever happens to live there — silently, because nothing
-/// about the read fails.
-///
-/// The rule "unknown RO_COMPAT is safe read-only" holds for a reader
-/// that *understands* the bit and merely chooses not to act on it. It
-/// does not hold for one that has never heard of it and whose
-/// arithmetic it invalidates. Until the cluster arithmetic exists,
-/// refusing is the honest answer.
-pub const READ_BREAKING_RO_COMPAT: u32 = RoCompat::BIGALLOC.bits();
+/// `BIGALLOC` was here, on the premise that it replaces
+/// `s_blocks_per_group` as the group stride. It does not (#75). The kernel
+/// refuses a volume whose `s_blocks_per_group` is not `s_clusters_per_group`
+/// times the cluster ratio, so group offsets, inode tables and extents --
+/// everything a read locates -- stay in blocks. What counts clusters is the
+/// block bitmaps and the descriptors' free counts, which only allocation and
+/// the audits read. So a bigalloc volume reads as any other: it is in
+/// [`SUPPORTED_RO_COMPAT`] and not [`MAINTAINED_RO_COMPAT`], which refuses
+/// writes, and `fsck::audit` and `verify::verify` refuse it by name.
+pub const READ_BREAKING_RO_COMPAT: u32 = 0;
 
 /// RO_COMPAT bits this driver **maintains**, as opposed to tolerates.
 ///
@@ -298,24 +295,18 @@ pub fn check_mountable(feature_incompat: u32, feature_ro_compat: u32) -> crate::
 mod mountability_tests {
     use super::*;
 
-    /// A bigalloc filesystem is refused rather than misread.
-    ///
-    /// This is the case the blanket "unknown RO_COMPAT is safe
-    /// read-only" rule got wrong. With bigalloc the allocation unit is
-    /// the cluster, so a reader assuming cluster == block computes
-    /// every block-group offset wrong and returns whatever lives
-    /// there. Refusing is not a limitation being admitted; it is the
-    /// difference between an error and silent corruption.
+    /// A bigalloc filesystem mounts to be read, and is not written (#75):
+    /// reads locate everything in blocks, and only allocation counts
+    /// clusters.
     #[test]
-    fn a_bigalloc_filesystem_is_refused() {
-        let err = check_mountable(0, RoCompat::BIGALLOC.bits())
-            .expect_err("bigalloc changes the allocation unit and must not be mounted blind");
-        match err {
-            crate::error::Error::UnsupportedRoCompat(bits) => {
-                assert_eq!(bits, RoCompat::BIGALLOC.bits());
-            }
-            other => panic!("expected UnsupportedRoCompat, got {other:?}"),
-        }
+    fn a_bigalloc_filesystem_reads_and_is_not_written() {
+        check_mountable(0, RoCompat::BIGALLOC.bits())
+            .expect("bigalloc leaves every read-side offset in blocks");
+        assert_eq!(
+            unmaintained_ro_compat(RoCompat::BIGALLOC.bits()),
+            RoCompat::BIGALLOC.bits(),
+            "a write would allocate blocks where the bitmap counts clusters"
+        );
     }
 
     /// Every other RO_COMPAT bit still mounts. The point is a targeted

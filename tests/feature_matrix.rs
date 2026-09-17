@@ -72,77 +72,39 @@ fn mount(path: &Path) -> fs_ext4::error::Result<Filesystem> {
     Filesystem::mount(dyn_dev)
 }
 
-/// **The regression G1 fixed.**
+/// **G1, and what it turned out to be.** A bigalloc filesystem mounts and
+/// reads its root (#75).
 ///
-/// bigalloc moves the allocation unit from the block to the cluster, so
-/// every block-group offset this crate computes is wrong on such a
-/// filesystem. Until the cluster arithmetic exists, refusing is the
-/// only correct behaviour — mounting means returning data from wrong
-/// addresses with nothing reporting it.
+/// This was a refusal, on the premise that bigalloc moves every block-group
+/// offset. It does not: `s_blocks_per_group` stays the group stride in
+/// blocks, and only the bitmaps and descriptor free counts count clusters.
+/// With the refusal lifted this image failed with
+/// `BadChecksum { what: "block group descriptor" }`, which was taken for
+/// the misreading. It was a different defect: `mke2fs -t ext4` gives a
+/// 16 MiB image 1 KiB blocks, bigalloc forces `s_first_data_block = 0`,
+/// and the descriptor table was located after `s_first_data_block` rather
+/// than after the superblock's block. Built with `-C 16384`, sixteen blocks
+/// to a cluster, so that case is the one exercised.
 ///
-/// Built with `-C 16384` against a 4 KiB block, so the cluster is four
-/// blocks and the divergence appears in the first group rather than
-/// somewhere deep in the filesystem.
-///
-/// # What happens without the refusal, measured
-///
-/// Disabling the bigalloc check and running this test produces:
-///
-/// ```text
-/// BadChecksum { what: "block group descriptor" }
-/// ```
-///
-/// That is the misreading, caught in the act: the crate located the
-/// group descriptors with block arithmetic, read cluster-based data,
-/// and the checksum did not match.
-///
-/// **That it was caught at all is luck, not design.** `metadata_csum`
-/// is optional; on a bigalloc filesystem without it the same wrong
-/// read produces no error and the caller gets whatever those bytes
-/// happened to be. The checksum is a backstop that happens to fire
-/// here, not a substitute for refusing a format the reader cannot
-/// address.
-///
-/// It also mislabels the problem — a user seeing "bad checksum" goes
-/// looking for corruption in a filesystem that is perfectly intact.
+/// `tests/bigalloc_read_oracle.rs` compares file contents; this is the
+/// matrix entry.
 #[test]
-fn bigalloc_is_refused_rather_than_misread() {
+fn bigalloc_mounts_and_reads() {
     let Some(img) = build("bigalloc", &["-t", "ext4", "-O", "bigalloc", "-C", "16384"]) else {
         eprintln!("skip: mke2fs not available (apt/brew install e2fsprogs)");
         return;
     };
-    let result = mount(&img);
+    let fs = mount(&img).expect("a bigalloc filesystem reads like any other");
+    assert_eq!(fs.sb.block_size(), 1024, "the case this pins is 1 KiB");
+    assert_eq!(fs.sb.first_data_block, 0);
+    fs.read_inode_verified(ROOT_INO)
+        .expect("the root inode must be readable after mounting");
     let _ = std::fs::remove_file(&img);
-
-    // Assert the SPECIFIC refusal, not merely that something failed.
-    // `is_err()` alone passed even with the bigalloc check disabled,
-    // because the image was being rejected for an unrelated reason —
-    // a test that cannot tell those apart is not testing the fix.
-    match result {
-        Err(fs_ext4::error::Error::UnsupportedRoCompat(bits)) => {
-            assert_ne!(
-                bits & fs_ext4::features::RoCompat::BIGALLOC.bits(),
-                0,
-                "refused, but not for bigalloc: {bits:#x}"
-            );
-        }
-        Err(other) => panic!(
-            "a bigalloc filesystem was refused, but for the wrong reason: {other:?}. \
-             The refusal must name bigalloc, or a later change that removes the \
-             bigalloc check will still look green."
-        ),
-        Ok(_) => panic!(
-            "a bigalloc filesystem MOUNTED. This crate does not implement cluster \
-             arithmetic, so every block-group offset it computes on such a \
-             filesystem is wrong — mounting means serving data from wrong \
-             addresses."
-        ),
-    }
 }
 
 /// The guard against fixing G1 too broadly.
 ///
-/// It would be easy to refuse bigalloc by tightening the RO_COMPAT
+/// It would be easy to refuse a feature by tightening the RO_COMPAT
 /// check into "anything unrecognised", which would also refuse ordinary
 /// filesystems carrying newer bits. This mounts a plain ext4 and
 /// requires it to still work.

@@ -62,6 +62,7 @@ impl VerifyReport {
 /// images (single group, < 100 MiB) this is sub-millisecond. Multi-group
 /// volumes scale linearly with allocated content.
 pub fn verify(fs: &Filesystem) -> Result<VerifyReport> {
+    crate::fsck::refuse_bigalloc(fs)?;
     let mut report = VerifyReport::default();
 
     // --- Phase 1: superblock sanity ---

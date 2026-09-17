@@ -479,7 +479,14 @@ impl Superblock {
         let metagroup = group / dpb;
         let offset = ((group % dpb) * u64::from(self.desc_size)) as usize;
         if !self.in_meta_bg(group) {
-            return (u64::from(self.first_data_block) + 1 + metagroup, offset);
+            // The table follows the superblock's own block, which is
+            // `first_data_block` on every volume but one: a 1 KiB bigalloc
+            // volume, whose groups start at block 0 while the superblock is
+            // still in block 1 (#75).
+            return (
+                SUPERBLOCK_OFFSET / u64::from(self.block_size()) + 1 + metagroup,
+                offset,
+            );
         }
         let first = metagroup * dpb;
         let mut has_super = u64::from(self.group_has_super(first));
