@@ -3425,17 +3425,48 @@ impl Filesystem {
         Ok(raw)
     }
 
+    /// Map logical block 0 of a new inode image to `phys`, in the volume's
+    /// dialect: an EXTENTS_FL leaf with one extent on ext4, direct pointer 0
+    /// on ext2/ext3. e2fsck calls an extent-mapped inode on a volume without
+    /// the EXTENTS feature corrupt, and the new directory and slow symlink
+    /// were extent-mapped whatever the volume (#89).
+    fn map_one_block(&self, raw: &mut [u8], phys: u64) -> Result<()> {
+        use crate::inode::{OFF_BLOCK, OFF_FLAGS};
+        if !self.flavor.uses_extents() {
+            let direct =
+                u32::try_from(phys).map_err(|_| Error::Corrupt("block past a 32-bit block map"))?;
+            raw[OFF_BLOCK..OFF_BLOCK + 4].copy_from_slice(&direct.to_le_bytes());
+            return Ok(());
+        }
+        let flags = u32::from_le_bytes(raw[OFF_FLAGS..OFF_FLAGS + 4].try_into().unwrap());
+        raw[OFF_FLAGS..OFF_FLAGS + 4]
+            .copy_from_slice(&(flags | crate::inode::InodeFlags::EXTENTS.bits()).to_le_bytes());
+
+        // i_block: extent leaf header (1 entry, max 4, depth 0) + one extent,
+        // logical block 0, length 1.
+        let header = OFF_BLOCK;
+        raw[header..header + 2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
+        raw[header + 2..header + 4].copy_from_slice(&1u16.to_le_bytes());
+        raw[header + 4..header + 6].copy_from_slice(&4u16.to_le_bytes());
+        raw[header + 6..header + 8].copy_from_slice(&0u16.to_le_bytes());
+        let entry = header + 12;
+        raw[entry..entry + 4].copy_from_slice(&0u32.to_le_bytes());
+        raw[entry + 4..entry + 6].copy_from_slice(&1u16.to_le_bytes());
+        let (phys_hi, phys_lo) = crate::extent_mut::split_phys_block(phys);
+        raw[entry + 6..entry + 8].copy_from_slice(&phys_hi.to_le_bytes());
+        raw[entry + 8..entry + 12].copy_from_slice(&phys_lo.to_le_bytes());
+        Ok(())
+    }
+
     /// Compose a slow-symlink inode image: `S_IFLNK | 0o777`, 1 link,
-    /// `i_size = target.len()`, EXTENTS flag set with a single-entry leaf
-    /// root pointing at `data_phys` (logical block 0, length 1). One fs
+    /// `i_size = target.len()`, logical block 0 mapped to `data_phys` by
+    /// [`Self::map_one_block`]. One fs
     /// block worth of 512-byte sectors charged to `i_blocks`.
     ///
     /// Caller must have already written the target bytes (zero-padded) to
     /// `data_phys * block_size`.
     fn build_slow_symlink_inode(&self, ino: u32, target: &[u8], data_phys: u64) -> Result<Vec<u8>> {
-        use crate::inode::{
-            OFF_BLOCK, OFF_BLOCKS_LO, OFF_FLAGS, OFF_LINKS_COUNT, OFF_MODE, OFF_SIZE_LO,
-        };
+        use crate::inode::{OFF_BLOCKS_LO, OFF_LINKS_COUNT, OFF_MODE, OFF_SIZE_LO};
         debug_assert!(target.len() >= 60 && target.len() <= 4096);
         let mut raw = vec![0u8; self.sb.inode_size as usize];
 
@@ -3446,26 +3477,7 @@ impl Filesystem {
         let bs = self.sb.block_size() as u64;
         let sectors = bs / 512;
         raw[OFF_BLOCKS_LO..OFF_BLOCKS_LO + 4].copy_from_slice(&(sectors as u32).to_le_bytes());
-        raw[OFF_FLAGS..OFF_FLAGS + 4]
-            .copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
-
-        // i_block: extent leaf header + one entry covering the single data block.
-        let extent_header_off = OFF_BLOCK;
-        raw[extent_header_off..extent_header_off + 2]
-            .copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
-        raw[extent_header_off + 2..extent_header_off + 4].copy_from_slice(&1u16.to_le_bytes());
-        raw[extent_header_off + 4..extent_header_off + 6].copy_from_slice(&4u16.to_le_bytes());
-        raw[extent_header_off + 6..extent_header_off + 8].copy_from_slice(&0u16.to_le_bytes());
-
-        // Single leaf extent: logical block 0, length 1, physical = data_phys.
-        let extent_entry_off = extent_header_off + 12;
-        raw[extent_entry_off..extent_entry_off + 4].copy_from_slice(&0u32.to_le_bytes());
-        raw[extent_entry_off + 4..extent_entry_off + 6].copy_from_slice(&1u16.to_le_bytes());
-        let (extent_phys_hi, extent_phys_lo) = crate::extent_mut::split_phys_block(data_phys);
-        raw[extent_entry_off + 6..extent_entry_off + 8]
-            .copy_from_slice(&extent_phys_hi.to_le_bytes());
-        raw[extent_entry_off + 8..extent_entry_off + 12]
-            .copy_from_slice(&extent_phys_lo.to_le_bytes());
+        self.map_one_block(&mut raw, data_phys)?;
 
         let now = now_unix_seconds();
         write_inode_timestamps(&mut raw, now);
@@ -4475,8 +4487,7 @@ impl Filesystem {
     /// timestamps = now.
     fn build_directory_inode(&self, ino: u32, mode: u16, data_phys_block: u64) -> Result<Vec<u8>> {
         use crate::inode::{
-            OFF_BLOCK, OFF_BLOCKS_HI, OFF_BLOCKS_LO, OFF_FLAGS, OFF_LINKS_COUNT, OFF_MODE,
-            OFF_SIZE_HI, OFF_SIZE_LO,
+            OFF_BLOCKS_HI, OFF_BLOCKS_LO, OFF_LINKS_COUNT, OFF_MODE, OFF_SIZE_HI, OFF_SIZE_LO,
         };
         let mut raw = vec![0u8; self.sb.inode_size as usize];
 
@@ -4484,26 +4495,7 @@ impl Filesystem {
         raw[OFF_MODE..OFF_MODE + 2].copy_from_slice(&mode_bits.to_le_bytes());
         // 2 hard links: one for "." and one for the parent's entry naming this dir.
         raw[OFF_LINKS_COUNT..OFF_LINKS_COUNT + 2].copy_from_slice(&2u16.to_le_bytes());
-        raw[OFF_FLAGS..OFF_FLAGS + 4]
-            .copy_from_slice(&crate::inode::InodeFlags::EXTENTS.bits().to_le_bytes());
-
-        // i_block (60 B): extent header (leaf, 1 entry, max 4) + one Extent.
-        let extent_header_off = OFF_BLOCK;
-        raw[extent_header_off..extent_header_off + 2]
-            .copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
-        raw[extent_header_off + 2..extent_header_off + 4].copy_from_slice(&1u16.to_le_bytes());
-        raw[extent_header_off + 4..extent_header_off + 6].copy_from_slice(&4u16.to_le_bytes());
-        // depth=0 leaf, generation=0 — both stay zero from initial vec![0u8; ...]
-
-        // Entry at extent_header_off+12: logical 0, len 1, phys = data_phys_block.
-        let extent_entry_off = extent_header_off + 12;
-        raw[extent_entry_off..extent_entry_off + 4].copy_from_slice(&0u32.to_le_bytes());
-        raw[extent_entry_off + 4..extent_entry_off + 6].copy_from_slice(&1u16.to_le_bytes());
-        let (extent_phys_hi, extent_phys_lo) = crate::extent_mut::split_phys_block(data_phys_block);
-        raw[extent_entry_off + 6..extent_entry_off + 8]
-            .copy_from_slice(&extent_phys_hi.to_le_bytes());
-        raw[extent_entry_off + 8..extent_entry_off + 12]
-            .copy_from_slice(&extent_phys_lo.to_le_bytes());
+        self.map_one_block(&mut raw, data_phys_block)?;
 
         // Size = block_size (the single data block fills the dir).
         let bs = self.sb.block_size() as u64;
@@ -5300,6 +5292,18 @@ impl Filesystem {
             return Err(Error::NotADirectory);
         }
         let new_logical_block = parent_inode.size.div_ceil(bs_u64);
+        if parent_inode.flags & crate::inode::InodeFlags::EXTENTS.bits() == 0 {
+            return self.extend_mapped_dir_and_add_entry(
+                parent_ino,
+                &parent_inode,
+                &mut parent_raw,
+                new_logical_block,
+                name,
+                target_ino,
+                file_type,
+                has_ft,
+            );
+        }
 
         // 1. Allocate one fs block. Hint to parent's group.
         let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
@@ -5465,6 +5469,108 @@ impl Filesystem {
         }
 
         Ok(())
+    }
+
+    /// [`Self::extend_dir_and_add_entry`] for an ext2/ext3 directory, whose
+    /// blocks are named by `i_block`'s twelve direct pointers and then its
+    /// single-indirect block. It read that array as an extent header and
+    /// refused, so such a directory never grew past its first block (#89).
+    /// A directory needing the double-indirect block is refused.
+    #[allow(clippy::too_many_arguments)]
+    fn extend_mapped_dir_and_add_entry(
+        &self,
+        parent_ino: u32,
+        parent_inode: &Inode,
+        parent_raw: &mut [u8],
+        new_logical_block: u64,
+        name: &[u8],
+        target_ino: u32,
+        file_type: crate::dir::DirEntryType,
+        has_ft: bool,
+    ) -> Result<()> {
+        use crate::inode::OFF_BLOCK;
+        const DIRECT: u64 = 12;
+        let bs = self.sb.block_size();
+        let bs_u64 = bs as u64;
+        let per_block = bs_u64 / 4;
+        if new_logical_block >= DIRECT + per_block {
+            return Err(Error::Unsupported(
+                "growing an ext2/ext3 directory past its single-indirect block",
+            ));
+        }
+        let parent_group = (parent_ino - 1) / self.sb.inodes_per_group;
+        let allocate = || -> Result<(u32, crate::alloc::BlockAllocationPlan)> {
+            let mut bitmap_reader = |block: u64| self.read_block(block);
+            let plan = crate::alloc::plan_block_allocation(
+                &self.sb,
+                &self.allocation_groups(),
+                1,
+                parent_group,
+                &mut bitmap_reader,
+            )?;
+            let phys = u32::try_from(plan.first_block)
+                .map_err(|_| Error::Corrupt("directory block past a 32-bit block map"))?;
+            // Committed now, so the next plan picks a different block.
+            self.commit_dir_block_alloc(plan.first_block, &plan)?;
+            Ok((phys, plan))
+        };
+
+        let (new_phys, _) = allocate()?;
+        let mut blocks_consumed = 1u64;
+        if new_logical_block < DIRECT {
+            let at = OFF_BLOCK + 4 * new_logical_block as usize;
+            parent_raw[at..at + 4].copy_from_slice(&new_phys.to_le_bytes());
+        } else {
+            let slot = OFF_BLOCK + 4 * DIRECT as usize;
+            let mut indirect_phys =
+                u32::from_le_bytes(parent_raw[slot..slot + 4].try_into().unwrap());
+            let mut indirect = if indirect_phys == 0 {
+                let (phys, _) = allocate()?;
+                indirect_phys = phys;
+                blocks_consumed += 1;
+                parent_raw[slot..slot + 4].copy_from_slice(&phys.to_le_bytes());
+                vec![0u8; bs as usize]
+            } else {
+                self.read_block(u64::from(indirect_phys))?
+            };
+            let at = 4 * (new_logical_block - DIRECT) as usize;
+            indirect[at..at + 4].copy_from_slice(&new_phys.to_le_bytes());
+            self.dev
+                .write_at(u64::from(indirect_phys) * bs_u64, &indirect)?;
+        }
+
+        let new_size = parent_inode.size + bs_u64;
+        let new_blocks = parent_inode.blocks + (bs_u64 / 512) * blocks_consumed;
+        Self::patch_inode_size_and_blocks(parent_raw, new_size, new_blocks)?;
+        if self.csum.enabled {
+            if let Some((lo, hi)) =
+                self.csum
+                    .compute_inode_checksum(parent_ino, parent_inode.generation, parent_raw)
+            {
+                parent_raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());
+                if parent_raw.len() >= 0x84 {
+                    parent_raw[0x82..0x84].copy_from_slice(&hi.to_le_bytes());
+                }
+            }
+        }
+        self.write_inode_raw(parent_ino, parent_raw)?;
+
+        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
+        let mut block = vec![0u8; bs as usize];
+        block[4..6].copy_from_slice(&((bs as usize - reserved_tail) as u16).to_le_bytes());
+        crate::dir::add_entry_to_block(
+            &mut block,
+            target_ino,
+            name,
+            file_type,
+            has_ft,
+            reserved_tail,
+        )?;
+        if reserved_tail == 12 {
+            self.csum
+                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
+        }
+        self.dev.write_at(u64::from(new_phys) * bs_u64, &block)
     }
 
     /// Grow a directory whose extent tree is already at depth ≥ 2.

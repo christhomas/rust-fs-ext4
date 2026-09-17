@@ -1,7 +1,6 @@
-//! Format ext3 (and ext2) volumes with the driver's own mkfs and leave them in
-//! the selected scratch directory for a real Linux e2fsck pass:
-//!
-//!   FS_EXT4_TEST_TMPDIR="$PWD/tmp/oracle" ./scripts/test.sh --test mkfs_ext3_oracle
+//! Format ext3 (and ext2) volumes with the driver's own mkfs and hand each to
+//! `e2fsck -fn`, which must exit 0. Where e2fsprogs is not installed the
+//! in-process checks still run and the external one is skipped with a note.
 //!
 //! `mkfs_e2fsck_oracle` covers the default Ext4 flavor; this covers the legacy
 //! flavors, which take materially different code paths:
@@ -11,10 +10,11 @@
 //!     32-byte group descriptors, no metadata_csum.
 //!   * Ext2 — same legacy layout but no journal.
 //!
-//! The mkfs doc comment calls Ext3 "not yet supported (Phase B)" while the code
-//! fully implements it; this is the external checker that settles which is
-//! true. No fixture mounts these flavors RW today, so the journal + indirect
-//! block-map layout mkfs writes has never faced e2fsck.
+//! The ext3 cases used to be ignored for a journal e2fsck called invalid:
+//! mkfs wrote inode 8 with `i_mode = 0`, and e2fsck (like the kernel) takes a
+//! journal inode that is not a regular file for no journal at all (#89). The
+//! ext3 cases also write through the crate, so the journal the writer commits
+//! to faces the checker too.
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::features::FsFlavor;
@@ -84,6 +84,11 @@ fn check_and_done(path: &str, tag: &str, block_size: u32, expect_journal: bool) 
             report.anomalies
         );
     }
+    e2fsck_clean(path, tag);
+    if expect_journal {
+        write_through_the_journal(path, tag);
+        e2fsck_clean(path, &format!("{tag} after writes"));
+    }
     if std::env::var_os("RFE_KEEP_IMAGES").is_some() {
         eprintln!("[{tag}] image: {path}");
     } else {
@@ -91,18 +96,55 @@ fn check_and_done(path: &str, tag: &str, block_size: u32, expect_journal: bool) 
     }
 }
 
-/// KNOWN BUG (deferred) — ext3 mkfs produces a journal that e2fsck rejects:
-/// "Superblock has an invalid journal (inode 8) ... journal superblock is
-/// corrupt" (EXIT 12). The driver's own jbd2 reader follows inode 8 to a
-/// structurally-parseable superblock and accepts it, so the in-process checks
-/// (incl. the free-count audit, now correct after the indirect-block fix in
-/// this branch) pass — but e2fsck's stricter validation does not. ext3 journal
-/// support is explicitly incomplete (mkfs.rs: "Ext3 — not yet supported
-/// (Phase B)"); the free-count drift this branch fixes was a separate bug on
-/// the same path. The ext2 sibling (no journal) is fully e2fsck-clean. Run with
-/// `--ignored` + scripts/vm-e2fsck.sh to reproduce the journal rejection.
+/// `e2fsck -fn` must find nothing to say. Skips where it is not installed.
+fn e2fsck_clean(path: &str, tag: &str) {
+    let Some(e2fsck) = ["/usr/sbin/e2fsck", "/sbin/e2fsck", "/usr/bin/e2fsck"]
+        .into_iter()
+        .find(|p| std::path::Path::new(p).exists())
+    else {
+        eprintln!("[{tag}] skip e2fsck: e2fsprogs not installed");
+        return;
+    };
+    let out = std::process::Command::new(e2fsck)
+        .args(["-fn", path])
+        .output()
+        .expect("run e2fsck");
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "[{tag}] e2fsck -fn: {}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}
+
+/// A directory, a file with content and a rename, each committed through the
+/// ext3 journal.
+fn write_through_the_journal(path: &str, tag: &str) {
+    let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(path).expect("rw")))
+        .unwrap_or_else(|e| panic!("[{tag}] mount rw: {e:?}"));
+    fs.apply_mkdir("/d", 0o755).expect("mkdir");
+    fs.apply_create("/d/f", 0o644).expect("create");
+    fs.apply_replace_file_content("/d/f", &vec![0xA5; 20_000])
+        .expect("write");
+    fs.apply_rename("/d/f", "/g", false).expect("rename");
+    // Enough names to grow /d past its first block, and a symlink too long
+    // to live in i_block.
+    for i in 0..300 {
+        fs.apply_create(&format!("/d/a_longer_file_name_{i:04}"), 0o644)
+            .unwrap_or_else(|e| panic!("[{tag}] create {i}: {e:?}"));
+    }
+    fs.apply_symlink(&"t".repeat(200), "/s").expect("symlink");
+    let jsb = fs_ext4::jbd2::read_superblock(&fs)
+        .expect("jsb read")
+        .expect("a journal");
+    assert!(
+        jsb.sequence > 1,
+        "[{tag}] the writes went through the journal"
+    );
+}
+
 #[test]
-#[ignore = "ext3 journal (inode 8) is rejected by e2fsck — incomplete journal support, see header"]
 fn mkfs_ext3_4k_blocks() {
     let Some(p) = format("ext3_4k", 32 * 1024 * 1024, 4096, FsFlavor::Ext3) else {
         return;
@@ -110,11 +152,10 @@ fn mkfs_ext3_4k_blocks() {
     check_and_done(&p, "ext3_4k", 4096, true);
 }
 
-/// See `mkfs_ext3_4k_blocks` — same deferred ext3 journal bug. 1 KiB blocks
-/// additionally exercise the first_data_block=1 layout (the free-count fix here
-/// accounts for the journal's indirect-tree blocks in that layout too).
+/// 1 KiB blocks additionally exercise the first_data_block=1 layout (the
+/// free-count arithmetic accounts for the journal's indirect-tree blocks there
+/// too).
 #[test]
-#[ignore = "ext3 journal (inode 8) is rejected by e2fsck — incomplete journal support, see mkfs_ext3_4k_blocks"]
 fn mkfs_ext3_1k_blocks() {
     let Some(p) = format("ext3_1k", 8 * 1024 * 1024, 1024, FsFlavor::Ext3) else {
         return;

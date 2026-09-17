@@ -358,9 +358,11 @@ fn mkfs_ext3_then_mount_ro_and_read_root() {
     // Inode 8 must be marked allocated and parse as the journal inode.
     let raw = fs.read_inode_raw(8).expect("read journal inode");
     let jinode = Inode::parse(&raw).expect("parse journal inode");
+    // mke2fs writes the journal inode as a regular file, and e2fsck takes one
+    // that is not for no journal at all (#89).
     assert_eq!(
-        jinode.mode, 0,
-        "journal inode i_mode must be 0 (Linux convention)"
+        jinode.mode, 0o100600,
+        "journal inode i_mode must be S_IFREG | 0600, as mke2fs writes it"
     );
     assert_eq!(jinode.links_count, 1);
     assert!(
