@@ -1,5 +1,5 @@
-//! Writing and removing block-mapped (ext2/ext3-style) files keeps the (#249)
-//! volume consistent, including on a volume with `metadata_csum`.
+//! Writing and removing block-mapped (ext2/ext3-style) files keeps the
+//! volume consistent, including on a volume with `metadata_csum` (#249).
 //!
 //! An ext3 volume tuned to `metadata_csum` keeps its block-mapped files, so
 //! both properties meet on real volumes, and `mke2fs -O ^extent,^64bit,
