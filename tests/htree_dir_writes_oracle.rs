@@ -211,6 +211,33 @@ fn a_full_leaf_drops_the_index_with_metadata_csum() {
     fill_a_leaf("fill_csum", "metadata_csum");
 }
 
+/// A root whose `info_length` is not 8 is refused before it routes a write
+/// (CodeRabbit on #196): its count and limit would be read from the wrong
+/// offset. Tested without metadata_csum, where no checksum would catch it.
+#[test]
+fn a_root_with_a_wrong_info_length_is_refused() {
+    let Some(image) = indexed_volume("info_len", "^metadata_csum,^has_journal", 600) else {
+        return;
+    };
+    {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+        let ino = resolve(&fs, "/bigdir").expect("resolve");
+        let (inode, _) = fs.read_inode_verified(ino).expect("inode");
+        let phys = fs.map_inode_logical(&inode, 0).unwrap().unwrap();
+        let bs = u64::from(fs.sb.block_size());
+        let mut root = fs.read_block(phys).unwrap();
+        root[29] = 16;
+        fs.dev.write_at(phys * bs, &root).unwrap();
+        fs.dev.flush().unwrap();
+    }
+    let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+    match fs.apply_create("/bigdir/through_a_bad_root", 0o644) {
+        Err(fs_ext4::Error::Corrupt(m)) => assert!(m.contains("info_length"), "{m}"),
+        other => panic!("a create went through a bad root: {:?}", other.map(|_| ())),
+    }
+    let _ = std::fs::remove_file(&image);
+}
+
 /// Flip one byte of `path`'s dx_root `dx_tail` checksum, on the device.
 fn corrupt_dx_root_checksum(image: &str, path: &str) {
     let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(image).unwrap())).unwrap();

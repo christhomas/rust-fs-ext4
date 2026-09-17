@@ -2061,8 +2061,15 @@ impl Filesystem {
     /// No-op without metadata_csum, or for a block with no tail to check.
     fn check_dx_block(&self, dir_ino: u32, dir: &Inode, block: &[u8], root: bool) -> Result<()> {
         let count_offset = if root {
-            // `dx_root_info` starts at 24; its length is the byte at 29.
-            24 + usize::from(*block.get(29).unwrap_or(&8))
+            // `dx_root_info` starts at 24; its length is the byte at 29,
+            // and the format fixes it at 8. Anything else is a root whose
+            // count and limit this would read from the wrong place, so it
+            // is refused before its checksum is trusted or it is written
+            // through, as the kernel refuses it (CodeRabbit on #196).
+            match block.get(29) {
+                Some(8) => 32,
+                _ => return Err(Error::Corrupt("htree root info_length is not 8")),
+            }
         } else {
             8
         };
