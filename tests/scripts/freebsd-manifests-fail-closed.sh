@@ -58,6 +58,14 @@ cat > "$t/bin/sha256" <<'STUB'
 [ -n "${FAIL_SHA:-}" ] && [ "$(basename "$2")" = "$FAIL_SHA" ] && exit 1
 sha256sum "$2" | cut -d' ' -f1
 STUB
+# `sort -z`, failing after writing its output when FAIL_SORT is set: the
+# stage that a pipeline's last status did not see.
+real_sort="$(command -v sort)"
+cat > "$t/bin/sort" <<STUB
+#!/usr/bin/env bash
+"$real_sort" "\$@"
+[ -z "\${FAIL_SORT:-}" ]
+STUB
 chmod +x "$t/bin/"*
 
 produce() {
@@ -92,6 +100,12 @@ fi
 
 ENVS=(FREEBSD_EXPECTED_REFUSALS="other refused-image")
 produce good refused-image; expect 0 "$?" "producer: an expected refusal passes"
+if env PATH="$t/bin:$PATH" TREES="$t/trees" FREEBSD_EXPECTED_REFUSALS="refused-image" \
+    sh "$PRODUCER" "$t/img" "$t/m3" 2>&1 >/dev/null | grep -q "refused-image: .*as expected"; then
+    printf 'ok    and the expected refusal is on stderr too\n'
+else
+    printf 'FAIL  the expected refusal is missing from stderr\n'; fails=$((fails + 1))
+fi
 ENVS=()
 
 produce good empty; expect 1 "$?" "producer: a mounted image with no files fails"
@@ -102,6 +116,15 @@ if [ ! -e "$t/manifests/good.manifest" ]; then
     printf 'ok    and leaves no truncated manifest behind\n'
 else
     printf 'FAIL  a truncated manifest was kept\n'; fails=$((fails + 1))
+fi
+ENVS=()
+
+ENVS=(FAIL_SORT=1)
+produce good; expect 1 "$?" "producer: a sort that fails after writing fails the image"
+if [ ! -e "$t/manifests/good.manifest" ]; then
+    printf 'ok    and publishes no manifest\n'
+else
+    printf 'FAIL  a manifest was published past a failed sort\n'; fails=$((fails + 1))
 fi
 ENVS=()
 
@@ -133,6 +156,16 @@ printf '%s\n' "[manifest:start]" "[manifest:disk:vdb:begin]" "[manifest:disk:vdb
 rm -rf "$t/hm"
 check good; expect 1 "$?" "host: an ok disk with no files fails"
 check; expect 1 "$?" "host: no images attached fails"
+
+# The same directory, reused: a good run, then a log whose ok block for the
+# same disk carries no files. The earlier run's manifest must not pass it.
+rm -rf "$t/hm"
+printf '%s\n' "[manifest:start]" \
+    "[manifest:disk:vdb:begin]" "./a.txt	4	abc" "[manifest:disk:vdb:end:ok]" \
+    "[manifest:end]" > "$t/serial.log"
+check good; expect 0 "$?" "host: reused directory, first run manifested (control)"
+printf '%s\n' "[manifest:start]" "[manifest:disk:vdb:begin]" "[manifest:disk:vdb:end:ok]" "[manifest:end]" > "$t/serial.log"
+check good; expect 1 "$?" "host: reused directory, a later ok block with no files still fails"
 
 if [ "$fails" -eq 0 ]; then
     echo "PASS  freebsd manifests fail closed"

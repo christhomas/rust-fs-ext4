@@ -80,9 +80,16 @@ for img in "$IMAGE_DIR"/*.img; do
         # commands fails; that stops `xargs`, whose status is then
         # non-zero, and the partial output is discarded rather than
         # renamed into place.
-        if find "$mount_point" -type f -print0 \
-            | sort -z \
-            | xargs -0 -n 1 sh -c '
+        #
+        # And each stage is checked on its own. As one pipeline, `sh`
+        # without `pipefail` saw only `xargs`'s status, so a `find` or
+        # `sort` that failed after writing some records still published
+        # the records it had (#212).
+        list="$partial.list"
+        sorted="$partial.sorted"
+        if find "$mount_point" -type f -print0 > "$list" \
+            && sort -z < "$list" > "$sorted" \
+            && xargs -0 -n 1 sh -c '
                 # GNU xargs runs this once with no file when there are
                 # none; FreeBSD'"'"'s does not. Either way, no file, no line.
                 [ -n "${2:-}" ] || exit 0
@@ -92,7 +99,8 @@ for img in "$IMAGE_DIR"/*.img; do
                 mode=$(stat -f %p "$f") || exit 255
                 sha=$(sha256 -q "$f") || exit 255
                 printf "%s\t%s\t%s\t%s\n" "$rel" "$size" "$mode" "$sha"
-              ' sh "$mount_point" > "$partial"; then
+              ' sh "$mount_point" < "$sorted" > "$partial"; then
+            rm -f "$list" "$sorted"
             if [ -s "$partial" ]; then
                 mv "$partial" "$manifest"
                 manifested=$((manifested + 1))
@@ -102,13 +110,15 @@ for img in "$IMAGE_DIR"/*.img; do
                 problem "$name: mounted, and no files were manifested"
             fi
         else
-            rm -f "$partial"
+            rm -f "$partial" "$list" "$sorted"
             problem "$name: the manifest could not be built for every file"
         fi
         umount "$mount_point"
     elif expected_refusal "$name"; then
         refused=$((refused + 1))
+        # On both streams, like a problem, but not recorded as one.
         echo "[freebsd-cross] $name: mount_ext2fs refused it, as expected"
+        echo "[freebsd-cross] $name: mount_ext2fs refused it, as expected" >&2
     else
         problem "$name: mount_ext2fs refused it, and it is not an expected refusal"
     fi

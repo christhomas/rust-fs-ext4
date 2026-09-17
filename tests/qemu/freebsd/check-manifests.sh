@@ -38,12 +38,18 @@ if [ "$#" -eq 0 ]; then
 fi
 
 mkdir -p "$dir"
+# The directory persists between runs, and a disk block with no file lines
+# never opens its output file, so an earlier run's manifest would satisfy
+# the non-empty check below. Every name this run can produce is cleared
+# first, and each block truncates its own file as it begins.
+rm -f "$dir"/vd?.manifest
 echo "[qemu-fbsd] manifests:"
 awk -v dir="$dir" '
     /^\[manifest:disk:.*:begin\]$/ {
         match($0, /disk:[^:]+/)
         name = substr($0, RSTART+5, RLENGTH-5)
         out = dir "/" name ".manifest"
+        printf "" > out
         in_manifest = 1
         next
     }
