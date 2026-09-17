@@ -31,14 +31,15 @@ const I_EXTRA_ISIZE: u16 = 32; // covers checksum_hi, ctime/mtime/atime extra, c
 const ROOT_MODE: u16 = 0o40755; // S_IFDIR | 0755
 const EXTENT_MAGIC: u16 = 0xF30A;
 
-/// Smallest filesystem block size this formatter will lay out.
 /// The block size `mkfs` uses when the caller does not choose one.
 ///
 /// Named because it was written out at three sites — the CLI's default,
 /// its help text, and the library — which is three places to change and
-/// two chances to forget.
+/// two chances to forget. The help text reads it too, and so does
+/// `fs_ext4_mkfs` for a block size of 0 (#180).
 pub const DEFAULT_BLOCK_SIZE: u32 = 4096;
 
+/// Smallest filesystem block size this formatter will lay out.
 pub const MIN_BLOCK_SIZE: u32 = 1024;
 /// Largest filesystem block size this formatter will lay out.
 pub const MAX_BLOCK_SIZE: u32 = 65536;

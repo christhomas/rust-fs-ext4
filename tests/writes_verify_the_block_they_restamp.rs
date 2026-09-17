@@ -274,6 +274,49 @@ refuses!(rename_refuses_it, "rename", |fs| fs.apply_rename(
 refuses!(link_refuses_it, "link", |fs| fs
     .apply_link("/holder/f3.txt", "/holder/f3-link.txt"));
 
+// THE OTHER NINE ENTRY POINTS (#166). Each reaches a `lookup_with_csum` the
+// seven above never execute with a corrupt block underneath, so putting
+// `path::lookup` back at any of those sites left this file green.
+refuses!(set_flags_refuses_it, "set_flags", |fs| fs
+    .apply_set_flags("/holder/f1.txt", 0));
+refuses!(setxattr_refuses_it, "setxattr", |fs| fs.apply_setxattr(
+    "/holder/f1.txt",
+    "user.k",
+    b"v"
+));
+refuses!(removexattr_refuses_it, "removexattr", |fs| fs
+    .apply_removexattr("/holder/f1.txt", "user.k"));
+refuses!(utimens_refuses_it, "utimens", |fs| fs.apply_utimens(
+    "/holder/f1.txt",
+    1,
+    0,
+    1,
+    0
+));
+// One level below `/holder`, so the walk to the new entry's PARENT crosses
+// the corrupt block: a name directly in `/holder` resolves the parent
+// through the root's block and is refused later, by the duplicate-name
+// check, which left `plan_new_inode_in_dir`'s own lookup unwitnessed.
+refuses!(create_refuses_it, "create", |fs| fs
+    .apply_create("/holder/sub/new.txt", 0o644)
+    .map(|_| ()));
+refuses!(mknod_refuses_it, "mknod", |fs| fs
+    .apply_mknod("/holder/sub/fifo", 0o010644, 0, 0)
+    .map(|_| ()));
+refuses!(symlink_refuses_it, "symlink", |fs| fs
+    .apply_symlink("target", "/holder/sub/link")
+    .map(|_| ()));
+refuses!(
+    replace_file_content_refuses_it,
+    "replace_file_content",
+    |fs| fs
+        .apply_replace_file_content("/holder/f1.txt", b"new")
+        .map(|_| ())
+);
+refuses!(pwrite_refuses_it, "pwrite", |fs| fs
+    .apply_pwrite("/holder/f1.txt", 0, b"new")
+    .map(|_| ()));
+
 // ---------------------------------------------------------------------------
 // The second half of the fix: the emptiness walks, which are a separate scan
 // ---------------------------------------------------------------------------

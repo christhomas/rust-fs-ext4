@@ -2432,7 +2432,7 @@ pub unsafe extern "C" fn fs_ext4_mkfs(
                 return -EINVAL;
             }
             let block_size = if cfg.block_size == 0 {
-                4096
+                crate::mkfs::DEFAULT_BLOCK_SIZE
             } else {
                 cfg.block_size
             };

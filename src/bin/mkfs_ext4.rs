@@ -49,7 +49,7 @@ Usage: mkfs.ext4 [options] device
 
 Options:
   -L <label>        Volume label (max 16 bytes UTF-8).
-  -b <size>         Block size in bytes. Power of 2, 1024..=65536. Default: 4096.
+  -b <size>         Block size in bytes. Power of 2, 1024..=65536. Default: {DEFAULT_BLOCK_SIZE}.
   -U <uuid>         Volume UUID (32 hex chars, dashes optional). Default: random.
   -F                Force; format even if device looks in use. (Accepted; we do
                     not currently inspect for active mounts.)
@@ -78,6 +78,16 @@ as errors otherwise. Two groups, because they parse differently: -m, -N, -i, -E,
 -O and -T each consume the argument that follows them, while -c takes none. The
 full feature set will land incrementally as the underlying crate grows.
 ";
+
+/// [`USAGE`] with the default block size filled in from
+/// [`fs_ext4::mkfs::DEFAULT_BLOCK_SIZE`], so the help cannot state a default
+/// the formatter no longer uses (#180).
+fn usage() -> String {
+    USAGE.replace(
+        "{DEFAULT_BLOCK_SIZE}",
+        &fs_ext4::mkfs::DEFAULT_BLOCK_SIZE.to_string(),
+    )
+}
 
 fn main() -> ExitCode {
     match run() {
@@ -126,7 +136,7 @@ fn run() -> Result<(), String> {
     let device = opts
         .device
         .as_deref()
-        .ok_or_else(|| format!("missing positional <device> argument\n\n{USAGE}"))?;
+        .ok_or_else(|| format!("missing positional <device> argument\n\n{}", usage()))?;
 
     let block_size = opts.block_size.unwrap_or(fs_ext4::mkfs::DEFAULT_BLOCK_SIZE);
 
@@ -246,7 +256,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
     while let Some(arg) = args.next() {
         match arg.as_str() {
             "-h" | "--help" => {
-                print!("{USAGE}");
+                print!("{}", usage());
                 std::process::exit(0);
             }
             "-V" | "--version" => {
@@ -315,7 +325,7 @@ fn parse_args_from(mut args: impl Iterator<Item = String>) -> Result<Opts, Strin
                     .push(format!("{other} not yet honored, ignoring"));
             }
             other if other.starts_with('-') => {
-                return Err(format!("unknown flag: {other}\n\n{USAGE}"));
+                return Err(format!("unknown flag: {other}\n\n{}", usage()));
             }
             // First non-flag positional is the device path. Reject duplicates
             // because mkfs.ext4 only formats one target per invocation.
@@ -380,6 +390,18 @@ fn parse_uuid(s: &str) -> Result<[u8; 16], String> {
 
 #[cfg(test)]
 mod tests {
+    /// The help states the default the formatter uses, from the one
+    /// constant, and leaves no placeholder behind (#180).
+    #[test]
+    fn the_help_states_the_default_block_size_from_the_constant() {
+        let help = super::usage();
+        assert!(
+            help.contains(&format!("Default: {}.", fs_ext4::mkfs::DEFAULT_BLOCK_SIZE)),
+            "{help}"
+        );
+        assert!(!help.contains("{DEFAULT_BLOCK_SIZE}"), "{help}");
+    }
+
     use super::*;
 
     fn parse(argv: &[&str]) -> Result<Opts, String> {
