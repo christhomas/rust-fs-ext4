@@ -23,7 +23,8 @@ name: CI
 #                tiers that need none — lint, the unit tier, and the
 #                fixture-reading tests. The tool and kernel oracles are
 #                architecture-independent (they read the same images) and
-#                are covered by `test`.
+#                are covered by `test`; so are the script tests, which
+#                check the tree rather than the machine.
 #   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
 #                the guest. That is how a macOS host runs a Linux suite,
 #                and this job is what keeps that path working.
@@ -213,8 +214,6 @@ jobs:
       # same bytes the x86_64 job's guest reads.
       - name: chore test:images
         run: chore test:images
-      - name: chore test:scripts
-        run: chore test:scripts
 
   suite-in-vm:
     name: suite in the guest (the macOS path)

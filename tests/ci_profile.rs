@@ -1011,7 +1011,7 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
         "jobs.test-arm64 must run on GitHub's arm64 runner"
     );
     let arm_steps = steps_of(arm, "test-arm64");
-    for task in ["lint", "test:unit", "test:images", "test:scripts"] {
+    for task in ["lint", "test:unit", "test:images"] {
         assert!(
             runs_chore(arm_steps, task),
             "jobs.test-arm64 does not run `chore {task}`"
