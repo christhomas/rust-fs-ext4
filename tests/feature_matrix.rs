@@ -80,7 +80,7 @@ fn mount(path: &Path) -> fs_ext4::error::Result<Filesystem> {
 /// blocks, and only the bitmaps and descriptor free counts count clusters.
 /// With the refusal lifted this image failed with
 /// `BadChecksum { what: "block group descriptor" }`, which was taken for
-/// the misreading. It was a different defect: `mke2fs -t ext4` gives a
+/// the misreading. It was a different defect: `mke2fs -t ext4` gave this
 /// 16 MiB image 1 KiB blocks, bigalloc forces `s_first_data_block = 0`,
 /// and the descriptor table was located after `s_first_data_block` rather
 /// than after the superblock's block. Built with `-C 16384`, sixteen blocks
@@ -90,7 +90,12 @@ fn mount(path: &Path) -> fs_ext4::error::Result<Filesystem> {
 /// matrix entry.
 #[test]
 fn bigalloc_mounts_and_reads() {
-    let Some(img) = build("bigalloc", &["-t", "ext4", "-O", "bigalloc", "-C", "16384"]) else {
+    // `-b 1024` explicitly: whether a 16 MiB image gets 1 KiB blocks is the
+    // local mke2fs.conf's choice, and CI's does not make it.
+    let Some(img) = build(
+        "bigalloc",
+        &["-t", "ext4", "-b", "1024", "-O", "bigalloc", "-C", "16384"],
+    ) else {
         eprintln!("skip: mke2fs not available (apt/brew install e2fsprogs)");
         return;
     };
