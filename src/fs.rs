@@ -124,6 +124,13 @@ fn split_parent_and_base(path: &str) -> Result<(String, String)> {
         // Trailing slash on a non-dir path is POSIX ENOTDIR, not a generic arg error.
         return Err(Error::NotADirectory);
     }
+    // A `&str` can hold NUL, and the entry format would store it: names are
+    // counted bytes. The kernel never files one, because its names arrive
+    // as C strings, and e2fsck reports one as an illegal character. Every
+    // operation that files a name splits it here.
+    if base.contains('\0') {
+        return Err(Error::InvalidArgument("a name cannot contain a NUL byte"));
+    }
     Ok((parent.to_string(), base.to_string()))
 }
 
