@@ -120,15 +120,28 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
     let jinode = Inode::parse(&raw)?;
     let block_size = fs.sb.block_size() as u64;
 
+    // EVERY ENTRY IS RESOLVED BEFORE ANY IS WRITTEN. Checked inside the
+    // write loop, a bad destination was found after the entries before it
+    // were already on disk, and the mount failed over a filesystem it had
+    // half replayed (#150). A refusal is only free before the first write.
+    //
+    // Source: journal_block is a logical block inside the journal inode,
+    // resolved to a physical fs block via the extent tree. Destination:
+    // fs_block, bounds-checked against the filesystem and the device.
+    let resolved = plan
+        .writes
+        .iter()
+        .map(|w| {
+            let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
+                .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
+            Ok((byte_offset_of(fs, phys)?, byte_offset_of(fs, w.fs_block)?))
+        })
+        .collect::<Result<Vec<(u64, u64)>>>()?;
+
     let mut applied = 0usize;
-    for w in &plan.writes {
-        // Source: journal_block is a logical block inside the journal inode.
-        // Resolve to a physical fs block via the extent tree, then read one
-        // full block.
-        let phys = jbd2::journal_block_to_physical(fs, &jinode, w.journal_block)?
-            .ok_or(Error::Corrupt("journal_apply: journal block unmapped"))?;
+    for (w, &(source, destination)) in plan.writes.iter().zip(&resolved) {
         let mut buf = vec![0u8; block_size as usize];
-        fs.dev.read_at(byte_offset_of(fs, phys)?, &mut buf)?;
+        fs.dev.read_at(source, &mut buf)?;
 
         // If the ESCAPED flag is set, the first 4 bytes of the journal block
         // were zeroed during write to keep them from colliding with the
@@ -137,8 +150,7 @@ pub fn apply(fs: &Filesystem, plan: &ReplayPlan) -> Result<usize> {
             buf[0..4].copy_from_slice(&crate::jbd2::JBD2_MAGIC_NUMBER.to_be_bytes());
         }
 
-        // Destination: fs_block * block_size = byte offset on the device.
-        fs.dev.write_at(byte_offset_of(fs, w.fs_block)?, &buf)?;
+        fs.dev.write_at(destination, &buf)?;
         applied += 1;
     }
 
