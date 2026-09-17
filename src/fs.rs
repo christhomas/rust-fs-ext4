@@ -717,8 +717,9 @@ impl Filesystem {
     /// `i_dtime`. Returns the blocks freed, the `i_dtime` the member ends
     /// with, and whether the inode itself was freed; `None`, having touched
     /// nothing, for a member this cannot reclaim whole -- one that does not
-    /// parse, one whose blocks are mapped the legacy indirect way, or one
-    /// whose extent tree the truncate planner does not handle.
+    /// parse, one whose indirect tree cannot be read or points outside the
+    /// filesystem, or one whose extent tree the truncate planner does not
+    /// handle.
     fn buffer_recover_orphan(
         &self,
         buf: &mut BlockBuffer,
@@ -743,13 +744,45 @@ impl Filesystem {
             return Ok(Some((freed, 0, false)));
         }
 
-        // Free data blocks (extents path only — orphan recovery for
-        // legacy indirect inodes is a follow-up). An indirect inode that
-        // holds blocks is not reclaimed at all: freeing its inode without
-        // its blocks would strand them, allocated and named by nothing.
         let mut freed = 0u64;
+        // LEGACY INDIRECT: every ext2 and ext3 file. Its data blocks and
+        // the indirect blocks that map them are freed with it, as far as
+        // its size reaches -- the bound the kernel's truncate uses -- in
+        // this same transaction. This used to free the inode alone, which
+        // left all of those blocks allocated and named by nothing (#79).
         if !parsed.has_extents() && parsed.blocks > 0 {
-            return Ok(None);
+            let data_blocks = u32::try_from(parsed.size.div_ceil(bs as u64))
+                .map_err(|_| Error::Corrupt("orphan: indirect file too large to map"))?;
+            let Ok(tree) = crate::indirect_mut::collect_for_free(
+                &parsed.block,
+                bs,
+                data_blocks,
+                self.dev.as_ref(),
+            ) else {
+                return Ok(None);
+            };
+            let fs_blocks = self.sb.blocks_count;
+            let in_range = |start: u64, len: u64| {
+                start >= self.sb.first_data_block as u64
+                    && start.checked_add(len).is_some_and(|end| end <= fs_blocks)
+            };
+            // A pointer outside the filesystem is a corrupt tree; freeing
+            // around it would clear bits that belong to nothing. Leave the
+            // member whole, as for any member this cannot reclaim.
+            if !tree
+                .data_runs
+                .iter()
+                .all(|r| in_range(r.start, r.len as u64))
+                || !tree.indirect_blocks.iter().all(|&b| in_range(b, 1))
+            {
+                return Ok(None);
+            }
+            for run in &tree.data_runs {
+                freed += self.buffer_free_block_run_and_bgd(buf, run.start, run.len as u64)?;
+            }
+            for &block in &tree.indirect_blocks {
+                freed += self.buffer_free_block_run_and_bgd(buf, block, 1)?;
+            }
         }
         if parsed.has_extents() && parsed.size > 0 {
             let Ok((_sc, muts)) =
@@ -6226,6 +6259,95 @@ mod tests {
     /// more, so recovery really does delete it. Kept as the other half of
     /// the pair, so the fix for the truncate case cannot be a blanket
     /// "leave every orphan alone".
+    /// An ext2 orphan's data blocks and indirect blocks go back to the
+    /// free pool with it (#79).
+    ///
+    /// The file is 20 blocks at 4 KiB, so its tree has a single indirect
+    /// block beside the twelve direct pointers. Recovery used to free the
+    /// inode and none of its blocks, and since #201 declined such an
+    /// orphan altogether rather than strand them; either way the blocks
+    /// stayed allocated. After the fix the free count returns to what it
+    /// was before the file was written, and fsck finds nothing.
+    #[test]
+    fn an_indirect_mapped_orphan_frees_its_data_and_indirect_blocks() {
+        const EXT2_VOL: u64 = 32 * 1024 * 1024;
+        let dev = MemDev::new(EXT2_VOL);
+        crate::mkfs::format_filesystem_with_flavor(
+            dev.as_ref(),
+            Some("ext2orph"),
+            None,
+            EXT2_VOL,
+            BS,
+            crate::features::FsFlavor::Ext2,
+        )
+        .expect("format");
+        let (ino, free_before) = {
+            let fs = mount(&dev);
+            let free_before = fs.sb.free_blocks_count;
+            let ino = fs.apply_create("/gone.bin", 0o644).expect("create");
+            fs.apply_replace_file_content("/gone.bin", &vec![0x5A; 20 * BS as usize])
+                .expect("write");
+            let (inode, _) = fs.read_inode_verified(ino).expect("read");
+            assert!(!inode.has_extents(), "fixture: an indirect-mapped file");
+            assert_ne!(
+                u32::from_le_bytes(inode.block[48..52].try_into().unwrap()),
+                0,
+                "fixture: the file uses its single indirect block"
+            );
+            (ino, free_before)
+        };
+        {
+            let fs = mount(&dev);
+            let (root, _) = fs.read_inode_verified(2).expect("root");
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            fs.buffer_remove_dir_entry(&mut buf, 2, &root, b"gone.bin")
+                .expect("remove the name");
+            fs.commit_block_buffer(buf).expect("commit");
+            plant_orphan(&fs, ino, 0, None);
+        }
+        // Recovery runs on this mount; the next one observes the result.
+        drop(mount(&dev));
+
+        let fs = mount(&dev);
+        assert!(
+            fs.orphan_list().expect("orphan_list").is_empty(),
+            "recovery must take the orphan off the chain"
+        );
+        assert!(!fs.inode_bit_is_set(ino).expect("inode bitmap"));
+        assert_eq!(
+            fs.sb.free_blocks_count, free_before,
+            "every block the file used -- 20 data and 1 indirect -- must be free again"
+        );
+        let report = crate::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
+        assert!(report.is_clean(), "fsck: {:?}", report.anomalies);
+        drop(fs);
+
+        // And e2fsck, where it is installed: a block left allocated with
+        // nothing mapping it is exactly what its pass 5 reports.
+        if let Some(e2fsck) = ["/usr/sbin/e2fsck", "/sbin/e2fsck", "/usr/bin/e2fsck"]
+            .into_iter()
+            .find(|p| std::path::Path::new(p).exists())
+        {
+            let image = std::env::temp_dir().join(format!(
+                "fs_ext4_indirect_orphan_{}.img",
+                std::process::id()
+            ));
+            std::fs::write(&image, &*dev.bytes.lock().unwrap()).unwrap();
+            let out = std::process::Command::new(e2fsck)
+                .arg("-fn")
+                .arg(&image)
+                .output()
+                .expect("run e2fsck");
+            let _ = std::fs::remove_file(&image);
+            assert!(
+                out.status.success(),
+                "e2fsck -fn:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
+    }
+
     #[test]
     fn an_orphan_with_no_links_is_still_reclaimed() {
         let dev = formatted();
