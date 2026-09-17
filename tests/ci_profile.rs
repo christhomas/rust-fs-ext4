@@ -116,89 +116,75 @@ fn checking_debug_runs(script: &str) -> Vec<String> {
 /// next one: `-j4 -r` is release, `-pr` names a package `r`. Everything
 /// after `--` belongs to the test harness, where `-r` is not cargo's.
 fn selects_release_by_short_flag(command: &str) -> bool {
-    let words = shell_words(command);
-    let mut at = 0;
-    while at < words.len() {
-        // `cargo` by name or by path, then any `+toolchain`, then `test`.
-        let is_cargo = words[at] == "cargo" || words[at].ends_with("/cargo");
-        let mut next = at + 1;
-        while is_cargo && words.get(next).is_some_and(|w| w.starts_with('+')) {
-            next += 1;
-        }
-        if is_cargo && words.get(next) == Some(&"test") && release_in(&words[next + 1..]) {
-            return true;
-        }
-        at += 1;
-    }
-    false
+    shell_commands(command).iter().any(|command| {
+        let words: Vec<&str> = command.iter().map(String::as_str).collect();
+        (0..words.len()).any(|at| {
+            // `cargo` by name or by path, then any `+toolchain`, then `test`.
+            let is_cargo = words[at] == "cargo" || words[at].ends_with("/cargo");
+            let mut next = at + 1;
+            while is_cargo && words.get(next).is_some_and(|w| w.starts_with('+')) {
+                next += 1;
+            }
+            is_cargo && words.get(next) == Some(&"test") && release_in(&words[next + 1..])
+        })
+    })
 }
 
-/// `command` split into words, with the shell's control operators -- `&&`,
-/// `||`, `;`, `|` and `&` -- as words of their own whether or not spaces
-/// surround them: `true&&cargo test -r` is a `cargo test` run, and in
-/// `cargo test --lib&&rm -rf build` the `-rf` is `rm`'s. An `&` or `|`
-/// straight after `>` or `<` is part of a redirection (`2>&1`, `>|`).
+/// `command` split into the commands the shell's control operators --
+/// `&&`, `||`, `;`, `|` and `&` -- separate, each as its words, with
+/// quotes and backslashes removed as the shell removes them.
+///
+/// Operators need no spaces: `true&&cargo test -r` is a `cargo test` run,
+/// and in `cargo test --lib&&rm -rf build` the `-rf` is `rm`'s. An `&` or
+/// `|` straight after `>` or `<` is part of a redirection (`2>&1`, `>|`).
 /// Inside quotes, or after a backslash, nothing is an operator or a word
-/// break: `--features 'a;b' -r` is one command. The quotes stay in the
-/// word, which only has to be told apart from an option.
-fn shell_words(command: &str) -> Vec<&str> {
-    let bytes = command.as_bytes();
-    let mut words = Vec::new();
-    let mut word_start = None;
-    let mut quote = None;
-    let mut at = 0;
-    while at < bytes.len() {
-        let byte = bytes[at];
-        if let Some(open) = quote {
-            if byte == open {
-                quote = None;
-            } else if byte == b'\\' && open == b'"' {
-                at += 1;
+/// break, and what the quotes held is the word: `--features 'a;b' -r` is
+/// one command, and `'-r'` is `-r`.
+fn shell_commands(command: &str) -> Vec<Vec<String>> {
+    let mut commands = vec![Vec::new()];
+    let mut word: Option<String> = None;
+    let mut chars = command.chars().peekable();
+    let mut previous = None;
+    while let Some(c) = chars.next() {
+        match c {
+            '\'' => {
+                let word = word.get_or_insert_with(String::new);
+                word.extend(chars.by_ref().take_while(|&q| q != '\''));
             }
-            at += 1;
-            continue;
-        }
-        if matches!(byte, b'\'' | b'"' | b'\\') {
-            word_start.get_or_insert(at);
-            if byte == b'\\' {
-                at += 1;
-            } else {
-                quote = Some(byte);
+            '"' => {
+                let word = word.get_or_insert_with(String::new);
+                while let Some(q) = chars.next() {
+                    match q {
+                        '"' => break,
+                        '\\' if matches!(chars.peek(), Some('"' | '\\' | '$' | '`')) => {
+                            word.extend(chars.next());
+                        }
+                        _ => word.push(q),
+                    }
+                }
             }
-            at += 1;
-            continue;
+            '\\' => word.get_or_insert_with(String::new).extend(chars.next()),
+            ';' | '&' | '|' if !matches!(previous, Some('>' | '<')) => {
+                if c != ';' && chars.peek() == Some(&c) {
+                    chars.next();
+                }
+                commands.last_mut().unwrap().extend(word.take());
+                commands.push(Vec::new());
+            }
+            c if c.is_whitespace() => commands.last_mut().unwrap().extend(word.take()),
+            c => word.get_or_insert_with(String::new).push(c),
         }
-        let operator_len = match byte {
-            b';' => 1,
-            b'&' | b'|' if at > 0 && matches!(bytes[at - 1], b'>' | b'<') => 0,
-            b'&' | b'|' if bytes.get(at + 1) == Some(&byte) => 2,
-            b'&' | b'|' => 1,
-            _ => 0,
-        };
-        if operator_len == 0 && !byte.is_ascii_whitespace() {
-            word_start.get_or_insert(at);
-            at += 1;
-            continue;
-        }
-        if let Some(start) = word_start.take() {
-            words.push(&command[start..at]);
-        }
-        if operator_len > 0 {
-            words.push(&command[at..at + operator_len]);
-        }
-        at += operator_len.max(1);
+        previous = Some(c);
     }
-    if let Some(start) = word_start {
-        words.push(&command[start..]);
-    }
-    words
+    commands.last_mut().unwrap().extend(word.take());
+    commands
 }
 
 /// Whether `cargo test`'s `arguments`, up to the end of its own command,
 /// carry `-r`. See [`selects_release_by_short_flag`].
 ///
-/// A shell separator ends the command: `cargo test --lib && rm -rf build`
-/// is a debug run, and the `r` in `-rf` belongs to `rm`.
+/// `arguments` are one command's words ([`shell_commands`]), so in
+/// `cargo test --lib && rm -rf build` the `r` in `-rf` is not among them.
 fn release_in(arguments: &[&str]) -> bool {
     const LONG_OPTIONS_TAKING_A_VALUE: [&str; 15] = [
         "--package",
@@ -219,9 +205,6 @@ fn release_in(arguments: &[&str]) -> bool {
     ];
     let mut next_is_a_value = false;
     for &argument in arguments {
-        if matches!(argument, "&&" | "||" | ";" | "|" | "&") {
-            return false;
-        }
         if std::mem::take(&mut next_is_a_value) {
             continue;
         }
@@ -1155,6 +1138,9 @@ mod parser {
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features 'a;b' -r",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features \"a&&b\" -r",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features a\\;b -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked '-r'",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked \"-qr\"",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked \\-r",
         ] {
             assert_eq!(
                 checking_debug_runs(line),
@@ -1173,6 +1159,8 @@ mod parser {
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib&&rm -rf build",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib;echo -r",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib|tee -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -- '-r'",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib && echo 'cargo test -r'",
         ] {
             assert_eq!(
                 checking_debug_runs(line).len(),
