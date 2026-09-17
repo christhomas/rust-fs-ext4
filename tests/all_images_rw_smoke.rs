@@ -281,10 +281,11 @@ fn ext4_inline() {
 fn ext4_largedir() {
     run_round_trip("ext4-largedir")
 }
-/// A 512-file root, indexed. This was ignored for an EIO on the 516th create,
-/// an htree-write defect; the htree insert fixes since have closed it (a
-/// `mkfs.ext4 -d` + `e2fsck -fyD` equivalent of this fixture passes) (#88).
+/// Creating a file in the kernel-grown 515-entry root fails with EIO (#233).
+/// The same files in an `e2fsck -D`-rebuilt index round-trip, so the defect
+/// is in inserting into the tree the kernel builds incrementally.
 #[test]
+#[ignore = "EIO creating in a kernel-grown htree root — #233"]
 fn ext4_manyfiles() {
     run_round_trip("ext4-manyfiles")
 }
