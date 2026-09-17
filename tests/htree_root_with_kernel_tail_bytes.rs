@@ -42,9 +42,9 @@ fn e2fsck_clean(image: &str, what: &str) {
     );
 }
 
-#[test]
-fn a_root_whose_dx_tail_looks_like_a_dirent_tail_takes_creates_and_unlinks() {
-    let root = fs_ext4_test_support::temp_path!("fs_ext4_233_tree_{}", std::process::id());
+/// An image with a 512-entry root that `e2fsck -D` indexed, and its path.
+fn indexed_root(tag: &str) -> (String, String) {
+    let root = fs_ext4_test_support::temp_path!("fs_ext4_233_{}_{}", tag, std::process::id());
     std::fs::create_dir_all(&root).unwrap();
     for i in 1..=512 {
         std::fs::write(format!("{root}/file_{i}.txt"), format!("f{i:04}\n")).unwrap();
@@ -81,6 +81,12 @@ fn a_root_whose_dx_tail_looks_like_a_dirent_tail_takes_creates_and_unlinks() {
         "{}",
         String::from_utf8_lossy(&index.stdout)
     );
+    (root, image)
+}
+
+#[test]
+fn a_root_whose_dx_tail_looks_like_a_dirent_tail_takes_creates_and_unlinks() {
+    let (root, image) = indexed_root("tail");
 
     // The kernel's bytes in dt_reserved, with the index checksum restamped.
     {
@@ -119,6 +125,38 @@ fn a_root_whose_dx_tail_looks_like_a_dirent_tail_takes_creates_and_unlinks() {
         .expect("unlink a file the index already held");
     drop(fs);
     e2fsck_clean(&image, "after create and unlinks");
+    let _ = std::fs::remove_dir_all(&root);
+    let _ = std::fs::remove_file(&image);
+}
+
+/// A leaf whose first record is an empty entry spanning the block, with no
+/// dirent tail, has the shape of an htree node. A leaf emptied on a volume
+/// without checksums looks like this, and so does one written before
+/// `metadata_csum` was enabled. The kernel does not verify a node-shaped
+/// block that a linear scan reads (`__ext4_read_dirblock` with
+/// `DIRENT`), so a create's existence scan must not refuse it as a bad
+/// index block (CodeRabbit on #256).
+#[test]
+fn a_node_shaped_leaf_does_not_stop_a_create() {
+    let (root, image) = indexed_root("leaf");
+    {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+        let (dir, _) = fs.read_inode_verified(2).unwrap();
+        // Block 0 is the root; the last block is a leaf, never a node, in a
+        // one-level index of 512 names.
+        let last = dir.size / u64::from(fs.sb.block_size()) - 1;
+        let phys = fs.map_inode_logical(&dir, last).unwrap().unwrap();
+        let mut block = vec![0u8; fs.sb.block_size() as usize];
+        let len = block.len() as u16;
+        block[4..6].copy_from_slice(&len.to_le_bytes());
+        fs.dev
+            .write_at(phys * u64::from(fs.sb.block_size()), &block)
+            .unwrap();
+    }
+    let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+    fs.apply_create("/after_the_empty_leaf.txt", 0o644)
+        .expect("create past a node-shaped leaf");
+    drop(fs);
     let _ = std::fs::remove_dir_all(&root);
     let _ = std::fs::remove_file(&image);
 }
