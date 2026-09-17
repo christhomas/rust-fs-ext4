@@ -75,9 +75,11 @@ xorriso -as mkisofs \
 # ---------------------------------------------------------------------------
 TEST_IMG_DIR="${TEST_IMG_DIR:-$CRATE_DIR/test-disks}"
 DRIVE_ARGS=()
+IMAGE_NAMES=()  # in attach order, which is the guest's vdb, vdc, ...
 LETTER_IDX=1  # vda is the boot disk; secondary disks start at vdb
 for img in "$TEST_IMG_DIR"/*.img; do
     [ -f "$img" ] || continue
+    IMAGE_NAMES+=("$(basename "$img" .img)")
     DRIVE_ARGS+=(-drive "file=${img},if=none,format=raw,id=img${LETTER_IDX}")
     DRIVE_ARGS+=(-device "virtio-blk-pci,drive=img${LETTER_IDX}")
     LETTER_IDX=$((LETTER_IDX + 1))
@@ -116,32 +118,12 @@ qemu-system-aarch64 \
 # ---------------------------------------------------------------------------
 # Step 5: parse the serial log, extract per-image manifests.
 # ---------------------------------------------------------------------------
-if ! grep -q '\[manifest:end\]' "$SERIAL_LOG"; then
-    echo "[qemu-fbsd] FAIL: cloud-init didn't reach manifest:end. Tail of serial log:"
-    tail -40 "$SERIAL_LOG"
-    exit 1
-fi
-
+# Every attached image must be accounted for: a manifest with files, or
+# a refusal on FREEBSD_EXPECTED_REFUSALS. See check-manifests.sh.
 MANIFEST_DIR="$WORK_DIR/manifests"
-mkdir -p "$MANIFEST_DIR"
-echo "[qemu-fbsd] manifests:"
-awk '
-    /^\[manifest:disk:.*:begin\]$/ {
-        match($0, /disk:[^:]+/)
-        name = substr($0, RSTART+5, RLENGTH-5)
-        out = "'"$MANIFEST_DIR"'/" name ".manifest"
-        in_manifest = 1
-        next
-    }
-    /^\[manifest:disk:.*:end:/ {
-        in_manifest = 0
-        match($0, /:end:[^]]+/)
-        status = substr($0, RSTART+5, RLENGTH-5)
-        printf "  %s -> %s (%s)\n", name, out, status
-        next
-    }
-    in_manifest { print > out }
-' "$SERIAL_LOG"
+# (the expansion is guarded: bash 3.2, the macOS host this runs on, calls
+# an empty array unbound under `set -u`.)
+"$SCRIPT_DIR/check-manifests.sh" "$SERIAL_LOG" "$MANIFEST_DIR" ${IMAGE_NAMES[@]+"${IMAGE_NAMES[@]}"}
 
 echo "[qemu-fbsd] DONE. Per-image manifests in $MANIFEST_DIR/"
 echo "[qemu-fbsd] Diff harness (compare against fs-ext4 mount) is future work —"
