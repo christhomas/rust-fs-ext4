@@ -240,7 +240,13 @@ fn find_entry_htree(
         Ok(buf)
     };
 
-    let leaf_logical = match htree::lookup_leaf(name, &root_block, &sb.hash_seed, read_dx_block)? {
+    let leaf_logical = match htree::lookup_leaf_with(
+        name,
+        &root_block,
+        &sb.hash_seed,
+        sb.unsigned_hash(),
+        read_dx_block,
+    )? {
         Some(b) => b,
         None => return Ok(None),
     };

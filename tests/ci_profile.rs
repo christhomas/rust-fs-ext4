@@ -679,17 +679,15 @@ jobs:
         );
     }
 
-    /// `pull_request_target` IS A PULL-REQUEST TRIGGER, so the
-    /// substring match in `runs_on_pull_request` counting it is
-    /// deliberate rather than sloppy.
+    /// `pull_request_target` ALONE IS NOT A PULL-REQUEST GATE, and
+    /// `runs_on_pull_request` does not count it: it compares each
+    /// parsed trigger name against `pull_request` and nothing else.
     ///
-    /// Pinned because it reads like a bug and was mistaken for one
-    /// while witnessing this fix: a mutation replacing `pull_request:`
-    /// with `pull_request_target:` left the guard green and looked
-    /// like a survivor. It is not -- such a workflow still runs on
-    /// pull requests, in the base-repository context, and can still be
-    /// a required check. The defeat that matters is the trigger going
-    /// away, which the test above covers by removing it.
+    /// Such a workflow runs in the base repository's context and checks
+    /// out the base ref by default, so it may never build the
+    /// contributor's code (#149). Replacing `pull_request:` with
+    /// `pull_request_target:` is a defeat of the gate, and this test is
+    /// what kills that mutation.
     #[test]
     fn a_pull_request_target_trigger_alone_does_not_gate() {
         let yaml = GATING.replace("  pull_request:\n", "  pull_request_target:\n");
@@ -839,8 +837,8 @@ jobs:
     /// pull request opening or being pushed to, so a step under it
     /// cannot be what gates the pull request.
     ///
-    /// This is why the check matches whole names and lists
-    /// `pull_request_target` explicitly rather than matching a prefix.
+    /// This is why the check compares whole trigger names rather than
+    /// matching a prefix.
     #[test]
     fn a_similarly_named_trigger_does_not_gate() {
         for trigger in [
@@ -852,7 +850,7 @@ jobs:
             assert_ne!(yaml, GATING, "the mutation must actually apply");
             assert!(
                 gating(&yaml).is_empty(),
-                "`{trigger}` is not `pull_request`, and a substring match said it was"
+                "`{trigger}` is not `pull_request`, so it must not be counted as one"
             );
         }
     }
