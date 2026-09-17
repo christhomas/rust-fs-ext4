@@ -655,15 +655,24 @@ impl Filesystem {
             if let Some((ino, dtime)) = unstamped.take() {
                 self.buffer_stamp_dtime(&mut buf, ino, dtime)?;
             }
-            let freed = self.buffer_recover_orphan(&mut buf, orphan_ino, next)?;
-            if let Some((blocks, final_dtime, deleted)) = freed {
-                self.buffer_patch_sb_counters(&mut buf, blocks as i64, i32::from(deleted))?;
-                reclaimed += usize::from(deleted);
-                if next == 0 {
-                    self.buffer_stamp_dtime(&mut buf, orphan_ino, final_dtime)?;
-                } else {
-                    unstamped = Some((orphan_ino, final_dtime));
-                }
+            let Some((blocks, final_dtime, deleted)) =
+                self.buffer_recover_orphan(&mut buf, orphan_ino, next)?
+            else {
+                // AN ORPHAN THIS CANNOT RECLAIM STAYS AT THE HEAD (CodeRabbit
+                // on #201). Its inode and blocks are left untouched and the
+                // chain is not advanced past it, so nothing is freed without
+                // its blocks and nothing leaves the chain still holding them;
+                // the members behind it wait with it. Only the previous
+                // member's pending `i_dtime` is written.
+                self.commit_block_buffer(buf)?;
+                break;
+            };
+            self.buffer_patch_sb_counters(&mut buf, blocks as i64, i32::from(deleted))?;
+            reclaimed += usize::from(deleted);
+            if next == 0 {
+                self.buffer_stamp_dtime(&mut buf, orphan_ino, final_dtime)?;
+            } else {
+                unstamped = Some((orphan_ino, final_dtime));
             }
             self.buffer_patch_sb_last_orphan(&mut buf, next)?;
             self.commit_block_buffer(buf)?;
@@ -689,8 +698,10 @@ impl Filesystem {
 
     /// Reclaim one chain member into `buf`, leaving `link` in its
     /// `i_dtime`. Returns the blocks freed, the `i_dtime` the member ends
-    /// with, and whether the inode itself was freed; `None` for a member
-    /// that could not be parsed, which is skipped and leaked.
+    /// with, and whether the inode itself was freed; `None`, having touched
+    /// nothing, for a member this cannot reclaim whole -- one that does not
+    /// parse, one whose blocks are mapped the legacy indirect way, or one
+    /// whose extent tree the truncate planner does not handle.
     fn buffer_recover_orphan(
         &self,
         buf: &mut BlockBuffer,
@@ -716,8 +727,13 @@ impl Filesystem {
         }
 
         // Free data blocks (extents path only — orphan recovery for
-        // legacy indirect inodes is a follow-up).
+        // legacy indirect inodes is a follow-up). An indirect inode that
+        // holds blocks is not reclaimed at all: freeing its inode without
+        // its blocks would strand them, allocated and named by nothing.
         let mut freed = 0u64;
+        if !parsed.has_extents() && parsed.blocks > 0 {
+            return Ok(None);
+        }
         if parsed.has_extents() && parsed.size > 0 {
             let Ok((_sc, muts)) =
                 crate::file_mut::plan_truncate_shrink(parsed.size, 0, &parsed.block, bs)
@@ -6013,6 +6029,56 @@ mod tests {
             }
         }
         assert!(total.unwrap_or(0) > 2, "recovery must span several writes");
+    }
+
+    /// An orphan whose blocks this cannot reclaim -- mapped the legacy
+    /// indirect way, as every ext3 file is -- is left whole and at the head
+    /// of the chain (CodeRabbit on #201). Freeing its inode without its
+    /// blocks, and moving the head past it, left the blocks allocated and
+    /// named by nothing, for good.
+    #[test]
+    fn an_orphan_whose_blocks_cannot_be_reclaimed_stays_whole_at_the_head() {
+        let dev = formatted();
+        let ino = {
+            let fs = mount(&dev);
+            let ino = fs.apply_create("/gone.txt", 0o644).expect("create");
+            fs.apply_pwrite("/gone.txt", 0, &[0xAB; 3 * BS as usize])
+                .expect("write");
+            ino
+        };
+        {
+            let fs = mount(&dev);
+            let (root, _) = fs.read_inode_verified(2).expect("root");
+            let mut buf = BlockBuffer::new(fs.sb.block_size());
+            fs.buffer_remove_dir_entry(&mut buf, 2, &root, b"gone.txt")
+                .expect("remove the name");
+            // Mapped the legacy way, as far as recovery can tell: the
+            // driver cannot write an indirect file to make one.
+            let (inode, mut raw) = fs.read_inode_verified(ino).expect("read");
+            let flags = inode.flags & !crate::inode::InodeFlags::EXTENTS.bits();
+            raw[0x20..0x24].copy_from_slice(&flags.to_le_bytes());
+            fs.finalize_inode_raw(ino, inode.generation, &mut raw)
+                .expect("finalize");
+            fs.buffer_write_inode(&mut buf, ino, &raw)
+                .expect("write inode");
+            fs.commit_block_buffer(buf).expect("commit");
+            plant_orphan(&fs, ino, 0, None);
+            let (inode, _) = fs.read_inode_verified(ino).expect("read");
+            assert!(
+                !inode.has_extents() && inode.blocks > 0,
+                "fixture: a non-extent orphan holding blocks"
+            );
+        }
+        // This mount runs recovery; the next one observes what it left.
+        drop(mount(&dev));
+        let fs = mount(&dev);
+        assert_eq!(fs.sb.last_orphan, ino, "the orphan left the chain");
+        assert!(
+            fs.inode_bit_is_set(ino).expect("bitmap"),
+            "the orphan's inode was freed without its blocks"
+        );
+        let (inode, _) = fs.read_inode_verified(ino).expect("read");
+        assert!(inode.blocks > 0, "the orphan's body was zeroed");
     }
 
     fn resolve_ino(fs: &Filesystem, path: &str) -> u32 {
