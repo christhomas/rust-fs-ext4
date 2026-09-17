@@ -12,7 +12,7 @@ Each pass is one entry, newest first. An entry names:
 - each finding with its issue;
 - what it didn't reach, so the next pass knows where to start.
 
-## 2026-09-17: file data and extent-tree paths
+## 2026-09-17: file data, extent-tree and xattr-block paths
 
 Read at `b7395bc` (#70).
 
@@ -25,13 +25,15 @@ Read at `b7395bc` (#70).
 | `apply_truncate_shrink`, `file_mut::plan_truncate_shrink` | none found: extents past EOF are freed, and deeper trees are refused |
 | `apply_truncate_grow` | none found |
 | `extent_mut::plan_insert_extent`, `plan_insert_extent_deep` | none found: both refuse an overlap |
+| `apply_setxattr`, `apply_removexattr` (external block), and the xattr block on unlink, rmdir, rename-over and orphan release | #245 |
 
 **Findings:**
 - **#240.** `map_logical` answers `None` for an uninitialized extent, so reads see zeros. `apply_pwrite` took that for a hole, and a write into preallocated space was refused as a corrupt extent tree on a valid volume. Reproduced with `mkfs.ext4`.
 - **#242.** Freeing a file read its blocks from `i_size`, not from its tree: an empty file's `KEEP_SIZE` preallocation was dropped from the tree and left allocated. Freeing also took the leaf extents for the whole tree, so a deep tree's node blocks leaked on punch-hole and rmdir, and unlink of such a file was refused. Reproduced; `e2fsck -fn` rejected each result.
+- **#245.** An external xattr block was read as the inode's own, but the kernel shares one block among inodes with identical attributes (`h_refcount`). Setting an attribute rewrote the shared block and reset its count to one, removing the last one freed a block others still used, and unlinking never released the block at all. Reproduced on a shared block built as the kernel leaves it.
 
 **Not reached, for the next pass:**
-- `src/xattr.rs`, `src/ea_inode.rs`;
+- `src/xattr.rs`'s in-inode region edits, `src/ea_inode.rs`;
 - `src/htree_mut.rs` and directory entry edits beyond rmdir;
 - `src/indirect_mut.rs` (ext2/ext3 block maps);
 - `src/inline_data.rs`;
