@@ -38,11 +38,28 @@ HOLDER="$LOCK/holder"
 # THERE IS NO "BREAKING POINT" ANY MORE. A second timeout used to take
 # the slot from anyone holding it past 90 minutes regardless of whether
 # their VM was up, which is how a live machine lost its slot to a waiter
-# that then booted a second one. Waiting for a live holder is unbounded
-# on purpose: `--force` is the way out, and it is a person's decision
+# that then booted a second one. No timer takes the slot from a live
+# holder: `--force` is the way to do that, and it is a person's decision
 # rather than a timer's. `AM_ORACLE_VM_STALE` is gone with it — a knob
 # that silently does nothing is worse than no knob.
+#
+# The WAIT is still bounded, by this. A waiter gives up after
+# `WAIT_SECS`, and that is what turns a stuck slot into a message naming
+# the remedy rather than a `vm.sh up` that hangs for ever (#134). Giving
+# up takes nothing from the holder.
 WAIT_SECS="${AM_ORACLE_VM_WAIT:-3600}"
+
+# How long a lock with no complete holder record is taken to be a holder
+# still writing it, measured from the lock directory's own creation.
+#
+# `cmd_acquire` writes the record straight after its `mkdir`, so a young
+# lock without one is mid-write, and an old one belongs to a process that
+# died between the two steps. This was a fixed `sleep 1`, which a creator
+# delayed past one second -- a fork of `date` on a machine running two
+# 4 GB VMs -- lost its live lock to (#127). Measuring the lock's age
+# rather than the waiter's patience does not depend on who is scheduled
+# first.
+RECORD_GRACE_SECS="${AM_ORACLE_VM_RECORD_GRACE:-30}"
 
 # How long a freshly taken slot is trusted before the "is a VM actually
 # running" test is allowed to break it.
@@ -68,6 +85,16 @@ VAGRANT_DIR="$REPO/tests/vagrant"
 
 now() { date +%s; }
 
+# Seconds since the lock directory was created (or last had an entry
+# added, which only makes it look younger), or failure if it is gone.
+# GNU `stat -c`, then BSD `stat -f`: the script runs on Linux and macOS.
+lock_age() {
+    local mtime
+    mtime="$(stat -c %Y "$LOCK" 2>/dev/null || stat -f %m "$LOCK" 2>/dev/null)" || return 1
+    [ -n "$mtime" ] || return 1
+    echo $(( $(now) - mtime ))
+}
+
 # The holder record, or empty if the slot is free.
 #   vagrant_dir<TAB>repo<TAB>epoch
 #
@@ -87,7 +114,7 @@ now() { date +%s; }
 # took the slot. Three things then went wrong at once, all downstream of
 # this returning 0:
 #
-#   * the `sleep 1` in `cmd_acquire` exists precisely to let a holder
+#   * the grace in `cmd_acquire` exists precisely to let a holder
 #     finish that write, and it is guarded by this failing. It never
 #     fired.
 #   * `holder_field 3` was empty, so `${since:-0}` made the age
@@ -323,11 +350,20 @@ cmd_acquire() {
 
         # Somebody holds it. Decide whether they still exist.
         if ! read_holder >/dev/null 2>&1; then
-            # The directory exists with no holder file: a process died
-            # between the two steps. Give it a moment in case it is
-            # simply mid-write, then take it.
-            sleep 1
-            read_holder >/dev/null 2>&1 || { break_lock "no holder recorded" ""; continue; }
+            # No complete record. A lock younger than the grace is a
+            # holder mid-write: wait for it, however long the scheduler
+            # keeps it. An older one belongs to a process that died
+            # between `mkdir` and the write: take it.
+            local lock_secs
+            if ! lock_secs="$(lock_age)"; then
+                continue # the lock went away; try for it
+            fi
+            if [ "$lock_secs" -lt "$RECORD_GRACE_SECS" ]; then
+                sleep 1
+                continue
+            fi
+            break_lock "no holder recorded" ""
+            continue
         fi
 
         local since age token

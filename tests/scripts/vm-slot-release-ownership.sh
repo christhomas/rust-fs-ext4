@@ -37,6 +37,40 @@ OTHER="$sandbox/some/other/repo/tests/vagrant"
 
 release() { "$REPO/scripts/vm-slot.sh" release >/dev/null 2>&1; }
 
+# A lock with no complete record counts as mid-write for this long. Short
+# here, so the cases that expect a reclaim do not wait out the default.
+export AM_ORACLE_VM_RECORD_GRACE=3
+
+# A `sleep` that leaves a marker when the waiter enters its grace -- its
+# only one-second sleep -- so a test holder can complete its record at a
+# known point in the waiter's loop rather than after a guessed delay
+# (#129). The poll sleep (5) passes straight through.
+mkdir -p "$sandbox/bin"
+real_sleep="$(command -v sleep)"
+cat > "$sandbox/bin/sleep" <<STUB
+#!/usr/bin/env bash
+[ "\$1" = 1 ] && : > "$sandbox/in-grace"
+exec "$real_sleep" "\$@"
+STUB
+chmod +x "$sandbox/bin/sleep"
+GRACE_PATH="$sandbox/bin:$PATH"
+
+# Complete the holder record once the waiter is inside its grace, after
+# `delay` more seconds -- longer than the one second the grace used to be.
+complete_in_grace() {
+    local delay="$1"
+    rm -f "$sandbox/in-grace"
+    (
+        for _ in $(seq 1 100); do
+            [ -e "$sandbox/in-grace" ] && break
+            "$real_sleep" 0.05
+        done
+        "$real_sleep" "$delay"
+        printf '%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(date +%s)" > "$LOCK/holder"
+    ) &
+    completer=$!
+}
+
 # Lay down a lock; with a holder file when one is given, without when
 # not — the second being the ordinary state of `cmd_acquire` between its
 # `mkdir` and the `printf` that records who took it.
@@ -121,14 +155,15 @@ fi
 #    slot. (`release`'s exit status carries no signal, as the header
 #    says; `acquire`'s is the whole answer, which is why case 5 uses it
 #    too.)
+#
+#    SEQUENCED BY A SIGNAL, NOT A SLEEP (#129). The record is completed
+#    after the waiter has entered its grace, and 1.5 seconds later: past
+#    the one second the grace used to be, which a creator on a loaded
+#    machine could need (#127), and inside the lock-age grace.
 set_lock
 : > "$LOCK/holder"                   # the mid-write state, exactly
-(
-    sleep 0.3
-    printf '%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(date +%s)" > "$LOCK/holder"
-) &
-completer=$!
-if AM_ORACLE_VM_WAIT=6 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+complete_in_grace 1.5
+if PATH="$GRACE_PATH" AM_ORACLE_VM_WAIT=6 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
     printf 'FAIL  a waiter took the slot from a holder that was mid-write\n'
     fails=$((fails + 1))
 else
@@ -205,12 +240,8 @@ fi
 for bad in '123' '/d\tr\t1\tt\textra'; do
     set_lock
     printf "$bad\n" > "$LOCK/holder"
-    (
-        sleep 0.3
-        printf '%s\t%s\t%s\n' "$OTHER" "holder-repo" "$(date +%s)" > "$LOCK/holder"
-    ) &
-    completer=$!
-    if AM_ORACLE_VM_WAIT=6 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
+    complete_in_grace 0.2
+    if PATH="$GRACE_PATH" AM_ORACLE_VM_WAIT=6 "$REPO/scripts/vm-slot.sh" acquire >/dev/null 2>&1; then
         printf 'FAIL  a waiter took the slot after reading %s as a record\n' "$bad"
         fails=$((fails + 1))
     else
