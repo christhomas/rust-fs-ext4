@@ -4602,6 +4602,24 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Whether logical block `logical` of directory `dir` is an htree index
+    /// block (the dx_root, or a dx_node) rather than a block of entries.
+    ///
+    /// The kernel's rule in `__ext4_read_dirblock`: in an indexed directory,
+    /// block 0 is the root, and a block whose first record is an empty entry
+    /// spanning the whole block is a node. Nothing at the END of the block
+    /// decides it. A kernel-grown dx_root keeps the bytes of the dirent tail
+    /// the directory had before it was indexed, so it ends in what looks
+    /// exactly like one (#233).
+    fn is_htree_index_block(dir: &Inode, logical: u64, block: &[u8]) -> bool {
+        if dir.flags & crate::inode::InodeFlags::INDEX.bits() == 0 || block.len() < 8 {
+            return false;
+        }
+        let first_inode = u32::from_le_bytes(block[0..4].try_into().unwrap());
+        let first_len = u16::from_le_bytes(block[4..6].try_into().unwrap()) as usize;
+        logical == 0 || (first_inode == 0 && first_len == block.len())
+    }
+
     /// Refuse a directory block whose tail checksum does not verify, before
     /// anything reads entries out of it.
     ///
@@ -4621,24 +4639,6 @@ impl Filesystem {
     /// Same predicate as `dir::parse_block_verified` (`dir.rs`), deliberately:
     /// `csum.enabled` AND a recognisable tail. A volume without the feature,
     /// and a block predating the tail, are both parsed exactly as before.
-    /// Whether logical block `logical` of directory `dir` is an htree index
-    /// block (the dx_root, or a dx_node) rather than a block of entries.
-    ///
-    /// The kernel's rule in `__ext4_read_dirblock`: in an indexed directory,
-    /// block 0 is the root, and a block whose first record is an empty entry
-    /// spanning the whole block is a node. Nothing at the END of the block
-    /// decides it. A kernel-grown dx_root keeps the bytes of the dirent tail
-    /// the directory had before it was indexed, so it ends in what looks
-    /// exactly like one (#233).
-    fn is_htree_index_block(dir: &Inode, logical: u64, block: &[u8]) -> bool {
-        if dir.flags & crate::inode::InodeFlags::INDEX.bits() == 0 || block.len() < 8 {
-            return false;
-        }
-        let first_inode = u32::from_le_bytes(block[0..4].try_into().unwrap());
-        let first_len = u16::from_le_bytes(block[4..6].try_into().unwrap()) as usize;
-        logical == 0 || (first_inode == 0 && first_len == block.len())
-    }
-
     fn refuse_unverified_dir_block(
         &self,
         ino: u32,
@@ -4656,7 +4656,17 @@ impl Filesystem {
         // exactly like a dirent tail, whose "checksum" is the index's. Every
         // create in such a directory was refused as a bad directory block.
         if Self::is_htree_index_block(dir, logical, block) {
-            return self.check_dx_block(ino, dir, block, logical == 0);
+            // Only the root is verified as an index here. A node is known by
+            // its shape alone, and a leaf with no dirent tail whose first
+            // record is an empty entry spanning the block has the same shape,
+            // so the kernel does not verify a node-shaped block a linear scan
+            // reads either (`__ext4_read_dirblock` with `DIRENT`). The
+            // htree walk verifies real nodes as it descends (CodeRabbit on
+            // #256).
+            if logical == 0 {
+                return self.check_dx_block(ino, dir, block, true);
+            }
+            return Ok(());
         }
         if self.csum.enabled
             && crate::dir::has_csum_tail(block)
