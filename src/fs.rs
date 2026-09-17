@@ -3270,25 +3270,12 @@ impl Filesystem {
         if target_inode.has_extents() {
             let runs = self.extent_tree_runs(&target_inode.block)?;
             freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
-        } else if !target_inode.has_extents() && Self::holds_block_map(&target_inode, bs) {
+        } else {
             // A BLOCK-MAPPED FILE HAS BLOCKS TOO. Only extents were freed,
             // so every ext2/ext3-style file left its data and indirect
             // blocks allocated with nothing pointing at them.
-            let freed = crate::indirect_mut::collect_for_free(
-                &target_inode.block,
-                bs,
-                target_inode.size.div_ceil(bs as u64) as u32,
-                self.dev.as_ref(),
-            )?;
-            for run in &freed.data_runs {
-                freed_sectors +=
-                    self.buffer_free_block_run_and_bgd(&mut buf, run.start, run.len as u64)?
-                        * sectors_per_block;
-            }
-            for &iblk in &freed.indirect_blocks {
-                freed_sectors +=
-                    self.buffer_free_block_run_and_bgd(&mut buf, iblk, 1)? * sectors_per_block;
-            }
+            freed_sectors +=
+                self.buffer_free_block_map(&mut buf, &target_inode)? * sectors_per_block;
         }
 
         // The xattr block goes with the inode, or loses one reference if
@@ -3941,6 +3928,30 @@ impl Filesystem {
         };
         inode.flags & crate::inode::InodeFlags::INLINE_DATA.bits() == 0
             && inode.blocks > xattr_sectors
+    }
+
+    /// Free every data and indirect block a block-mapped inode holds,
+    /// staged in `buf`. Returns the blocks freed. Does nothing for an inode
+    /// whose `i_block` holds no pointers ([`Self::holds_block_map`]).
+    fn buffer_free_block_map(&self, buf: &mut BlockBuffer, inode: &Inode) -> Result<u64> {
+        let bs = self.sb.block_size();
+        if !Self::holds_block_map(inode, bs) {
+            return Ok(0);
+        }
+        let freed = crate::indirect_mut::collect_for_free(
+            &inode.block,
+            bs,
+            inode.size.div_ceil(u64::from(bs)) as u32,
+            self.dev.as_ref(),
+        )?;
+        let mut count = 0;
+        for run in &freed.data_runs {
+            count += self.buffer_free_block_run_and_bgd(buf, run.start, run.len as u64)?;
+        }
+        for &iblk in &freed.indirect_blocks {
+            count += self.buffer_free_block_run_and_bgd(buf, iblk, 1)?;
+        }
+        Ok(count)
     }
 
     fn apply_replace_file_content_indirect(
@@ -5171,13 +5182,8 @@ impl Filesystem {
                 let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
                 let blocks = dst_old_inode.size.div_ceil(bs as u64);
                 for logical in 0..blocks {
-                    let Some(phys) = crate::extent::map_logical(
-                        &dst_old_inode.block,
-                        self.dev.as_ref(),
-                        bs,
-                        logical,
-                    )?
-                    else {
+                    // Either mapping, as rmdir's emptiness check.
+                    let Some(phys) = self.map_inode_logical(&dst_old_inode, logical)? else {
                         continue;
                     };
                     let block = self.read_block(phys)?;
@@ -5297,6 +5303,11 @@ impl Filesystem {
                 if dst_old_inode.has_extents() {
                     let runs = self.extent_tree_runs(&dst_old_inode.block)?;
                     freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
+                } else {
+                    // A block-mapped file or directory being replaced: its
+                    // blocks were left allocated.
+                    freed_sectors +=
+                        self.buffer_free_block_map(&mut buf, &dst_old_inode)? * sectors_per_block;
                 }
                 if dst_old_inode.file_acl != 0 {
                     freed_sectors += self
@@ -6206,9 +6217,9 @@ impl Filesystem {
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
         let blocks = target_inode.size.div_ceil(bs as u64);
         for logical in 0..blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&target_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
+            // Either mapping: a block-mapped directory's i_block is not an
+            // extent header.
+            let Some(phys) = self.map_inode_logical(&target_inode, logical)? else {
                 continue;
             };
             let block = self.read_block(phys)?;
@@ -6230,8 +6241,14 @@ impl Filesystem {
 
         // Free target's data blocks. Each freed run credits its own group's
         // BGD; SB credit accumulates and lands once below.
-        let runs = self.extent_tree_runs(&target_inode.block)?;
-        let mut freed_blocks = self.buffer_free_runs(&mut buf, &runs)?;
+        let mut freed_blocks = if target_inode.has_extents() {
+            let runs = self.extent_tree_runs(&target_inode.block)?;
+            self.buffer_free_runs(&mut buf, &runs)?
+        } else {
+            // A block-mapped directory: read as an extent header, it was
+            // refused as a corrupt tree on a valid volume.
+            self.buffer_free_block_map(&mut buf, &target_inode)?
+        };
 
         if target_inode.file_acl != 0 {
             freed_blocks += self.buffer_release_xattr_block(&mut buf, target_inode.file_acl)?;
