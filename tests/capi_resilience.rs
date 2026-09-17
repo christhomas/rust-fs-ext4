@@ -339,22 +339,46 @@ fn dir_next_null_pointer_returns_null() {
     assert!(p.is_null());
 }
 
+/// Real-world case: a user points the FSKit extension at a disk that is
+/// not ext4. The mount must fail, and fail because the bytes are not ext4.
+///
+/// This named `test-disks/ntfs-basic.img`, which no builder has ever
+/// produced, so it exercised the missing-file path and passed on a mount
+/// that would have accepted anything (#87). The image is made here: an
+/// NTFS boot sector at the front of 16 MiB, which is all a probe of the
+/// volume start sees. It has to exist, and the refusal has to be the
+/// superblock's, not the open's.
 #[test]
 fn ntfs_image_mounted_as_ext4_rejected_cleanly() {
-    // Real-world case: user points the FSKit extension at a non-ext4 disk.
-    // Must fail at mount with a clear error — never blunder into garbage.
-    let ntfs_image = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ntfs-basic.img");
-    let c = CString::new(ntfs_image).unwrap();
+    let path = fs_ext4_test_support::temp_path!("fs_ext4_ntfs_{}.img", std::process::id());
+    let mut image = vec![0u8; 16 * 1024 * 1024];
+    image[0..3].copy_from_slice(&[0xEB, 0x52, 0x90]); // jump
+    image[3..11].copy_from_slice(b"NTFS    "); // OEM ID
+    image[11..13].copy_from_slice(&512u16.to_le_bytes()); // bytes per sector
+    image[13] = 8; // sectors per cluster
+    image[21] = 0xF8; // media descriptor
+    image[40..48].copy_from_slice(&(16u64 * 1024 * 1024 / 512 - 1).to_le_bytes()); // total sectors
+    image[48..56].copy_from_slice(&4u64.to_le_bytes()); // $MFT cluster
+    image[510] = 0x55;
+    image[511] = 0xAA;
+    std::fs::write(&path, &image).expect("write the NTFS image");
+    assert!(
+        std::path::Path::new(&path).exists(),
+        "fixture: the image exists"
+    );
+
+    let c = CString::new(path.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(c.as_ptr()) };
+    let err = last_err();
+    let errno = fs_ext4_last_errno();
+    let _ = std::fs::remove_file(&path);
     assert!(
         fs.is_null(),
         "mount of an NTFS image must NOT succeed as ext4"
     );
-    let errno = fs_ext4_last_errno();
     assert_ne!(errno, 0, "rejected mount must have non-zero errno");
-    let err = last_err();
     assert!(
-        !err.is_empty(),
-        "rejected mount must have a last_error message"
+        err.contains("bad magic"),
+        "the refusal must be that this is not ext4, not a failure to open: {err:?}"
     );
 }
