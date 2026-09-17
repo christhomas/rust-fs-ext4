@@ -444,6 +444,18 @@ impl Filesystem {
         if unmaintained != 0 {
             return Err(Error::UnsupportedRoCompat(unmaintained));
         }
+        // THE MOUNT'S INCOMPAT REFUSAL, AGAIN, HERE. It runs once, against
+        // `is_writable()` at mount time, and writability is not fixed: a
+        // lazy mount starts read-only and the host hands it a write FD
+        // afterwards (see `mount_lazy`). That mount passed the check by
+        // being read-only and then wrote to a CASEFOLD or MMP volume
+        // (#117). The mount-time check stays, so a volume that is writable
+        // from the start still fails to mount rather than mounting and
+        // refusing.
+        let write_breaking = features::write_breaking_incompat(self.sb.feature_incompat);
+        if write_breaking != 0 {
+            return Err(Error::UnsupportedIncompat(write_breaking));
+        }
         Ok(())
     }
 
@@ -5752,6 +5764,79 @@ mod tests {
         );
     }
 
+    /// A device that turns writable after the mount, as the FSKit write FD
+    /// does for a lazy mount.
+    struct LaterWritable {
+        inner: std::sync::Arc<MemDev>,
+        writable: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::block_io::BlockDevice for LaterWritable {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+        fn size_bytes(&self) -> u64 {
+            self.inner.size_bytes()
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            if !self.is_writable() {
+                return Err(Error::ReadOnly);
+            }
+            self.inner.write_at(offset, buf)
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_writable(&self) -> bool {
+            self.writable.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A lazy mount that was read-only when it mounted and writable later
+    /// still refuses to write a write-breaking INCOMPAT volume (#117).
+    ///
+    /// The refusal ran once at mount, and passed because the device was
+    /// not yet writable; every later write checked only RO_COMPAT.
+    #[test]
+    fn a_volume_that_becomes_writable_after_a_lazy_mount_still_refuses_write_breaking_features() {
+        for bit in [
+            crate::features::Incompat::CASEFOLD.bits(),
+            crate::features::Incompat::MMP.bits(),
+        ] {
+            let dev = formatted();
+            set_incompat_bit(&dev, bit);
+            let later = std::sync::Arc::new(LaterWritable {
+                inner: dev.clone(),
+                writable: std::sync::atomic::AtomicBool::new(false),
+            });
+            let fs = Filesystem::mount_lazy(later.clone()).expect("a read-only lazy mount");
+            later
+                .writable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            match fs.apply_create("/late.txt", 0o644) {
+                Err(Error::UnsupportedIncompat(b)) => assert_eq!(b, bit),
+                other => panic!("{bit:#x}: a write went through: {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// The control: the same late-writable device over an ordinary volume
+    /// does write, so the refusal above is the feature and not the device.
+    #[test]
+    fn an_ordinary_volume_that_becomes_writable_after_a_lazy_mount_writes() {
+        let dev = formatted();
+        let later = std::sync::Arc::new(LaterWritable {
+            inner: dev,
+            writable: std::sync::atomic::AtomicBool::new(false),
+        });
+        let fs = Filesystem::mount_lazy(later.clone()).expect("a read-only lazy mount");
+        later
+            .writable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fs.apply_create("/late.txt", 0o644)
+            .expect("an ordinary volume must accept the write");
+    }
+
     /// The MMP case this generalised, so folding the two into one set
     /// cannot have dropped the original.
     #[test]
@@ -5947,6 +6032,42 @@ mod tests {
             !destination_holds_the_payload(&dev, &payload),
             "the journal was replayed into a volume the driver had already declined to mount"
         );
+    }
+
+    /// A lazy mount that turns writable does not replay a dirty journal
+    /// into a write-breaking INCOMPAT volume either (#117): replay is a
+    /// write, and it did not go through `refuse_write`. The control
+    /// replays the same journal once the bit is gone.
+    #[test]
+    fn a_lazy_mount_that_becomes_writable_does_not_replay_into_a_write_breaking_volume() {
+        for bit in [0, crate::features::Incompat::MMP.bits()] {
+            let (dev, payload) = ext3_with_a_dirty_journal();
+            if bit != 0 {
+                set_incompat_bit(&dev, bit);
+            }
+            let later = std::sync::Arc::new(LaterWritable {
+                inner: dev.clone(),
+                writable: std::sync::atomic::AtomicBool::new(false),
+            });
+            let fs = Filesystem::mount_lazy(later.clone()).expect("a read-only lazy mount");
+            later
+                .writable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = fs.replay_journal_if_dirty();
+            if bit == 0 {
+                assert_eq!(result.expect("the control replays"), 1);
+                assert!(destination_holds_the_payload(&dev, &payload));
+            } else {
+                match result {
+                    Err(Error::UnsupportedIncompat(b)) => assert_eq!(b, bit),
+                    other => panic!("replay was not refused: {other:?}"),
+                }
+                assert!(
+                    !destination_holds_the_payload(&dev, &payload),
+                    "the journal was replayed into an MMP volume"
+                );
+            }
+        }
     }
 
     // ---------------------------------------------------------------
