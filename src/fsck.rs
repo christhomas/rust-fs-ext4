@@ -284,6 +284,18 @@ where
 /// Findings are emitted through `on_finding`; nothing is pushed onto
 /// `report.anomalies` from here. Callers that want the legacy
 /// "collect into a vec" behaviour wrap `on_finding` accordingly.
+/// The audits compare block bitmaps and descriptor free counts with the
+/// blocks they observe. Under BIGALLOC both count clusters, so every group
+/// would be reported inconsistent (#75).
+pub(crate) fn refuse_bigalloc(fs: &Filesystem) -> Result<()> {
+    if fs.sb.feature_ro_compat & crate::features::RoCompat::BIGALLOC.bits() != 0 {
+        return Err(crate::error::Error::Unsupported(
+            "bigalloc: bitmaps and group free counts are in clusters, which the audit does not model",
+        ));
+    }
+    Ok(())
+}
+
 fn audit_inner(
     fs: &Filesystem,
     max_dirs_visited: u32,
@@ -292,6 +304,7 @@ fn audit_inner(
     on_finding: &mut dyn FnMut(&Anomaly),
     report: &mut AuditReport,
 ) -> Result<()> {
+    refuse_bigalloc(fs)?;
     // Observed: ino → reference-count.
     let mut observed: HashMap<u32, u32> = HashMap::new();
     // What each directory's ".." entry CLAIMS the parent is (read off

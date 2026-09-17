@@ -9,6 +9,11 @@
   `descriptor_loc`), and waking a `BLOCK_UNINIT` group reserves the
   descriptor block or backup at its head. `mke2fs` enables the feature on
   large volumes, which were refused at mount.
+- `BIGALLOC` volumes mount and read. The refusal assumed clusters replace
+  blocks as the group stride; they do not, and only the bitmaps and the
+  descriptors' free counts are in clusters. Writes stay refused (the
+  feature is not maintained), and `fsck::audit` and `verify::verify`
+  refuse the volume by name.
 
 ### Fixed
 
@@ -50,6 +55,9 @@
   block, as the kernel does. `e2fsck` reported "Padding at end of block
   bitmap is not set" on any volume whose groups are smaller than a bitmap
   block covers.
+- The group descriptor table is located after the superblock's block
+  rather than after `s_first_data_block`. They differ on a 1 KiB bigalloc
+  volume, whose groups start at block 0.
 
 ## [0.5.1] — 2026-09-06
 
