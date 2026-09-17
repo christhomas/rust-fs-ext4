@@ -74,6 +74,11 @@ pub const SUPPORTED_INCOMPAT: u32 = Incompat::FILETYPE.bits()
     // Descriptors kept per meta group rather than in one table: found
     // through `Superblock::descriptor_location` (#73).
     | Incompat::META_BG.bits()
+    // "Some inode may be encrypted", not "the volume is": fscrypt is a
+    // per-directory policy and everything outside it is plain. Encrypted
+    // contents and names are refused per inode (`file_io::refuse_encrypted`,
+    // #76); writes are refused volume-wide, see WRITE_BREAKING_INCOMPAT.
+    | Incompat::ENCRYPT.bits()
     // A dirty journal: replayed onto the device by a writable mount
     // (`journal_apply::replay_if_dirty`), and into the buffer cache by a
     // read-only one (`journal_apply::replay_into_cache`, #72).
@@ -117,7 +122,14 @@ pub const SUPPORTED_INCOMPAT: u32 = Incompat::FILETYPE.bits()
 /// `s_encoding` nor `EXT4_CASEFOLD_FL` is read anywhere, so the driver
 /// cannot currently tell that a directory is casefolded at all. Wiring
 /// that up is what would let this bit move out of here.
-pub const WRITE_BREAKING_INCOMPAT: u32 = Incompat::MMP.bits() | Incompat::CASEFOLD.bits();
+///
+/// - `ENCRYPT` is read per inode, and a write would have to be refused per
+///   inode too: a name created in an encrypted directory, or data written
+///   to an encrypted file, is plaintext where the kernel reads ciphertext.
+///   Nothing on the write side checks `EXT4_ENCRYPT_FL`, so the volume is
+///   read-only here (#76).
+pub const WRITE_BREAKING_INCOMPAT: u32 =
+    Incompat::MMP.bits() | Incompat::CASEFOLD.bits() | Incompat::ENCRYPT.bits();
 
 /// The INCOMPAT bits on this volume that a write here would not keep
 /// consistent. Zero means the volume may be mounted read-write.
