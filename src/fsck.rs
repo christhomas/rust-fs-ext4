@@ -599,11 +599,12 @@ fn audit_free_counts(
     // Re-read BGDs and SB from disk for each scan rather than
     // trusting `fs.groups` / `fs.sb` (mount-time snapshots, never
     // mutated). The post-repair re-scan needs the patched values to
-    // avoid re-emitting drift findings the repair pass just fixed:
-    // bitmaps come from `fs.read_block` (sees pinned post-commit
-    // bytes), so the comparison's "stored" side has to match — read
-    // the descriptors and SB the same way for both halves of the
-    // compare to look at the same point in time.
+    // avoid re-emitting drift findings the repair pass just fixed.
+    // Every read here, the bitmaps and these descriptors alike, goes
+    // through `fs.dev`, which the mount wrapped in a `CachedDevice`
+    // (`Filesystem::mount_inner`); that cache holds the pinned
+    // post-commit, pre-checkpoint bytes, so both halves of the compare
+    // see the same point in time.
     let live_groups = bgd::read_all(fs.dev.as_ref(), &fs.sb, &fs.csum)?;
     let live_sb = Superblock::read(fs.dev.as_ref())?;
 
@@ -613,11 +614,12 @@ fn audit_free_counts(
     for (gi, bg) in live_groups.iter().enumerate() {
         // Block bitmap: count zero bits across the bytes covering the
         // bits that actually correspond to this group's blocks. The
-        // last group may be partial. Go through `read_block` so the
-        // post-repair re-scan sees post-commit-pre-checkpoint pinned
-        // bytes — `dev.read_at` would skip the cache and surface the
-        // stale on-disk image, falsely re-emitting drift findings the
-        // repair pass just fixed.
+        // last group may be partial. The post-repair re-scan sees the
+        // pinned post-commit bytes here because the cache is in the
+        // device: `fs.read_block` is `fs.dev.read_at` with the offset
+        // worked out, and neither can skip the `CachedDevice`. Seeing the
+        // stale on-disk image would mean reaching past it deliberately,
+        // and nothing here does (#152).
         let group_first_block = first_data + gi as u64 * bpg;
         let group_block_count = std::cmp::min(bpg, total_blocks.saturating_sub(group_first_block));
         let block_bitmap = fs.read_block(bg.block_bitmap)?;

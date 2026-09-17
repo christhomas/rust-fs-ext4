@@ -444,6 +444,18 @@ impl Filesystem {
         if unmaintained != 0 {
             return Err(Error::UnsupportedRoCompat(unmaintained));
         }
+        // THE MOUNT'S INCOMPAT REFUSAL, AGAIN, HERE. It runs once, against
+        // `is_writable()` at mount time, and writability is not fixed: a
+        // lazy mount starts read-only and the host hands it a write FD
+        // afterwards (see `mount_lazy`). That mount passed the check by
+        // being read-only and then wrote to a CASEFOLD or MMP volume
+        // (#117). The mount-time check stays, so a volume that is writable
+        // from the start still fails to mount rather than mounting and
+        // refusing.
+        let write_breaking = features::write_breaking_incompat(self.sb.feature_incompat);
+        if write_breaking != 0 {
+            return Err(Error::UnsupportedIncompat(write_breaking));
+        }
         Ok(())
     }
 
@@ -1058,9 +1070,12 @@ impl Filesystem {
     /// (extent-tree updates + freed-block ranges) with actual disk writes —
     /// rewrites the inode and zeros the freed bitmap bits.
     ///
-    /// Journaled. The inode write, the bitmap writes, the BGD and the
-    /// superblock accumulate into one `BlockBuffer` and commit as a
-    /// single transaction, so they are atomic with respect to a crash.
+    /// The inode write, the bitmap writes, the BGD and the superblock
+    /// accumulate into one `BlockBuffer` and commit together. On a mount
+    /// with a journal that commit is one transaction, atomic with respect
+    /// to a crash. Without one (an ext2 volume, or ext4 formatted without
+    /// a journal) `commit_block_buffer` writes the blocks in turn, and a
+    /// crash part-way leaves some written and some not (#179).
     ///
     /// This said "Not journaled … safe only in a test scratch image", and
     /// promised the transaction as future work. The future work landed;
@@ -3193,11 +3208,16 @@ impl Filesystem {
     /// This is the "Finder just saved a document" path — complete rewrite of
     /// a file. Piecewise writes / appends / sparse writes come later.
     ///
-    /// Journaled, and atomic across the whole replace: freeing the old
-    /// data, allocating the new run, the bitmap, BGD and superblock
-    /// updates, the new block contents and the inode all commit as one
-    /// transaction — as the comment twenty-eight lines into the body
-    /// already said.
+    /// For an extent-mapped inode on a mount with a journal, atomic across
+    /// the whole replace: freeing the old data, allocating the new run, the
+    /// bitmap, BGD and superblock updates, the new block contents and the
+    /// inode all commit as one transaction. Two cases are not (#179):
+    ///
+    /// - without a journal, the same blocks are written in turn, and a
+    ///   crash part-way leaves some written and some not;
+    /// - an inode that is not extent-mapped goes to
+    ///   `apply_replace_file_content_indirect`, which builds no transaction
+    ///   at all, on ext3 with a journal too.
     ///
     /// Returns the new file size on success.
     pub fn apply_replace_file_content(&self, path: &str, data: &[u8]) -> Result<u64> {
@@ -3329,11 +3349,12 @@ impl Filesystem {
     /// metadata blocks, builds the new tree via `indirect_mut::plan_contiguous`,
     /// then persists everything (data → indirect blocks → inode).
     ///
-    /// No journal interaction: ext2 has no journal at all, and the user's
-    /// `JournalWriter` returns `None` for those mounts so `self.journal` is
-    /// already None at this point. ext3 mounts (Phase B) will plumb writes
-    /// through the journal once the writer can address indirect-block
-    /// journal inodes.
+    /// No journal interaction, on any mount. The writer can address an
+    /// indirect-mapped journal inode (see `mount_inner`), so an ext3 mount
+    /// has one, but this path frees, allocates and writes block by block
+    /// and never builds a `BlockBuffer` for it. A crash after the old runs
+    /// are freed and before the inode is rewritten leaves the inode
+    /// mapping blocks the bitmap already calls free (#179).
     fn apply_replace_file_content_indirect(
         &self,
         ino: u32,
@@ -6216,6 +6237,79 @@ mod tests {
         );
     }
 
+    /// A device that turns writable after the mount, as the FSKit write FD
+    /// does for a lazy mount.
+    struct LaterWritable {
+        inner: std::sync::Arc<MemDev>,
+        writable: std::sync::atomic::AtomicBool,
+    }
+
+    impl crate::block_io::BlockDevice for LaterWritable {
+        fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+            self.inner.read_at(offset, buf)
+        }
+        fn size_bytes(&self) -> u64 {
+            self.inner.size_bytes()
+        }
+        fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+            if !self.is_writable() {
+                return Err(Error::ReadOnly);
+            }
+            self.inner.write_at(offset, buf)
+        }
+        fn flush(&self) -> Result<()> {
+            Ok(())
+        }
+        fn is_writable(&self) -> bool {
+            self.writable.load(std::sync::atomic::Ordering::SeqCst)
+        }
+    }
+
+    /// A lazy mount that was read-only when it mounted and writable later
+    /// still refuses to write a write-breaking INCOMPAT volume (#117).
+    ///
+    /// The refusal ran once at mount, and passed because the device was
+    /// not yet writable; every later write checked only RO_COMPAT.
+    #[test]
+    fn a_volume_that_becomes_writable_after_a_lazy_mount_still_refuses_write_breaking_features() {
+        for bit in [
+            crate::features::Incompat::CASEFOLD.bits(),
+            crate::features::Incompat::MMP.bits(),
+        ] {
+            let dev = formatted();
+            set_incompat_bit(&dev, bit);
+            let later = std::sync::Arc::new(LaterWritable {
+                inner: dev.clone(),
+                writable: std::sync::atomic::AtomicBool::new(false),
+            });
+            let fs = Filesystem::mount_lazy(later.clone()).expect("a read-only lazy mount");
+            later
+                .writable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            match fs.apply_create("/late.txt", 0o644) {
+                Err(Error::UnsupportedIncompat(b)) => assert_eq!(b, bit),
+                other => panic!("{bit:#x}: a write went through: {:?}", other.map(|_| ())),
+            }
+        }
+    }
+
+    /// The control: the same late-writable device over an ordinary volume
+    /// does write, so the refusal above is the feature and not the device.
+    #[test]
+    fn an_ordinary_volume_that_becomes_writable_after_a_lazy_mount_writes() {
+        let dev = formatted();
+        let later = std::sync::Arc::new(LaterWritable {
+            inner: dev,
+            writable: std::sync::atomic::AtomicBool::new(false),
+        });
+        let fs = Filesystem::mount_lazy(later.clone()).expect("a read-only lazy mount");
+        later
+            .writable
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+        fs.apply_create("/late.txt", 0o644)
+            .expect("an ordinary volume must accept the write");
+    }
+
     /// The MMP case this generalised, so folding the two into one set
     /// cannot have dropped the original.
     #[test]
@@ -6413,6 +6507,42 @@ mod tests {
         );
     }
 
+    /// A lazy mount that turns writable does not replay a dirty journal
+    /// into a write-breaking INCOMPAT volume either (#117): replay is a
+    /// write, and it did not go through `refuse_write`. The control
+    /// replays the same journal once the bit is gone.
+    #[test]
+    fn a_lazy_mount_that_becomes_writable_does_not_replay_into_a_write_breaking_volume() {
+        for bit in [0, crate::features::Incompat::MMP.bits()] {
+            let (dev, payload) = ext3_with_a_dirty_journal();
+            if bit != 0 {
+                set_incompat_bit(&dev, bit);
+            }
+            let later = std::sync::Arc::new(LaterWritable {
+                inner: dev.clone(),
+                writable: std::sync::atomic::AtomicBool::new(false),
+            });
+            let fs = Filesystem::mount_lazy(later.clone()).expect("a read-only lazy mount");
+            later
+                .writable
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            let result = fs.replay_journal_if_dirty();
+            if bit == 0 {
+                assert_eq!(result.expect("the control replays"), 1);
+                assert!(destination_holds_the_payload(&dev, &payload));
+            } else {
+                match result {
+                    Err(Error::UnsupportedIncompat(b)) => assert_eq!(b, bit),
+                    other => panic!("replay was not refused: {other:?}"),
+                }
+                assert!(
+                    !destination_holds_the_payload(&dev, &payload),
+                    "the journal was replayed into an MMP volume"
+                );
+            }
+        }
+    }
+
     // ---------------------------------------------------------------
     // EA_INODE: an attribute whose value lives in another inode
     // ---------------------------------------------------------------
@@ -6502,14 +6632,15 @@ mod tests {
 
     /// THE OTHER DOOR. `get_resolved` is the single-attribute entry
     /// point and `read_all_resolved` is the list-all one, and they are
-    /// separate functions with separate resolution — `capi.rs` reaches
-    /// the first from `fs_ext4_getxattr` and the second from
-    /// `fs_ext4_listxattr`.
+    /// separate functions with separate resolution. `capi.rs` reaches the
+    /// first from `fs_ext4_getxattr`; `fs_ext4_listxattr` returns names
+    /// only and uses `list_names`, which resolves nothing (#122).
     ///
-    /// A consumer enumerating attributes rather than asking for one by
-    /// name goes through the list-all path, so leaving it unresolved
-    /// hands back an empty value with a success return: the same failure
-    /// this issue is about, through a different door.
+    /// A Rust consumer enumerating attributes WITH their values rather
+    /// than asking for one by name goes through the list-all path, so
+    /// leaving it unresolved hands back an empty value with a success
+    /// return: the same failure this issue is about, through a different
+    /// door.
     #[test]
     fn the_list_all_path_resolves_an_ea_inode_value_too() {
         let (dev, real) = ea_inode_volume();
@@ -6533,6 +6664,68 @@ mod tests {
             "the value was read from e_value_offs instead of from the EA inode"
         );
         assert_eq!(e.value, real, "the value must be the EA inode's file body");
+    }
+
+    /// A names-only listing does not read values, so a value that cannot be
+    /// read does not fail it (#122).
+    ///
+    /// `fs_ext4_listxattr` resolved every EA-inode value and discarded it,
+    /// and one unreadable value turned the whole listing into -1. Here the
+    /// attribute points at an inode WITHOUT the EA_INODE flag, which
+    /// `read_value_inode` refuses: resolving values fails (the control),
+    /// and listing names still names it.
+    #[test]
+    fn listing_names_does_not_read_an_unreadable_ea_inode_value() {
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            fs.apply_create("/subject.txt", 0o644).expect("create");
+            let not_ea = fs.apply_create("/plain.bin", 0o644).expect("create");
+            let subject = resolve(&fs, "/subject.txt").expect("resolve");
+            plant_ea_inode_xattr(&fs, subject, "user.big", not_ea, &DECOY);
+        }
+        let fs = mount(&dev);
+        let ino = resolve(&fs, "/subject.txt").expect("resolve");
+        let (inode, raw) = fs.read_inode_verified(ino).expect("read inode");
+
+        assert!(
+            crate::xattr::read_all_resolved(&fs, &inode, &raw).is_err(),
+            "control: the value behind this attribute cannot be read"
+        );
+        let names =
+            crate::xattr::list_names(&fs, &inode, &raw).expect("listing names needs no value");
+        assert!(names.iter().any(|n| n == "user.big"), "{names:?}");
+        drop(fs);
+
+        // And through the door the bug was reported at: the C entry point
+        // must report the size, then write the name, instead of -1.
+        let image =
+            fs_ext4_test_support::temp_path!("fs_ext4_listxattr_{}.img", std::process::id());
+        std::fs::write(&image, &*dev.bytes.lock().unwrap()).expect("write image");
+        let c_image = std::ffi::CString::new(image.clone()).unwrap();
+        let c_path = std::ffi::CString::new("/subject.txt").unwrap();
+        unsafe {
+            let handle = crate::capi::fs_ext4_mount(c_image.as_ptr());
+            assert!(!handle.is_null(), "C mount");
+            let needed =
+                crate::capi::fs_ext4_listxattr(handle, c_path.as_ptr(), std::ptr::null_mut(), 0);
+            assert!(needed > 0, "the probe returned {needed}");
+            let mut buf = vec![0u8; needed as usize];
+            let wrote = crate::capi::fs_ext4_listxattr(
+                handle,
+                c_path.as_ptr(),
+                buf.as_mut_ptr().cast(),
+                buf.len(),
+            );
+            assert_eq!(wrote, needed);
+            assert!(
+                buf.split(|&b| b == 0).any(|n| n == b"user.big"),
+                "{:?}",
+                String::from_utf8_lossy(&buf)
+            );
+            crate::capi::fs_ext4_umount(handle);
+        }
+        let _ = std::fs::remove_file(&image);
     }
 
     /// The buffer-level parser cannot follow the pointer — it has no
@@ -6856,6 +7049,42 @@ mod tests {
     /// `0x76..0x78` only by `write_file_acl`. A hand-written second copy
     /// of either is what let the two disagree with `Inode::parse` for as
     /// long as they did.
+    /// Every statement in `src` that writes `field` with `copy_from_slice`,
+    /// whitespace collapsed.
+    ///
+    /// BY STATEMENT, NOT BY LINE (#162). rustfmt wraps a long write as
+    /// `raw[0x74..0x76]` on one line and `.copy_from_slice(..)` on the next,
+    /// so a line scan saw neither half as a write, and #157's defect could be
+    /// re-inlined with fmt, clippy and this test all green. Line comments are
+    /// removed first so a `;` or an offset in prose does not join or form a
+    /// statement.
+    fn half_word_writes(src: &str, field: &str) -> Vec<String> {
+        let code: String = src
+            .lines()
+            .map(|line| line.find("//").map_or(line, |at| &line[..at]))
+            .collect::<Vec<_>>()
+            .join("\n");
+        code.split(';')
+            .map(|statement| statement.split_whitespace().collect::<Vec<_>>().join(" "))
+            .filter(|statement| statement.contains(field) && statement.contains("copy_from_slice"))
+            .collect()
+    }
+
+    /// The guard's reader sees a write however rustfmt lays it out.
+    #[test]
+    fn the_half_word_scan_reads_a_write_rustfmt_wrapped() {
+        let wrapped = "
+                    let acl_lo_value_for_the_external_xattr_block: u32 = 0;
+                    raw[0x74..0x76]
+                        .copy_from_slice(&acl_hi_value_for_the_external_xattr_block.to_le_bytes());
+                    // raw[0x74..0x76].copy_from_slice(&in_a_comment);
+        ";
+        assert_eq!(half_word_writes(wrapped, "0x74..0x76").len(), 1);
+        let one_line = "raw[0x74..0x76].copy_from_slice(&x.to_le_bytes());";
+        assert_eq!(half_word_writes(one_line, "0x74..0x76").len(), 1);
+        assert!(half_word_writes("let a = raw[0x74..0x76][0];", "0x74..0x76").is_empty());
+    }
+
     #[test]
     fn each_inode_half_word_is_written_in_exactly_one_place() {
         let whole = std::fs::read_to_string(concat!(env!("CARGO_MANIFEST_DIR"), "/src/fs.rs"))
@@ -6876,13 +7105,7 @@ mod tests {
              the split ate the file"
         );
 
-        let writes = |field: &str| -> Vec<String> {
-            src.lines()
-                .filter(|l| l.contains(field) && l.contains("copy_from_slice"))
-                .map(str::trim)
-                .map(str::to_owned)
-                .collect()
-        };
+        let writes = |field: &str| half_word_writes(src, field);
 
         let blocks_hi = writes("0x74..0x76");
         assert_eq!(
