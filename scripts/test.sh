@@ -1,6 +1,18 @@
 #!/usr/bin/env bash
-# Run tests in an owned scratch directory. On Raspberry Pi, keep write-heavy
-# fixture copies on the checkout's storage rather than the system SD card.
+# test.sh [cargo test args...]  run the suite in an owned scratch directory
+# test.sh --print-temp-dir      print that directory and exit
+#
+# SCRATCH LIVES IN THE REPOSITORY, always: tmp/ (gitignored), and never
+# the system temporary directory or a runner-supplied one. The oracle
+# tools run inside the fs-linux-test-harness VM, which sees this
+# repository at the path the host knows it by and nothing else of the
+# host — so an image anywhere else is a path the tool asked to read it
+# cannot open. The same rule is written in Rust in
+# tests/support/src/lib.rs (select_temp_dir), and
+# tests/test_temp_policy.rs checks it.
+#
+# FS_EXT4_TEST_TMPDIR supplies an exact directory instead; it must be
+# inside the repository, and it is the caller's to delete.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -15,27 +27,20 @@ cleanup() {
 trap cleanup EXIT HUP INT TERM
 
 if [[ -n "${FS_EXT4_TEST_TMPDIR:-}" ]]; then
+    case "$FS_EXT4_TEST_TMPDIR" in
+        "$REPO"/*) ;;
+        *)
+            echo "test.sh: FS_EXT4_TEST_TMPDIR is $FS_EXT4_TEST_TMPDIR, which is outside" >&2
+            echo "         $REPO. The oracle tools run in the harness VM, which sees this" >&2
+            echo "         repository and nothing else of the host." >&2
+            exit 1
+            ;;
+    esac
     # An exact caller-supplied directory is not ours to delete.
     mkdir -p "$FS_EXT4_TEST_TMPDIR"
-elif [[ -n "${FS_EXT4_TEST_TMP_BASE:-}" ]]; then
-    mkdir -p "$FS_EXT4_TEST_TMP_BASE"
-    RUN_DIR="$(mktemp -d "$FS_EXT4_TEST_TMP_BASE/fs-ext4-tests.XXXXXX")"
-    export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
-elif [[ "${GITHUB_ACTIONS:-}" == "true" && -n "${RUNNER_TEMP:-}" ]]; then
-    mkdir -p "$RUNNER_TEMP"
-    RUN_DIR="$(mktemp -d "$RUNNER_TEMP/fs-ext4-tests.XXXXXX")"
-    export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
-elif [[ -r /proc/device-tree/model ]] && grep -aq 'Raspberry Pi' /proc/device-tree/model; then
+else
     mkdir -p "$REPO/tmp"
     RUN_DIR="$(mktemp -d "$REPO/tmp/fs-ext4-tests.XXXXXX")"
-    export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
-else
-    if [[ -n "${TMPDIR:-}" ]]; then
-        mkdir -p "$TMPDIR"
-        RUN_DIR="$(mktemp -d "$TMPDIR/fs-ext4-tests.XXXXXX")"
-    else
-        RUN_DIR="$(mktemp -d -t fs-ext4-tests.XXXXXX)"
-    fi
     export FS_EXT4_TEST_TMPDIR="$RUN_DIR"
 fi
 

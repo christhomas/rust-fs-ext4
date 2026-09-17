@@ -11,12 +11,11 @@
 //! random sequence of operations checked with e2fsck.
 //!
 //! Volumes come from `mkfs.ext4`, and `e2fsck -fn` must accept each after
-//! the refused truncate. Fails without e2fsprogs (`chore tools`).
+//! the refused truncate. The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::Error;
-use std::process::Command;
 use std::sync::Arc;
 
 #[test]
@@ -44,11 +43,10 @@ fn truncate_refuses_directories_symlinks_and_device_nodes() {
             std::fs::File::create(&image)
                 .and_then(|f| f.set_len(64 * 1024 * 1024))
                 .unwrap();
-            let out = Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
+            let out = fs_ext4_test_support::oracle("mkfs.ext4")
                 .args(["-q", "-F", "-b", "4096"])
                 .arg(&image)
-                .output()
-                .unwrap();
+                .output();
             assert!(
                 out.status.success(),
                 "{}",
@@ -70,10 +68,9 @@ fn truncate_refuses_directories_symlinks_and_device_nodes() {
                 (_, Err(Error::InvalidArgument(_))) => {}
                 _ => panic!("[{kind} {what}] expected InvalidArgument, got {got:?}"),
             }
-            let fsck = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+            let fsck = fs_ext4_test_support::oracle("e2fsck")
                 .args(["-fn", &image])
-                .output()
-                .unwrap();
+                .output();
             assert!(
                 fsck.status.success(),
                 "[{kind} {what}] e2fsck -fn rejected the volume:\n{}",

@@ -14,27 +14,25 @@
 //! committed to a CSUM_V2 journal and walked back, and the SECOND
 //! destination is checked.
 //!
-//! Volumes come from `mkfs.ext4`; fails without e2fsprogs (`chore tools`).
+//! Volumes come from `mkfs.ext4`; fails when the harness VM the e2fsprogs tools run in is unreachable.
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::Inode;
 use fs_ext4::journal_writer::JournalWriter;
 use fs_ext4::{jbd2, journal};
-use std::process::Command;
 use std::sync::Arc;
 
 fn mkfs(tag: &str, features: &str) -> String {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
+    let mkfs = "mkfs.ext4";
     let path = fs_ext4_test_support::temp_path!("fs_ext4_184_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-b", "4096", "-O", features])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",

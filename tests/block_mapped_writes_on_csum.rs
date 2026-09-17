@@ -16,25 +16,22 @@
 //!   `apply_rmdir` or renaming over a block-mapped directory was refused
 //!   as a corrupt extent tree.
 //!
-//! `e2fsck -fn` judges each step. Fails without e2fsprogs (`chore tools`).
+//! `e2fsck -fn` judges each step. The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 fn mkfs(tag: &str, features: &str) -> String {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_blockmap_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-O", features])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
@@ -44,10 +41,9 @@ fn mkfs(tag: &str, features: &str) -> String {
 }
 
 fn e2fsck_clean(path: &str, what: &str) {
-    let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+    let out = fs_ext4_test_support::oracle("e2fsck")
         .args(["-fn", path])
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "[{what}] e2fsck -fn rejected the volume:\n{}",

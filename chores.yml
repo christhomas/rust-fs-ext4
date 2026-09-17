@@ -26,18 +26,39 @@ chore_min_version: 0.6.0
 #
 #   chore siblings     check out ../rust-fs-core and ../fs-linux-test-harness
 #                      at their pinned refs
-#   chore tools        install and verify the HOST oracle tools (e2fsprogs)
+#   chore tools        install and verify what the HOST needs: ripgrep, and
+#                      the VM (Vagrant, QEMU, KVM/HVF). NOT e2fsprogs
 #   chore fixtures     build test-disks/*.img — kernel-made, so in the
 #                      harness VM (vm:*)
-#   chore test:unit    tests that need no tool and no fixture
+#   chore test:unit    tests that need no tool, no fixture and no VM
+#   chore test:images  tests that read a fixture but need no VM
 #   chore test:oracle  the driver writes, e2fsprogs reads back (e2fsck -fn
 #                      for consistency, debugfs for content and metadata)
+#   chore test:kernel  the driver writes, THE REAL KERNEL reads back: our
+#                      images loop-mounted by Linux in the guest
+#   chore test:vm      the whole suite compiled and run INSIDE the guest
 #   chore test         everything, exactly as CI runs it
 #
-# Tests run on the host. The VM is for what the host cannot do (populate
-# images through the kernel's ext4 driver), and there is no Rust toolchain
-# in it. NOTHING SKIPS: a missing tool or fixture fails the test that
-# needed it, naming the task that provides it.
+# WHERE THINGS RUN, and why.
+#
+#   THE ORACLE TOOLS RUN IN THE GUEST, ALWAYS. e2fsprogs on a workstation
+#   is whatever that machine has — a keg-only Homebrew formula on a Mac, a
+#   distribution build on Linux, a different version per developer — and
+#   on a Mac it is not the platform these images are for at all. One
+#   Debian guest, one version, the same answers everywhere. There is no
+#   host path to fall back to: tests/test_contract.rs fails the suite if a
+#   test runs one here.
+#
+#   THE KERNEL ORACLES MOUNT IN THE GUEST, ALWAYS. A loop mount needs root
+#   and an ext4 driver; the host has neither to spare.
+#
+#   THE LINUX TESTS RUN ON LINUX. On a Linux host that is this host, and
+#   `chore test` compiles and runs them here. On a Mac nothing Linux-shaped
+#   runs natively: `chore test` runs `test:vm` instead, which builds and
+#   runs the same sources inside the guest.
+#
+# NOTHING SKIPS: a missing tool, fixture or VM fails the test that needed
+# it, naming the task that provides it.
 vars:
   TRIPLE: aarch64-apple-darwin
   LIBNAME: fs_ext4
@@ -52,7 +73,7 @@ vars:
   # A COMMIT, NOT A TAG, and only for now: the family pins siblings by
   # tag, and fs-linux-test-harness has no release yet. Replace this with
   # its tag (v0.1.0) once one is cut.
-  LINUX_HARNESS_REF: 9e62260eb5616381d03be6232cd9887c57f69b57
+  LINUX_HARNESS_REF: 0ea55c6b33563d0383ac4044595904c6779492c3
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
@@ -110,7 +131,7 @@ tasks:
           done
 
   tools:
-    desc: Install and verify the host oracle tools (e2fsprogs); on macOS, print the Homebrew formula
+    desc: "Install and verify what the HOST needs: ripgrep, and the VM the oracle tools live in"
     cmds: ['scripts/tools.sh']
 
   fixtures:
@@ -156,29 +177,109 @@ tasks:
     cmds:
       - 'EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
+  test:images:
+    desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
+    # The tier CI's aarch64 job runs: GitHub's arm64 runners have no
+    # /dev/kvm, so no VM can start there, and the oracle and kernel tiers
+    # read the same images on every architecture anyway. Named as a tier
+    # rather than skipped inside the tests, so what does not run there is
+    # visible in the workflow rather than hidden in a green log.
+    cmds:
+      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+
   test:oracle:
-    desc: 'The driver writes, e2fsprogs reads back: every test that runs e2fsck, debugfs or mkfs on the host'
+    desc: 'The driver writes, e2fsprogs reads back — every tool call made inside the harness VM'
     # --show-output prints what each passing oracle test checked (the
-    # [oracle] lines: every tool invocation and its verdict), so a green
-    # run carries its evidence rather than just a count.
+    # `[oracle vm]` lines: every tool invocation, where it ran and its
+    # verdict), so a green run carries its evidence rather than a count.
+    #
+    # NO `vm:up` HERE, deliberately. The first oracle call in each test
+    # process brings the VM up (idempotent, milliseconds when it is
+    # already running) and every later call rides one shared SSH
+    # connection. Nothing holds it, so the `after_all` reaper stops it
+    # when this invocation ends — one boot for the tier, and no VM left
+    # behind by a run that was interrupted.
     cmds:
       - scripts/tools.sh --check
       - 'scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
+  test:kernel:
+    desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
+    # The gap e2fsprogs cannot close: a volume it calls clean can still be
+    # one Linux mounts differently. These tests write with the Rust API
+    # and with the C ABI, mount read-only in the guest, and compare names,
+    # sizes, modes, xattrs, ACLs and SHA-256 of contents against what was
+    # written — plus the reverse direction, and a deliberate corruption
+    # that must fail.
+    cmds:
+      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+
+  test:vm:
+    desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
+    # scripts/guest-suite.sh, through the harness's [test] guest_command.
+    # The toolchain and the build directory live on the VM's own disk, so
+    # the first run pays a full build and later runs are incremental.
+    # FLTH_KEEP_VM=1 keeps the VM up for the next one.
+    timeout: 120m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds:
+      # The sibling crates this one builds against are staged on the
+      # share first: the guest is given THIS repository, not the
+      # directory that holds it, so a path dependency on ../rust-fs-core
+      # has nothing to resolve to until it is put there. From the pinned
+      # checkout's HEAD, so what the guest builds against is what
+      # `chore siblings` pinned and nothing uncommitted.
+      - |
+        set -eu
+        [ -x ../fs-linux-test-harness/scripts/vm.sh ] || {
+          echo "test:vm needs the harness sibling -- run 'chore siblings'." >&2
+          exit 1
+        }
+        share="$(../fs-linux-test-harness/scripts/vm.sh share)"
+        for sibling in rust-fs-core; do
+          [ -d "../$sibling/.git" ] || {
+            echo "test:vm: ../$sibling is not checked out -- run 'chore siblings'." >&2
+            exit 1
+          }
+          dest="$share/siblings/$sibling"
+          rm -rf "$dest"
+          mkdir -p "$dest"
+          git -C "../$sibling" archive --format=tar HEAD | tar -x -C "$dest"
+        done
+        ../fs-linux-test-harness/scripts/vm.sh guest-test $CLI_ARGS
+
   test:
-    desc: 'Everything, exactly as CI runs it: unit (debug), the oracles, the whole suite (release), the script tests'
-    # Checks for the tools and the fixtures FIRST and fails naming the
-    # task that provides them, rather than letting several hundred tests
-    # each fail on the same missing image.
+    desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
+    # WE RUN THE LINUX TESTS ON LINUX. This host is Linux, so they run
+    # here; on a Mac there is no ext4, no loop mount and no e2fsprogs
+    # worth trusting, so the same sources are built and run inside the
+    # guest instead (`test:vm`). Not a reduced run and not a skip: the
+    # whole suite, one Linux away.
+    cmds:
+      - |
+        set -eu
+        if [ "$(uname -s)" != Linux ]; then
+          echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."
+          exec "{{.CHORE_EXE}}" test:vm
+        fi
+        "{{.CHORE_EXE}}" test:native
+
+  test:native:
+    desc: 'The suite on this (Linux) host: unit (debug), the oracles, the kernel oracles, everything (release), the scripts'
+    # Checks for the host tools and the fixtures FIRST and fails naming
+    # the task that provides them, rather than letting several hundred
+    # tests each fail on the same missing image.
     #
-    # test:oracle runs before the whole suite, which runs those tests
-    # again: the price (under a minute) of its output being in every
-    # log, and of `test` staying plainly "everything".
+    # test:oracle and test:kernel run before the whole suite, which runs
+    # those tests again: the price (a minute) of their evidence being in
+    # every log, and of `test` staying plainly "everything".
     cmds:
       - task: test:unit
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
       - task: test:oracle
+      - task: test:kernel
       - scripts/test.sh --locked --release
       - task: test:scripts
 

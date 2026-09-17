@@ -7,13 +7,12 @@
 //! primary superblock. The image is a fresh `mkfs.ext4` (no metadata_csum,
 //! so no inode checksum to restamp) with the journal inode's second extent
 //! moved, so the journal's own superblock at logical block 0 stays
-//! readable; fails without e2fsprogs (`chore tools`).
+//! readable; fails when the harness VM the e2fsprogs tools run in is unreachable.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::error::Error;
 use fs_ext4::journal_writer::JournalWriter;
 use fs_ext4::{bgd, Filesystem};
-use std::process::Command;
 use std::sync::Arc;
 
 /// A fresh image with the journal inode's second extent starting at
@@ -27,11 +26,10 @@ fn image_with_journal_at(name: &str, start: Option<u64>) -> std::path::PathBuf {
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
-    let made = Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
+    let made = fs_ext4_test_support::oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-O", "^metadata_csum"])
         .arg(&img)
-        .output()
-        .expect("run mkfs.ext4");
+        .output();
     assert!(
         made.status.success(),
         "{}",

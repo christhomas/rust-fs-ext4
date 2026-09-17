@@ -13,13 +13,12 @@
 //! check, and the same seed reproduces it.
 //!
 //! Three geometries: 4 KiB extent-mapped (the default), 1 KiB blocks, and a
-//! block-mapped volume without extents. e2fsprogs is required (`chore tools`);
+//! block-mapped volume without extents. the e2fsprogs tools run in the harness VM;
 //! the test fails if it is missing, rather than passing without checking
 //! anything.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 const STEPS: u64 = 150;
@@ -40,10 +39,9 @@ impl Rng {
 
 /// e2fsck's complaint, or `None` for a clean volume.
 fn e2fsck(image: &str) -> Option<String> {
-    let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+    let out = fs_ext4_test_support::oracle("e2fsck")
         .args(["-fn", image])
-        .output()
-        .unwrap();
+        .output();
     (!out.status.success()).then(|| String::from_utf8_lossy(&out.stdout).into_owned())
 }
 
@@ -208,12 +206,11 @@ fn random_operation_sequences_leave_volumes_e2fsck_accepts() {
             std::fs::File::create(&image)
                 .and_then(|f| f.set_len(64 * 1024 * 1024))
                 .unwrap();
-            let out = Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
+            let out = fs_ext4_test_support::oracle("mkfs.ext4")
                 .args(["-q", "-F"])
                 .args(args)
                 .arg(&image)
-                .output()
-                .unwrap();
+                .output();
             assert!(
                 out.status.success(),
                 "{}",

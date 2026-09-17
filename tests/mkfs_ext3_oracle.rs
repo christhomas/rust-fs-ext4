@@ -1,6 +1,6 @@
 //! Format ext3 (and ext2) volumes with the driver's own mkfs and hand each to
 //! `e2fsck -fn`, which must exit 0. Fails when e2fsprogs is not installed
-//! (`chore tools`).
+//! (they run in the harness VM).
 //!
 //! `mkfs_e2fsck_oracle` covers the default Ext4 flavor; this covers the legacy
 //! flavors, which take materially different code paths:

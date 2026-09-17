@@ -11,21 +11,17 @@
 //! The reference is e2fsprogs: `mkfs.ext4 -d` writes known files, `dumpe2fs`
 //! reports every group's free-block count, and `e2fsck -fn` judges the volume
 //! after this crate writes to it. Fails when e2fsprogs is not installed
-//! (`chore tools`).
+//! (they run in the harness VM).
 
 #![cfg(unix)]
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::Filesystem;
 use std::collections::BTreeMap;
-use std::process::Command;
 use std::sync::Arc;
 
-fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
+fn run(tool: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = fs_ext4_test_support::oracle(tool).args(args).output();
     (
         out.status.code(),
         format!(
@@ -53,7 +49,7 @@ fn read_file(fs: &Filesystem, path: &str) -> Vec<u8> {
 
 /// Group number → free blocks, as `dumpe2fs` reports them.
 fn dumpe2fs_free_blocks(image: &str) -> BTreeMap<usize, u64> {
-    let (code, log) = run(&fs_ext4_test_support::oracle_tool("dumpe2fs"), &[image]);
+    let (code, log) = run("dumpe2fs", &[image]);
     assert_eq!(code, Some(0), "{log}");
     let mut out = BTreeMap::new();
     let mut group = None;
@@ -73,7 +69,7 @@ fn dumpe2fs_free_blocks(image: &str) -> BTreeMap<usize, u64> {
 /// Group number → blocks at its head that `dumpe2fs` names as the
 /// superblock, its descriptor block(s) and reserved GDT blocks.
 fn dumpe2fs_head_blocks(image: &str) -> BTreeMap<usize, u64> {
-    let (code, log) = run(&fs_ext4_test_support::oracle_tool("dumpe2fs"), &[image]);
+    let (code, log) = run("dumpe2fs", &[image]);
     assert_eq!(code, Some(0), "{log}");
     let span = |text: &str| -> u64 {
         let range = text.trim().trim_end_matches(',');
@@ -113,9 +109,9 @@ fn dumpe2fs_head_blocks(image: &str) -> BTreeMap<usize, u64> {
 }
 
 fn meta_bg_volume(block_size: u32) {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
-    let e2fsck = fs_ext4_test_support::oracle_tool("e2fsck");
-    let debugfs = fs_ext4_test_support::oracle_tool("debugfs");
+    let mkfs = "mkfs.ext4";
+    let e2fsck = "e2fsck";
+    let debugfs = "debugfs";
     let tag = format!("meta_bg_{block_size}");
     let root = fs_ext4_test_support::temp_path!("fs_ext4_{tag}_{}", std::process::id());
     std::fs::create_dir_all(format!("{root}/sub")).unwrap();
@@ -131,7 +127,7 @@ fn meta_bg_volume(block_size: u32) {
         .unwrap();
     let blocks_per_group = if block_size == 1024 { 1024 } else { 512 };
     let (code, log) = run(
-        &mkfs,
+        mkfs,
         &[
             "-q",
             "-F",
@@ -199,9 +195,9 @@ fn meta_bg_volume(block_size: u32) {
         }
         fs.apply_unlink("/f3.bin").unwrap();
     }
-    let (code, log) = run(&e2fsck, &["-fn", &image]);
+    let (code, log) = run(e2fsck, &["-fn", &image]);
     assert_eq!(code, Some(0), "[{tag}] e2fsck -fn after writes:\n{log}");
-    let (code, log) = run(&debugfs, &["-R", "cat /w/big11", &image]);
+    let (code, log) = run(debugfs, &["-R", "cat /w/big11", &image]);
     assert_eq!(code, Some(0), "{log}");
     let fs = Filesystem::mount(Arc::new(FileDevice::open(&image).unwrap())).unwrap();
     for (g, free) in dumpe2fs_free_blocks(&image) {

@@ -13,25 +13,23 @@
 //! never leaves a group uninit. 1 KiB blocks make each group 8 MiB, so a
 //! 64 MiB image has eight groups and directory spreading reaches the
 //! untouched ones straight away. Fails when `mkfs.ext4` or `e2fsck` is not
-//! installed (`chore tools`).
+//! installed (they run in the harness VM).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 fn run(tag: &str, features: &str) {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
-    let e2fsck = fs_ext4_test_support::oracle_tool("e2fsck");
+    let mkfs = "mkfs.ext4";
+    let e2fsck = "e2fsck";
     let path = fs_ext4_test_support::temp_path!("fs_ext4_uninit_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .expect("size the image");
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-b", "1024", "-O", features])
         .arg(&path)
-        .output()
-        .expect("run mkfs.ext4");
+        .output();
     assert!(
         out.status.success(),
         "mkfs.ext4: {}",
@@ -55,10 +53,9 @@ fn run(tag: &str, features: &str) {
         fs.dev.flush().expect("flush");
     }
 
-    let out = Command::new(e2fsck)
+    let out = fs_ext4_test_support::oracle(e2fsck)
         .args(["-fn", &path])
-        .output()
-        .expect("run e2fsck");
+        .output();
     let report = format!(
         "{}{}",
         String::from_utf8_lossy(&out.stdout),

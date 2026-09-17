@@ -24,9 +24,10 @@
 //! (`fs_ext4_mount_rw` / `fs_ext4_create` / `fs_ext4_write_file` /
 //! `fs_ext4_pwrite` / `fs_ext4_umount`).
 //!
-//! The images are built here with `mke2fs` on the host — no kernel, no
-//! VM, no fixture. The tools are installed by `chore tools`; a missing
-//! one fails the test (see `fs_ext4_test_support::oracle_tool`).
+//! The images are built here with `mke2fs` — no kernel mount, no fixture.
+//! Every e2fsprogs call, this one included, runs in the harness VM
+//! (`fs_ext4_test_support::oracle`), which is where those tools live and
+//! the only place they are ever run.
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::capi::*;
@@ -34,7 +35,6 @@ use fs_ext4::fs::Filesystem;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
@@ -136,13 +136,11 @@ struct Output {
 }
 
 fn run(tool: &str, args: &[&str]) -> Output {
-    let exe = fs_ext4_test_support::oracle_tool(tool);
-    let out = Command::new(&exe)
+    let out = fs_ext4_test_support::oracle(tool)
         .args(args)
         // A fixed clock for mke2fs, so the images are the same every run.
         .env("E2FSPROGS_FAKE_TIME", "1700000000")
-        .output()
-        .unwrap_or_else(|e| panic!("run {exe}: {e}"));
+        .output();
     let o = Output {
         code: out.status.code().unwrap_or(-1),
         stdout: String::from_utf8_lossy(&out.stdout).into_owned(),

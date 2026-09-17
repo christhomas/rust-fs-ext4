@@ -4,23 +4,31 @@ name: CI
 # evidence as a green run here (see the test contract at the top of
 # chores.yml):
 #
-#   unit       `chore test:unit` on a runner with NO fixtures: the tests
-#              that need no tool and no fixture, in the debug profile
-#              that traps an arithmetic overflow. That the job passes
-#              with test-disks/ empty is what proves the split.
-#   fixtures   `chore fixtures`: the kernel-made images, built in the
-#              fs-linux-test-harness VM under KVM on x86_64, and handed
-#              to the test jobs as an artifact (they are disk images, the
-#              same for every architecture).
-#   test       on BOTH native architectures: `chore tools` installs the
-#              oracle tools, `chore lint`, then `chore test` — unit,
-#              the whole suite in release with the fixtures and e2fsprogs
-#              on the host, and the script tests. aarch64 matters on its
-#              own: c_char is unsigned there, and it is what DiskJockey
-#              ships on. GitHub's arm64 runners have no KVM, which is why
-#              the fixtures come from the x86_64 job rather than a VM here.
-#   ci-ok      the one required check: green only when every job above
-#              ran and succeeded (failed, cancelled OR skipped fails it).
+#   unit         `chore test:unit` on a runner with NO fixtures: the tests
+#                that need no tool, no fixture and no VM, in the debug
+#                profile that traps an arithmetic overflow. That the job
+#                passes with test-disks/ empty is what proves the split.
+#   fixtures     `chore fixtures`: the kernel-made images, built in the
+#                fs-linux-test-harness VM under KVM on x86_64, and handed
+#                to the other jobs as an artifact (they are disk images,
+#                the same for every architecture).
+#   test         x86_64, where GitHub gives us KVM: `chore lint` and
+#                `chore test` — the whole gate, with EVERY e2fsprogs call
+#                and every kernel mount happening inside the harness VM.
+#                Nothing installs e2fsprogs on the runner, and the log
+#                shows `[oracle vm]` / `[kernel vm]` for each one.
+#   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
+#                it is what DiskJockey ships on) but GitHub's arm64
+#                runners have NO KVM, so no VM can run: this job runs the
+#                tiers that need none — lint, the unit tier, and the
+#                fixture-reading tests. The tool and kernel oracles are
+#                architecture-independent (they read the same images) and
+#                are covered by `test`.
+#   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
+#                the guest. That is how a macOS host runs a Linux suite,
+#                and this job is what keeps that path working.
+#   ci-ok        the one required check: green only when every job above
+#                ran and succeeded (failed, cancelled OR skipped fails it).
 
 on:
   push:
@@ -107,17 +115,10 @@ jobs:
           retention-days: 7
 
   test:
-    name: test (${{ matrix.arch }})
+    name: test (x86_64, oracles in the VM)
     needs: fixtures
-    runs-on: ${{ matrix.os }}
-    strategy:
-      fail-fast: false
-      matrix:
-        include:
-          - arch: x86_64
-            os: ubuntu-24.04
-          - arch: aarch64
-            os: ubuntu-24.04-arm
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
     steps:
       - uses: actions/checkout@v4
       - name: Install chore
@@ -135,22 +136,122 @@ jobs:
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
       - name: chore tools
         run: chore tools
       - uses: actions/download-artifact@v4
         with:
           name: fixtures
           path: test-disks
+      # THE EVIDENCE, NOT THE CLAIM. e2fsprogs cannot be removed from an
+      # Ubuntu runner — it is essential — so instead every one of its
+      # programs is replaced with a stub that fails loudly. Nothing this
+      # job runs may use them: the tools belong to the guest, and a test
+      # that reached for one here would turn the run red with a message
+      # saying so, rather than quietly passing on the wrong version.
+      - name: Make the runner's own e2fsprogs unusable
+        run: |
+          set -eu
+          for tool in debugfs dumpe2fs e2fsck fsck.ext4 mke2fs mkfs.ext4 tune2fs resize2fs; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
       - name: chore lint
         run: chore lint
       - name: chore test
         run: chore test
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+
+  test-arm64:
+    name: test (aarch64, no KVM on this runner)
+    needs: fixtures
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      - name: chore lint
+        run: chore lint
+      - name: chore test:unit
+        run: chore test:unit
+      # Everything that reads a fixture but needs no VM. The oracle and
+      # kernel tiers cannot run here — GitHub's arm64 runners have no
+      # /dev/kvm — and they are not architecture-specific: they read the
+      # same bytes the x86_64 job's guest reads.
+      - name: chore test:images
+        run: chore test:images
+      - name: chore test:scripts
+        run: chore test:scripts
+
+  suite-in-vm:
+    name: suite in the guest (the macOS path)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # No Rust on the runner: the toolchain that matters is the one the
+      # guest installs from rust-toolchain.toml. That is the point of the
+      # job — on a Mac there is no usable host toolchain for these tests
+      # either.
+      - name: chore test:vm
+        run: chore test:vm
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
 
   ci-ok:
     name: ci-ok
     if: always()
-    needs: [unit, fixtures, test]
+    needs: [unit, fixtures, test, test-arm64, suite-in-vm]
     runs-on: ubuntu-latest
     steps:
       - name: Every job ran and succeeded

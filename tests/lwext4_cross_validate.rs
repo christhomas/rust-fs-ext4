@@ -34,7 +34,7 @@
 //! Status: the contract is recorded here and
 //! `scripts/cross-validate-lwext4.sh` builds lwext4 and invokes the
 //! ignored test. The diff machinery is the follow-up (#99); when it
-//! lands, lwext4 becomes an oracle tool `chore tools` installs and the
+//! lands, lwext4 becomes another oracle the harness VM provides and the
 //! `#[ignore]` goes.
 //!
 //! Spec source: github.com/gkostka/lwext4 (BSD-2-Clause).

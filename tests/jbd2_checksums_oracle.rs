@@ -12,7 +12,7 @@
 //!   a revoke block) must be replayed by this crate, and not replayed once a
 //!   journalled data block or the commit block is damaged.
 //!
-//! Fails when e2fsprogs is not installed (`chore tools`).
+//! The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 #![cfg(unix)]
 
@@ -21,8 +21,7 @@ use fs_ext4::error::Result;
 use fs_ext4::inode::Inode;
 use fs_ext4::journal_writer::JournalWriter;
 use fs_ext4::Filesystem;
-use fs_ext4_test_support::oracle_tool;
-use std::process::Command;
+use fs_ext4_test_support::oracle;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -31,27 +30,16 @@ const BS: u64 = 4096;
 const TARGETS: [u64; 3] = [9000, 9001, 9002];
 const REVOKED: u64 = 9100;
 
-fn run(program: &str, args: &[&str], stdin: Option<&str>) -> (Option<i32>, String) {
-    use std::io::Write;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
-    let input = stdin.unwrap_or("").to_owned();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
+fn run(tool: &str, args: &[&str], stdin: Option<&str>) -> (Option<i32>, String) {
+    let mut call = oracle(tool).args(args);
+    if let Some(script) = stdin {
+        call = call.stdin(script.as_bytes().to_vec());
+    }
+    let out = call.output();
     (
         out.status.code(),
         format!(
-            "{program} {args:?}: {}{}",
+            "{tool} {args:?}: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ),
@@ -59,16 +47,14 @@ fn run(program: &str, args: &[&str], stdin: Option<&str>) -> (Option<i32>, Strin
 }
 
 fn fresh_image(tag: &str, features: &str) -> String {
-    let mkfs = oracle_tool("mkfs.ext4");
-    oracle_tool("e2fsck");
-    oracle_tool("debugfs");
+    let mkfs = "mkfs.ext4";
     let image =
         fs_ext4_test_support::temp_path!("fs_ext4_jbd2_csum_{tag}_{}.img", std::process::id());
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
     let (code, log) = run(
-        &mkfs,
+        mkfs,
         &["-q", "-F", "-b", "4096", "-O", features, &image],
         None,
     );
@@ -90,7 +76,7 @@ fn read_block(image: &str, block: u64) -> Vec<u8> {
 }
 
 fn incompat_features(image: &str) -> String {
-    let (_, log) = run(&oracle_tool("dumpe2fs"), &["-h", image], None);
+    let (_, log) = run("dumpe2fs", &["-h", image], None);
     log.lines()
         .filter(|l| l.starts_with("Journal features:"))
         .collect()
@@ -181,8 +167,8 @@ fn e2fsck_replays_what_this_crate_committed(tag: &str, features: &str, bits: u32
         );
     }
 
-    let e2fsck = oracle_tool("e2fsck");
-    let (code, log) = run(&e2fsck, &["-fy", &image], None);
+    let e2fsck = "e2fsck";
+    let (code, log) = run(e2fsck, &["-fy", &image], None);
     assert!(matches!(code, Some(0 | 1)), "[{tag}] {log}");
     for (i, &block) in TARGETS.iter().enumerate() {
         assert!(
@@ -190,7 +176,7 @@ fn e2fsck_replays_what_this_crate_committed(tag: &str, features: &str, bits: u32
             "[{tag}] e2fsck did not replay block {block} of the crate's transaction: {log}"
         );
     }
-    let (code, log) = run(&e2fsck, &["-fn", &image], None);
+    let (code, log) = run(e2fsck, &["-fn", &image], None);
     assert_eq!(code, Some(0), "[{tag}] {log}");
     let _ = std::fs::remove_file(&image);
 }
@@ -226,11 +212,7 @@ fn debugfs_journal(tag: &str) -> String {
     std::fs::write(&data, bytes).unwrap();
     let blocks = TARGETS.map(|b| b.to_string()).join(",");
     let script = format!("jo -c\njw -b {blocks} -r {REVOKED} {data}\njc\n");
-    let (code, log) = run(
-        &oracle_tool("debugfs"),
-        &["-w", "-f", "-", &image],
-        Some(&script),
-    );
+    let (code, log) = run("debugfs", &["-w", "-f", "-", &image], Some(&script));
     let _ = std::fs::remove_file(&data);
     assert!(code == Some(0) && log.contains("Setting csum v3"), "{log}");
     image

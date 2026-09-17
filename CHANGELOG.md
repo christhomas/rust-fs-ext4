@@ -30,17 +30,49 @@
 
 - **The test contract is chore tasks, and the first consumer of
   [fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness).**
-  `chore tools` installs the host oracle tools (e2fsprogs), `chore fixtures`
-  builds the kernel-made `test-disks/*.img` in the harness VM,
-  `chore test:unit` runs what needs neither, `chore test:oracle` runs the
-  e2fsprogs oracles, and `chore test` runs everything exactly as CI does
-  (`unit`, `fixtures`, `test` on x86_64 and aarch64, and the `ci-ok` gate).
-  `chore siblings` checks out `../rust-fs-core` and the harness at their
-  pinned refs.
+  `chore tools` verifies what the HOST needs, `chore fixtures` builds the
+  kernel-made `test-disks/*.img` in the harness VM, `chore test:unit` runs
+  what needs no tool, fixture or VM, `chore test:images` what reads a
+  fixture but needs no VM, `chore test:oracle` the e2fsprogs oracles,
+  `chore test:kernel` the kernel oracles, `chore test:vm` the whole suite
+  inside the guest, and `chore test` everything exactly as CI does
+  (`unit`, `fixtures`, `test`, `test-arm64`, `suite-in-vm`, and the
+  `ci-ok` gate). `chore siblings` checks out `../rust-fs-core` and the
+  harness at their pinned refs.
+- **THE ORACLE TOOLS RUN IN THE HARNESS VM, NEVER ON THE HOST.**
+  `e2fsck`, `debugfs`, `dumpe2fs`, `tune2fs` and `mke2fs` are no longer
+  installed on any development machine or CI runner: e2fsprogs on a
+  workstation is whatever that machine has — a keg-only Homebrew formula
+  on a Mac, a distribution build on Linux, a different version per
+  developer — and an oracle whose answer depends on which laptop asked is
+  not an oracle. `scripts/vm-setup.sh` installs them in one Debian guest,
+  `fs_ext4_test_support::oracle(tool)` is the only way a test reaches one
+  (it returns the tool's own `Output`: same exit status, same streams),
+  and `tests/test_contract.rs` fails the suite if a test spawns one
+  itself, drives the VM itself, or mounts anything on the host. A Mac now
+  needs no e2fsprogs at all. `chore tools` checks ripgrep and the VM host
+  requirements instead.
+  The VM is booted once per run — the first oracle call brings it up, and
+  every later call rides one multiplexed SSH connection, about 0.1 s per
+  tool invocation — and the chore reaper stops it when the invocation
+  ends.
+- **We run the Linux tests on Linux.** On a Linux host `chore test`
+  compiles and runs the suite natively as before; on macOS it runs
+  `chore test:vm`, which builds and runs the same sources inside the
+  guest (`scripts/guest-suite.sh`, the harness's `[test] guest_command`,
+  with the toolchain `rust-toolchain.toml` pins installed in the VM and a
+  build directory on the VM's own disk so later runs are incremental). CI
+  exercises that path on every pull request (`suite-in-vm`).
+- **Scratch files live inside the repository** (`./tmp`), on every machine
+  and on CI alike, because the guest sees this repository and nothing else
+  of the host: an image under `/tmp` or `$RUNNER_TEMP` does not exist for
+  the tool asked to read it. `FS_EXT4_TEST_TMPDIR` still names an exact
+  directory and is now refused when it is outside the repository;
+  `FS_EXT4_TEST_TMP_BASE` is gone.
 - **No test skips.** Every test that returned early when a fixture or an
-  e2fsprogs tool was missing now fails naming `chore fixtures` or
-  `chore tools` (`fs_ext4_test_support::fixture`, `oracle_tool`,
-  `assert_e2fsck_clean`).
+  e2fsprogs tool was missing now fails naming the task that provides it
+  (`fs_ext4_test_support::fixture`, `oracle`, `assert_e2fsck_clean`, and
+  the guest-kernel helpers).
 - The `validate-mkfs-bin` CI job (and release.yml's `validate-fsck`) is now
   `tests/mkfs_bin_fsck_oracle.rs`, so it runs locally too.
 - `tests/lwext4_cross_validate.rs` is one `#[ignore]`d test that fails when
@@ -49,6 +81,24 @@
 
 ### Added
 
+- **Kernel oracles: the driver writes, and the REAL KERNEL reads back.**
+  `tests/kernel_readback.rs` (Rust API) and `tests/kernel_readback_capi.rs`
+  (C ABI) build a tree on a fresh volume — directories, a multi-megabyte
+  file written in several unaligned pieces, a short and a long symlink,
+  xattrs, a POSIX ACL, a rename, an unlink, a truncate — then loop-mount
+  the image read-only inside the harness VM and compare every name, type,
+  mode, size, symlink target, xattr, ACL and SHA-256 against what was
+  written, in ONE guest call. `this_driver_reads_back_what_the_kernel_wrote`
+  goes the other way (the kernel writes into our image; the C ABI reads it
+  back), and `a_flipped_data_byte_fails_the_comparison_and_not_e2fsck`
+  flips one byte of file data and proves `e2fsck -fn` still calls the
+  volume clean while the readback catches it — the comparison can fail, so
+  its passing means something. `chore test:kernel`.
+  They found two real defects in the tests' own understanding of the
+  format, which is what an independent oracle is for: an ext4 ACL is
+  version 1 (not the userspace xattr format's 2) and its entries without
+  an id are four bytes, not eight — the kernel refuses either mistake on a
+  volume `e2fsck` calls clean.
 - `tests/oracle_debugfs.rs`: the driver writes (Rust API and C ABI), and
   `debugfs` reads every byte back (`dump` + compare) and the metadata
   (`stat`, `ex`, `icheck`, `ncheck`, `logdump`), with `e2fsck -fn` for

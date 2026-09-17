@@ -11,26 +11,24 @@
 //! could not be made.
 //!
 //! Volumes come from `mkfs.ext4`, and `e2fsck -fn` must accept every result.
-//! Fails without e2fsprogs (`chore tools`).
+//! The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 fn mkfs(tag: &str) -> String {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
+    let mkfs = "mkfs.ext4";
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_prealloc_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-b", "4096"])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
@@ -40,10 +38,9 @@ fn mkfs(tag: &str) -> String {
 }
 
 fn e2fsck_clean(path: &str) {
-    let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+    let out = fs_ext4_test_support::oracle("e2fsck")
         .args(["-fn", path])
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "e2fsck -fn rejected the volume:\n{}{}",

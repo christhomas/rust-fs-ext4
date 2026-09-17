@@ -17,11 +17,13 @@
 //!   the device's last block (81919), not at a full group boundary.
 //!
 //! `-f` forces a full check and `-n` refuses every repair, so fsck reports
-//! without touching the image and exits non-zero on any problem. The tools
-//! come from `chore tools`; a missing one fails the test.
+//! without touching the image and exits non-zero on any problem. The
+//! e2fsprogs tools run in the harness VM; THIS CRATE'S OWN `mkfs.ext4`
+//! runs on the host, because it is the thing under test rather than an
+//! oracle.
 
-use fs_ext4_test_support::oracle_tool;
-use std::process::{Command, Output};
+use fs_ext4_test_support::oracle;
+use std::process::Command;
 
 const MKFS: &str = env!("CARGO_BIN_EXE_mkfs_ext4");
 
@@ -35,24 +37,17 @@ fn image(name: &str, size: u64) -> String {
     path
 }
 
-fn run(program: &str, args: &[&str]) -> Output {
-    let out = Command::new(program)
+/// THIS CRATE'S OWN `mkfs.ext4`, on the host: it is the thing under
+/// test, not an oracle, and it is a Rust binary the host just built.
+fn mkfs_bin(args: &[&str]) -> String {
+    let out = Command::new(MKFS)
         .args(args)
         .output()
-        .unwrap_or_else(|e| panic!("run {program}: {e}"));
-    eprintln!(
-        "[oracle] {program} {} -> {:?}",
-        args.join(" "),
-        out.status.code()
-    );
-    out
-}
-
-fn succeeds(program: &str, args: &[&str]) -> String {
-    let out = run(program, args);
+        .unwrap_or_else(|e| panic!("run {MKFS}: {e}"));
+    report("mkfs_ext4", args, out.status.code());
     assert!(
         out.status.success(),
-        "{program} {} failed ({:?}):\n{}{}",
+        "mkfs_ext4 {} failed ({:?}):\n{}{}",
         args.join(" "),
         out.status.code(),
         String::from_utf8_lossy(&out.stdout),
@@ -61,28 +56,43 @@ fn succeeds(program: &str, args: &[&str]) -> String {
     String::from_utf8_lossy(&out.stdout).into_owned()
 }
 
+/// An e2fsprogs tool, in the harness VM, which must succeed.
+fn succeeds(tool: &str, args: &[&str]) -> String {
+    let out = oracle(tool).args(args).output();
+    assert!(
+        out.status.success(),
+        "{tool} {} failed ({:?}):\n{}{}",
+        args.join(" "),
+        out.status.code(),
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+    String::from_utf8_lossy(&out.stdout).into_owned()
+}
+
+fn report(program: &str, args: &[&str], code: Option<i32>) {
+    println!("[oracle host] {program} {} -> {code:?}", args.join(" "));
+}
+
 fn fsck(args: &[&str]) {
-    succeeds(&oracle_tool("fsck.ext4"), args);
+    succeeds("fsck.ext4", args);
 }
 
 #[test]
 fn single_group_image_passes_fsck_and_keeps_its_label_and_uuid() {
     let img = image("single", 32 * 1024 * 1024);
-    succeeds(
-        MKFS,
-        &[
-            "-L",
-            "CITEST",
-            "-U",
-            "deadbeef-cafe-1234-5678-0123456789ab",
-            &img,
-        ],
-    );
+    mkfs_bin(&[
+        "-L",
+        "CITEST",
+        "-U",
+        "deadbeef-cafe-1234-5678-0123456789ab",
+        &img,
+    ]);
     fsck(&["-fnv", &img]);
 
     // tune2fs prints the on-disk superblock: the arguments reached the
     // bytes fsck just validated.
-    let sb = succeeds(&oracle_tool("tune2fs"), &["-l", &img]);
+    let sb = succeeds("tune2fs", &["-l", &img]);
     let field = |name: &str| {
         sb.lines()
             .find(|l| l.starts_with(name))
@@ -102,8 +112,8 @@ fn single_group_image_passes_fsck_and_keeps_its_label_and_uuid() {
 fn multi_group_images_pass_fsck_through_primary_and_backup_superblocks() {
     let mg3 = image("mg3", 320 * 1024 * 1024);
     let mg5 = image("mg5", 640 * 1024 * 1024);
-    succeeds(MKFS, &["-L", "CIMULTI3", &mg3]);
-    succeeds(MKFS, &["-L", "CIMULTI5", &mg5]);
+    mkfs_bin(&["-L", "CIMULTI3", &mg3]);
+    mkfs_bin(&["-L", "CIMULTI5", &mg5]);
 
     fsck(&["-fnv", &mg3]);
     fsck(&["-fnv", &mg5]);
@@ -112,7 +122,7 @@ fn multi_group_images_pass_fsck_through_primary_and_backup_superblocks() {
     fsck(&["-fn", "-b", "98304", "-B", "4096", &mg5]);
 
     // The short final group ends at the last block of the device.
-    let groups = succeeds(&oracle_tool("dumpe2fs"), &[&mg3]);
+    let groups = succeeds("dumpe2fs", &[&mg3]);
     let layout: Vec<&str> = groups.lines().filter(|l| l.starts_with("Group ")).collect();
     assert!(
         groups.contains("Group 2: (Blocks 65536-81919)"),

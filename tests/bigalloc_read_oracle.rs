@@ -6,14 +6,13 @@
 //! byte-identical to its source and to `debugfs cat`. A write must be
 //! refused naming the feature, since the allocator counts blocks where the
 //! bitmaps count clusters, and so must the audit, for the same reason.
-//! Fails when e2fsprogs is not installed (`chore tools`).
+//! The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 #![cfg(unix)]
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::features::RoCompat;
 use fs_ext4::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 fn read(fs: &Filesystem, path: &str) -> Vec<u8> {
@@ -43,8 +42,8 @@ fn content(seed: u32, len: usize) -> Vec<u8> {
 }
 
 fn bigalloc_volume(block: u32, cluster: u32, size_mib: u64, min_groups: usize) {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
-    let debugfs = fs_ext4_test_support::oracle_tool("debugfs");
+    let mkfs = "mkfs.ext4";
+    let debugfs = "debugfs";
     let tag = format!("bigalloc_{block}_{cluster}");
     let root = fs_ext4_test_support::temp_path!("fs_ext4_{tag}_{}", std::process::id());
     std::fs::create_dir_all(format!("{root}/d/e")).unwrap();
@@ -66,14 +65,13 @@ fn bigalloc_volume(block: u32, cluster: u32, size_mib: u64, min_groups: usize) {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(size_mib * 1024 * 1024))
         .unwrap();
-    let out = Command::new(&mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-O", "bigalloc", "-b"])
         .arg(block.to_string())
         .arg("-C")
         .arg(cluster.to_string())
         .args(["-d", &root, &image])
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
@@ -95,10 +93,9 @@ fn bigalloc_volume(block: u32, cluster: u32, size_mib: u64, min_groups: usize) {
             "[{tag}] {path} differs from its source"
         );
     }
-    let reference = Command::new(&debugfs)
+    let reference = fs_ext4_test_support::oracle(debugfs)
         .args(["-R", "cat /d/big.bin", &image])
-        .output()
-        .unwrap();
+        .output();
     assert!(
         read(&fs, "/d/big.bin") == reference.stdout,
         "[{tag}] debugfs cat"

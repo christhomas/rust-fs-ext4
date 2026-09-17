@@ -8240,7 +8240,7 @@ mod tests {
         );
     }
 
-    /// Tests that run an oracle tool (`chore tools`): mkfs.ext4, e2fsck.
+    /// Tests that run an oracle tool (they run in the harness VM): mkfs.ext4, e2fsck.
     mod needs_host {
         use super::*;
 
@@ -8258,11 +8258,10 @@ mod tests {
                 .unwrap()
                 .set_len(16284 * 4096)
                 .unwrap();
-            let made = std::process::Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
+            let made = fs_ext4_test_support::oracle("mkfs.ext4")
                 .args(["-q", "-F", "-b", "4096", "-g", "4096", "-O", "^has_journal"])
                 .arg(&img)
-                .output()
-                .expect("run mkfs.ext4");
+                .output();
             assert!(
                 made.status.success(),
                 "{}",
@@ -8296,7 +8295,7 @@ mod tests {
         /// return value or the superblock delta: those are `len` before and
         /// after the fix alike. Measured before it: group 1 credited 8 and
         /// group 2 credited 0, its four bits left set. Fails without mkfs.ext4
-        /// (`chore tools`).
+        /// (they run in the harness VM).
         #[test]
         fn a_freed_run_across_a_group_boundary_credits_both_groups() {
             let dir = fs_ext4_test_support::temp_dir()
@@ -8307,7 +8306,7 @@ mod tests {
                 .unwrap()
                 .set_len(64 * 1024 * 1024)
                 .unwrap();
-            let made = std::process::Command::new(fs_ext4_test_support::oracle_tool("mkfs.ext4"))
+            let made = fs_ext4_test_support::oracle("mkfs.ext4")
                 .args([
                     "-q",
                     "-F",
@@ -8319,8 +8318,7 @@ mod tests {
                     "^metadata_csum,^has_journal",
                 ])
                 .arg(&img)
-                .output()
-                .expect("run mkfs.ext4");
+                .output();
             assert!(
                 made.status.success(),
                 "{}",
@@ -8460,11 +8458,10 @@ mod tests {
                 std::process::id()
             ));
             std::fs::write(&image, &*dev.bytes.lock().unwrap()).unwrap();
-            let out = std::process::Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+            let out = fs_ext4_test_support::oracle("e2fsck")
                 .arg("-fn")
                 .arg(&image)
-                .output()
-                .expect("run e2fsck");
+                .output();
             let _ = std::fs::remove_file(&image);
             assert!(
                 out.status.success(),

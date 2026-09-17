@@ -1,66 +1,52 @@
 #!/usr/bin/env bash
 #
-# tools.sh — install and verify the host oracle tools (`chore tools`).
+# tools.sh — what the HOST needs (`chore tools`).
 #
-#   tools.sh           install what is missing, then verify every tool
+#   tools.sh           install what is missing, then verify
 #   tools.sh --check   verify only; exit 1 naming what is missing
 #
-# The oracle tests (`chore test:oracle`) run on the HOST: e2fsprogs'
-# mke2fs builds images, debugfs reads content and metadata back, e2fsck
-# checks consistency, dumpe2fs and tune2fs read the superblock. The script
-# tests (`chore test:scripts`) search the tree with ripgrep. Tests never
-# skip when one is missing — they fail and name this task — so this is the
-# one place that knows how to get them.
+# THE ORACLE TOOLS ARE NOT HERE, AND THAT IS THE POINT. e2fsprogs —
+# mke2fs, debugfs, e2fsck, dumpe2fs, tune2fs — runs inside the
+# fs-linux-test-harness VM, provisioned by scripts/vm-setup.sh, and
+# nowhere else. A workstation therefore installs none of it: no keg-only
+# Homebrew formula on a Mac, no distribution build whose version differs
+# from the next machine's, and no chance of an oracle answering
+# differently depending on who asked. tests/support/src/oracle.rs is the
+# only way a test reaches one, and tests/test_contract.rs fails the suite
+# if anything runs one on the host.
 #
-#   Linux   apt-get (with sudo when not root). e2fsprogs is also what
-#           the harness VM installs for the fixture builder, so host and
-#           guest agree on what the tools are.
-#   macOS   prints the Homebrew formula: e2fsprogs is keg-only there,
-#           and the tests find it under $(brew --prefix e2fsprogs)
-#           without it being on PATH.
+# What the host does need:
 #
-# The VM the fixtures need is checked separately: `chore vm:host:check`.
+#   ripgrep      the script tests (`chore test:scripts`) search the tree
+#                with it; a check written around a missing rg reports
+#                PASS having matched nothing
+#   the VM       Vagrant, QEMU and KVM/HVF — checked by the harness
+#                itself (../fs-linux-test-harness/scripts/host-tools.sh,
+#                also `chore vm:host:check`), which knows what it needs
+#                on each platform
+#
+# `--check` LEAVES THE VM OUT. It is the early gate the test tasks run so
+# that a missing ripgrep fails once instead of in every script test, and
+# it is also what the architecture-only CI job can run on a machine with
+# no KVM at all. Whether the VM works is answered by booting it: the
+# first oracle call does that, and says what to install when it cannot.
 set -euo pipefail
+
+REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd -P)"
+HARNESS_TOOLS="$REPO/../fs-linux-test-harness/scripts/host-tools.sh"
 
 MODE=install
 [ "${1:-}" = "--check" ] && MODE=check
 
-# 1.47.0 is the first e2fsprogs that knows `orphan_file`, and the oracle
-# tests turn it off by name (`-O ^orphan_file`, a feature this driver
-# does not write); older releases refuse the option outright. It is also
-# what Debian 12 and Ubuntu 24.04 ship.
-MIN_E2FSPROGS=1.47.0
 # tool:debian-package:homebrew-formula
-TOOLS="mke2fs:e2fsprogs:e2fsprogs mkfs.ext4:e2fsprogs:e2fsprogs e2fsck:e2fsprogs:e2fsprogs
-fsck.ext4:e2fsprogs:e2fsprogs debugfs:e2fsprogs:e2fsprogs dumpe2fs:e2fsprogs:e2fsprogs
-tune2fs:e2fsprogs:e2fsprogs rg:ripgrep:ripgrep"
+TOOLS="rg:ripgrep:ripgrep"
 
-# Find a tool the way tests/common/mod.rs (oracle_tool) does.
-find_tool() {
-    local name="$1" d
-    for d in ${PATH//:/ } /usr/sbin /sbin /usr/local/sbin \
-        /opt/homebrew/opt/e2fsprogs/sbin /usr/local/opt/e2fsprogs/sbin; do
-        [ -x "$d/$name" ] && { echo "$d/$name"; return 0; }
-    done
-    return 1
-}
-
-# The entries whose tool is missing.
 missing() {
     local entry out=""
     for entry in $TOOLS; do
-        find_tool "${entry%%:*}" >/dev/null || out="$out $entry"
+        command -v "${entry%%:*}" >/dev/null 2>&1 || out="$out $entry"
     done
     echo "${out# }"
-}
-
-# The distinct package names (field 2 or 3) of some entries.
-packages() {
-    local field="$1" entry
-    shift
-    for entry in "$@"; do
-        echo "$entry" | cut -d: -f"$field"
-    done | sort -u | tr '\n' ' '
 }
 
 names() {
@@ -68,8 +54,10 @@ names() {
     for entry in "$@"; do printf '%s ' "${entry%%:*}"; done
 }
 
-version_ge() {
-    [ "$(printf '%s\n%s\n' "$2" "$1" | sort -V | head -1)" = "$2" ]
+packages() {
+    local field="$1" entry
+    shift
+    for entry in "$@"; do echo "$entry" | cut -d: -f"$field"; done | sort -u | tr '\n' ' '
 }
 
 install_linux() {
@@ -78,7 +66,7 @@ install_linux() {
     pkgs="$(packages 2 $(missing))"
     [ "$(id -u)" -eq 0 ] || sudo="sudo"
     if ! command -v apt-get >/dev/null 2>&1; then
-        echo "tools: no apt-get on this Linux host; install with its package manager: $pkgs(e2fsprogs >= $MIN_E2FSPROGS)" >&2
+        echo "tools: no apt-get on this Linux host; install with its package manager: $pkgs" >&2
         exit 1
     fi
     echo "tools: installing with apt-get: $pkgs"
@@ -96,7 +84,6 @@ if [ -n "$gap" ] && [ "$MODE" = install ]; then
             echo "tools: missing on this Mac: $(names $gap)" >&2
             # shellcheck disable=SC2086
             echo "       brew install $(packages 3 $gap)" >&2
-            echo "       (keg-only: the tests find it under \$(brew --prefix e2fsprogs)/sbin)" >&2
             exit 1
             ;;
         *) echo "tools: unsupported host $(uname -s)" >&2; exit 1 ;;
@@ -110,12 +97,16 @@ if [ -n "$gap" ]; then
     exit 1
 fi
 
-version="$("$(find_tool mke2fs)" -V 2>&1 | sed -n 's/^mke2fs \([0-9][0-9.]*\).*/\1/p' | head -1)"
-if [ -z "$version" ] || ! version_ge "$version" "$MIN_E2FSPROGS"; then
-    echo "tools: e2fsprogs ${version:-of unknown version} is older than $MIN_E2FSPROGS" >&2
+printf '  %-9s %s\n' rg "$(command -v rg)"
+echo "tools: $(rg --version | head -1) — the host's own tools are present"
+echo "tools: the oracle tools live in the harness VM (scripts/vm-setup.sh), not here."
+
+[ "$MODE" = check ] && exit 0
+
+if [ ! -x "$HARNESS_TOOLS" ]; then
+    echo "tools: the fs-linux-test-harness sibling is not checked out." >&2
+    echo "       Run 'chore siblings'. The oracle tools, the fixtures and the" >&2
+    echo "       kernel tests all run in its VM." >&2
     exit 1
 fi
-for entry in $TOOLS; do
-    printf '  %-9s %s\n' "${entry%%:*}" "$(find_tool "${entry%%:*}")"
-done
-echo "tools: e2fsprogs $version, $(rg --version | head -1) — all present"
+"$HARNESS_TOOLS"

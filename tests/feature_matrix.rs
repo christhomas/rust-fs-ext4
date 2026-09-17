@@ -18,10 +18,9 @@
 //! fs-linux-test-harness VM because most fixtures require a real mount to
 //! populate. The images here need only `mke2fs` — nothing is written into
 //! them, the feature bits in the superblock are the whole point — so the
-//! test builds them itself. It fails without e2fsprogs (`chore tools`).
+//! test builds them itself. It fails when the harness VM the e2fsprogs tools run in is unreachable.
 
 use std::path::{Path, PathBuf};
-use std::process::Command;
 use std::sync::Arc;
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
@@ -32,17 +31,16 @@ const ROOT_INO: u32 = 2;
 
 /// Build a 16 MiB image with the given `mke2fs` options.
 fn build(name: &str, opts: &[&str]) -> PathBuf {
-    let mke2fs = fs_ext4_test_support::oracle_tool("mke2fs");
+    let mke2fs = "mke2fs";
     let path =
         fs_ext4_test_support::temp_dir().join(format!("fs-ext4-fm-{}-{name}", std::process::id()));
     let _ = std::fs::remove_file(&path);
     std::fs::write(&path, vec![0u8; 16 * 1024 * 1024]).expect("allocate image");
-    let out = Command::new(&mke2fs)
+    let out = fs_ext4_test_support::oracle(mke2fs)
         .args(["-q", "-F"])
         .args(opts)
         .arg(&path)
-        .output()
-        .expect("run mke2fs");
+        .output();
     assert!(
         out.status.success(),
         "mke2fs {opts:?} failed: {}",

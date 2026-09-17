@@ -1,82 +1,47 @@
+//! Where scratch files go, and why there is only one answer.
+//!
+//! The oracle tools run inside the fs-linux-test-harness VM, which sees
+//! this repository at the path the host knows it by and nothing else of
+//! the host. An image under `/tmp`, or under `$RUNNER_TEMP` on CI, is a
+//! path `e2fsck` cannot open when it is asked to read it. So the scratch
+//! root is inside the repository on every machine, and a caller that
+//! names one outside it is refused rather than left to fail later with
+//! "No such file or directory" in a guest.
+
 use fs_ext4_test_support::{materialize_temp_dir, select_temp_dir};
 use std::ffi::OsStr;
 use std::path::Path;
 
 #[test]
-fn scratch_location_follows_explicit_ci_pi_then_platform_policy() {
+fn scratch_lives_in_the_repository_by_default() {
     let worktree = Path::new("/worktree");
-    let platform = Path::new("/platform/tmp");
-
+    assert_eq!(select_temp_dir(None, worktree), worktree.join("tmp"));
     assert_eq!(
-        select_temp_dir(
-            Some(OsStr::new("/explicit/nvme")),
-            Some(OsStr::new("/managed/base")),
-            true,
-            Some(OsStr::new("/runner/tmp")),
-            Some(b"Raspberry Pi 5 Model B"),
-            worktree,
-            platform,
-        ),
-        Path::new("/explicit/nvme")
-    );
-    assert_eq!(
-        select_temp_dir(
-            None,
-            Some(OsStr::new("/managed/base")),
-            true,
-            Some(OsStr::new("/runner/tmp")),
-            None,
-            worktree,
-            platform
-        ),
-        Path::new("/managed/base")
-    );
-    assert_eq!(
-        select_temp_dir(
-            None,
-            None,
-            true,
-            Some(OsStr::new("/runner/tmp")),
-            Some(b"Generic ARM Server"),
-            worktree,
-            platform
-        ),
-        Path::new("/runner/tmp")
-    );
-    assert_eq!(
-        select_temp_dir(None, None, true, None, None, worktree, platform),
-        platform
-    );
-    assert_eq!(
-        select_temp_dir(
-            None,
-            None,
-            false,
-            None,
-            Some(b"Raspberry Pi 5 Model B Rev 1.1\0"),
-            worktree,
-            platform,
-        ),
-        worktree.join("tmp")
-    );
-    assert_eq!(
-        select_temp_dir(
-            None,
-            None,
-            false,
-            None,
-            Some(b"Generic ARM Server"),
-            worktree,
-            platform
-        ),
-        platform
+        select_temp_dir(Some(OsStr::new("")), worktree),
+        worktree.join("tmp"),
+        "an empty FS_EXT4_TEST_TMPDIR is no choice at all"
     );
 }
 
 #[test]
+fn an_explicit_directory_inside_the_repository_is_taken_exactly() {
+    let worktree = Path::new("/worktree");
+    assert_eq!(
+        select_temp_dir(Some(OsStr::new("/worktree/scratch/run-1")), worktree),
+        Path::new("/worktree/scratch/run-1")
+    );
+}
+
+#[test]
+#[should_panic(expected = "which is outside")]
+fn an_explicit_directory_outside_the_repository_is_refused() {
+    select_temp_dir(Some(OsStr::new("/tmp/elsewhere")), Path::new("/worktree"));
+}
+
+#[test]
 fn every_non_explicit_root_creates_a_unique_child() {
-    let base =
-        std::env::temp_dir().join(format!("fs-ext4-temp-policy-test.{}", std::process::id()));
+    let base = fs_ext4_test_support::temp_dir()
+        .join(format!("fs-ext4-temp-policy-test.{}", std::process::id()));
     let first = materialize_temp_dir(None, &base).expect("first managed child");
     let second = materialize_temp_dir(None, &base).expect("second managed child");
 
@@ -91,7 +56,7 @@ fn every_non_explicit_root_creates_a_unique_child() {
 
 #[test]
 fn explicit_directory_is_preserved_exactly() {
-    let exact = std::env::temp_dir().join(format!(
+    let exact = fs_ext4_test_support::temp_dir().join(format!(
         "fs-ext4-explicit-policy-test.{}",
         std::process::id()
     ));

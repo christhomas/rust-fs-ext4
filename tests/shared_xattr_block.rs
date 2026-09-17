@@ -17,27 +17,24 @@
 //! the block's count set to 2, all checksums restamped. `e2fsck -fn` must
 //! accept that before anything is done to it, and after each operation on
 //! `/a`, and `/b` must still read its attribute. Fails without e2fsprogs
-//! (`chore tools`).
+//! (they run in the harness VM).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 const NAME: &str = "user.shared";
 
 fn mkfs(tag: &str) -> String {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_shared_xattr_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-I", "256"])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
@@ -47,10 +44,9 @@ fn mkfs(tag: &str) -> String {
 }
 
 fn e2fsck_clean(path: &str, what: &str) {
-    let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+    let out = fs_ext4_test_support::oracle("e2fsck")
         .args(["-fn", path])
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "[{what}] e2fsck -fn rejected the volume:\n{}",

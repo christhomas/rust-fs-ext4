@@ -13,7 +13,7 @@
 //! - A finished commit, and a replay by this crate, leave neither the flag
 //!   nor a dirty journal behind.
 //!
-//! Fails when e2fsprogs is not installed (`chore tools`).
+//! The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 #![cfg(unix)]
 
@@ -21,8 +21,7 @@ use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::error::Result;
 use fs_ext4::journal_writer::JournalWriter;
 use fs_ext4::Filesystem;
-use fs_ext4_test_support::oracle_tool;
-use std::process::Command;
+use fs_ext4_test_support::oracle;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -32,15 +31,12 @@ const TARGETS: [u64; 3] = [9000, 9001, 9002];
 const RECOVER: u32 = 0x4;
 const CLEAR_BUT_DATA: &str = "needs_recovery flag is clear, but journal has data";
 
-fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
+fn run(tool: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = oracle(tool).args(args).output();
     (
         out.status.code(),
         format!(
-            "{program} {args:?}: {}{}",
+            "{tool} {args:?}: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ),
@@ -50,24 +46,23 @@ fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
 /// A fresh `metadata_csum` image whose journal declares CSUM_V3, as the
 /// kernel's first mount leaves it.
 fn fresh_image(tag: &str) -> String {
-    let mkfs = oracle_tool("mkfs.ext4");
-    oracle_tool("e2fsck");
-    let debugfs = oracle_tool("debugfs");
+    let mkfs = "mkfs.ext4";
+    let debugfs = "debugfs";
     let image =
         fs_ext4_test_support::temp_path!("fs_ext4_recover_{tag}_{}.img", std::process::id());
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let (code, log) = run(&mkfs, &["-q", "-F", "-b", "4096", &image]);
+    let (code, log) = run(mkfs, &["-q", "-F", "-b", "4096", &image]);
     assert_eq!(code, Some(0), "{log}");
     // `jo -c` sets the checksum feature; an empty `jc` commit is replayed
     // and cleared by `e2fsck` so the image starts clean.
     let script = format!("{image}.cmds");
     std::fs::write(&script, "jo -c\njc\n").unwrap();
-    let (code, log) = run(&debugfs, &["-w", "-f", &script, &image]);
+    let (code, log) = run(debugfs, &["-w", "-f", &script, &image]);
     let _ = std::fs::remove_file(&script);
     assert_eq!(code, Some(0), "{log}");
-    let (code, log) = run(&oracle_tool("e2fsck"), &["-fy", &image]);
+    let (code, log) = run("e2fsck", &["-fy", &image]);
     assert!(matches!(code, Some(0 | 1)), "{log}");
     assert!(
         !flag_set(&image),
@@ -160,7 +155,7 @@ fn a_crash_after_the_journal_is_dirty_leaves_the_flag_for_linux() {
         "a live journal without needs_recovery is wiped by Linux"
     );
 
-    let (code, log) = run(&oracle_tool("e2fsck"), &["-fy", &image]);
+    let (code, log) = run("e2fsck", &["-fy", &image]);
     assert!(matches!(code, Some(0 | 1)), "{log}");
     assert!(!log.contains(CLEAR_BUT_DATA), "{log}");
     for (i, &block) in TARGETS.iter().enumerate() {
@@ -188,11 +183,11 @@ fn a_journaled_superblock_block_keeps_the_flag() {
         flag_set(&image),
         "step 3 wrote a superblock without needs_recovery over a live journal"
     );
-    let (code, log) = run(&oracle_tool("e2fsck"), &["-fy", &image]);
+    let (code, log) = run("e2fsck", &["-fy", &image]);
     assert!(matches!(code, Some(0 | 1)), "{log}");
     assert!(!log.contains(CLEAR_BUT_DATA), "{log}");
     assert!(read_at(&image, TARGETS[0] * BS, BS as usize) == pattern(0));
-    let (code, log) = run(&oracle_tool("e2fsck"), &["-fn", &image]);
+    let (code, log) = run("e2fsck", &["-fn", &image]);
     assert_eq!(code, Some(0), "{log}");
     let _ = std::fs::remove_file(&image);
 }
@@ -202,7 +197,7 @@ fn a_finished_commit_leaves_neither_flag_nor_journal() {
     let image = fresh_image("done");
     commit(&image, &targets(), usize::MAX);
     assert!(!flag_set(&image));
-    let (code, log) = run(&oracle_tool("e2fsck"), &["-fn", &image]);
+    let (code, log) = run("e2fsck", &["-fn", &image]);
     assert_eq!(code, Some(0), "{log}");
     assert!(!log.contains("journal"), "{log}");
     let _ = std::fs::remove_file(&image);
@@ -221,7 +216,7 @@ fn the_crates_replay_clears_the_journal_and_the_flag() {
         assert!(read_at(&image, block * BS, BS as usize) == pattern(i));
     }
     assert!(!flag_set(&image), "replay left needs_recovery set");
-    let (code, log) = run(&oracle_tool("e2fsck"), &["-fn", &image]);
+    let (code, log) = run("e2fsck", &["-fn", &image]);
     assert_eq!(code, Some(0), "{log}");
     assert!(
         !log.contains(CLEAR_BUT_DATA),
@@ -230,7 +225,7 @@ fn the_crates_replay_clears_the_journal_and_the_flag() {
 
     // And the journal the replay left is one the crate writes on again.
     commit(&image, &targets(), usize::MAX);
-    let (code, log) = run(&oracle_tool("e2fsck"), &["-fn", &image]);
+    let (code, log) = run("e2fsck", &["-fn", &image]);
     assert_eq!(code, Some(0), "{log}");
     let _ = std::fs::remove_file(&image);
 }

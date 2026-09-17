@@ -7,25 +7,23 @@
 //! seeded random sequence of operations checked with e2fsck.
 //!
 //! Volumes come from `mkfs.ext4`, extent-mapped and block-mapped, and
-//! `e2fsck -fn` judges each. Fails without e2fsprogs (`chore tools`).
+//! `e2fsck -fn` judges each. The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 fn mkfs(tag: &str, features: &str) -> String {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
+    let mkfs = "mkfs.ext4";
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_replace_xattr_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-b", "4096", "-I", "256", "-O", features])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
@@ -58,10 +56,9 @@ fn replacing_content_keeps_the_xattr_block_counted() {
             fs.apply_replace_file_content("/a", &vec![6u8; len])
                 .unwrap();
             drop(fs);
-            let out = Command::new(fs_ext4_test_support::oracle_tool("e2fsck"))
+            let out = fs_ext4_test_support::oracle("e2fsck")
                 .args(["-fn", &path])
-                .output()
-                .unwrap();
+                .output();
             assert!(
                 out.status.success(),
                 "[{tag} {what}] e2fsck -fn rejected the volume:\n{}",

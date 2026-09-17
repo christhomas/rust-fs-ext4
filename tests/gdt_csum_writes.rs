@@ -13,19 +13,17 @@
 //! groups so directory spreading reaches groups that are still `INODE_UNINIT`
 //! and `BLOCK_UNINIT`, which is where the descriptor edits happen.
 //!
-//! Fails when `mkfs.ext4` or `e2fsck` is not installed (`chore tools`).
+//! `mkfs.ext4` and `e2fsck` run in the harness VM.
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::features::RoCompat;
 use fs_ext4::{Error, Filesystem};
-use fs_ext4_test_support::oracle_tool;
-use std::process::Command;
+use fs_ext4_test_support::oracle;
 use std::sync::Arc;
 
 /// A fresh `mkfs.ext4` volume with `GDT_CSUM` and not `METADATA_CSUM`.
 fn make_volume(tag: &str, sixty_four: bool) -> String {
-    let mkfs = oracle_tool("mkfs.ext4");
-    oracle_tool("e2fsck");
+    let mkfs = "mkfs.ext4";
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_gdt_csum_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
@@ -36,7 +34,7 @@ fn make_volume(tag: &str, sixty_four: bool) -> String {
     } else {
         "^metadata_csum,uninit_bg,^64bit"
     };
-    let out = Command::new(mkfs)
+    let out = oracle(mkfs)
         .args([
             "-q",
             "-F",
@@ -48,8 +46,7 @@ fn make_volume(tag: &str, sixty_four: bool) -> String {
             "lazy_itable_init=1",
         ])
         .arg(&path)
-        .output()
-        .expect("run mkfs.ext4");
+        .output();
     assert!(
         out.status.success(),
         "mkfs.ext4 failed: {}",
@@ -59,10 +56,7 @@ fn make_volume(tag: &str, sixty_four: bool) -> String {
 }
 
 fn e2fsck_clean(path: &str) -> (bool, String) {
-    let out = Command::new(oracle_tool("e2fsck"))
-        .args(["-fn", path])
-        .output()
-        .expect("run e2fsck");
+    let out = oracle("e2fsck").args(["-fn", path]).output();
     (
         out.status.success(),
         format!(

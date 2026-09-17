@@ -951,32 +951,15 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     let text = read_or_panic(&path);
     let document = load_document(&text, &path);
 
-    // jobs.test
+    // jobs.test — x86_64, where GitHub gives us KVM, so the oracles and
+    // the kernel tests can run at all.
     let test = job(&document, "test", &path);
     assert_unconditional(test, "test", "ci.yml");
-    assert_eq!(
-        field(test, "runs-on").and_then(Yaml::as_str),
-        Some("${{ matrix.os }}"),
-        "jobs.test must run each matrix row on its native runner"
-    );
-    let rows = field(test, "strategy")
-        .and_then(|strategy| field(strategy, "matrix"))
-        .and_then(|matrix| field(matrix, "include"))
-        .and_then(Yaml::as_sequence)
-        .unwrap_or_else(|| panic!("jobs.test must use an explicit strategy.matrix.include"));
-    let actual: Vec<(&str, &str)> = rows
-        .iter()
-        .map(|row| {
-            (
-                field(row, "arch").and_then(Yaml::as_str).unwrap_or(""),
-                field(row, "os").and_then(Yaml::as_str).unwrap_or(""),
-            )
-        })
-        .collect();
-    assert_eq!(
-        actual,
-        vec![("x86_64", "ubuntu-24.04"), ("aarch64", "ubuntu-24.04-arm")],
-        "the test job must cover both native standard Linux runner architectures"
+    let runner = field(test, "runs-on").and_then(Yaml::as_str).unwrap_or("");
+    assert!(
+        runner.starts_with("ubuntu-") && !runner.contains("arm"),
+        "jobs.test must run on an x86_64 ubuntu runner: the oracle tools and the kernel \
+         oracles run in a VM, and only those runners have KVM; got {runner:?}"
     );
     assert!(
         needs_of(test).iter().any(|n| n == "fixtures"),
@@ -986,23 +969,78 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     for task in ["tools", "lint", "test"] {
         assert!(
             runs_chore(steps, task),
-            "jobs.test does not run `chore {task}` on every native matrix row"
+            "jobs.test does not run `chore {task}`"
         );
     }
+    assert!(
+        steps
+            .iter()
+            .any(|step| run_of(step).contains("ci-setup-linux.sh")),
+        "jobs.test must set the VM host up with the harness's ci-setup-linux.sh: every \
+         oracle tool call and every kernel mount happens in that VM"
+    );
     assert!(
         steps
             .iter()
             .any(|step| is_artifact_step(step, "download-artifact", "fixtures")),
         "jobs.test must download the `fixtures` artifact the fixtures job built"
     );
-    for step in steps {
+    // NOTHING INSTALLS THE ORACLE TOOLS ON THE RUNNER, and the job proves
+    // it rather than claiming it.
+    assert!(
+        steps.iter().all(|step| !run_of(step).contains("e2fsprogs")),
+        "jobs.test must not install e2fsprogs on the runner: the tools live in the VM"
+    );
+    let debugger = ["debug", "fs"].concat();
+    assert!(
+        steps
+            .iter()
+            .any(|step| run_of(step).contains(&debugger) && run_of(step).contains("::error::")),
+        "jobs.test must make the runner's own oracle tools UNUSABLE before the tests \
+         run — they cannot be uninstalled, they are essential — so that a green run is \
+         evidence every call went to the guest rather than a claim that it did"
+    );
+
+    // jobs.test-arm64 — the architecture the driver ships on, on a runner
+    // with no KVM: the tiers that need no VM.
+    let arm = job(&document, "test-arm64", &path);
+    assert_unconditional(arm, "test-arm64", "ci.yml");
+    assert_eq!(
+        field(arm, "runs-on").and_then(Yaml::as_str),
+        Some("ubuntu-24.04-arm"),
+        "jobs.test-arm64 must run on GitHub's arm64 runner"
+    );
+    let arm_steps = steps_of(arm, "test-arm64");
+    for task in ["lint", "test:unit", "test:images", "test:scripts"] {
+        assert!(
+            runs_chore(arm_steps, task),
+            "jobs.test-arm64 does not run `chore {task}`"
+        );
+    }
+    for step in arm_steps {
         let run = run_of(step);
         assert!(
             !run.contains("qemu-system-") && !run.contains("ci-setup-linux.sh"),
-            "jobs.test runs on GitHub's arm64 runners, which have no KVM, so it must not \
-             start a VM: {run:?}"
+            "GitHub's arm64 runners have no KVM, so jobs.test-arm64 must not start a VM: \
+             {run:?}"
         );
     }
+
+    // jobs.suite-in-vm — the whole suite built and run INSIDE the guest,
+    // which is how a host that is not Linux runs it.
+    let in_vm = job(&document, "suite-in-vm", &path);
+    assert_unconditional(in_vm, "suite-in-vm", "ci.yml");
+    let in_vm_steps = steps_of(in_vm, "suite-in-vm");
+    assert!(
+        runs_chore(in_vm_steps, "test:vm"),
+        "jobs.suite-in-vm must run `chore test:vm`, or the in-guest path rots unnoticed"
+    );
+    assert!(
+        in_vm_steps
+            .iter()
+            .any(|step| run_of(step).contains("ci-setup-linux.sh")),
+        "jobs.suite-in-vm must set the VM host up with the harness's ci-setup-linux.sh"
+    );
 
     // jobs.fixtures
     let fixtures = job(&document, "fixtures", &path);
@@ -1080,7 +1118,22 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
             .get(name)
             .unwrap_or_else(|| panic!("chores.yml has no `{name}` task"))
     };
-    let test_task = task("test");
+    // `test` chooses between the native run and the in-guest one; the
+    // native side is what the gate on a Linux runner executes.
+    let dispatcher = task("test");
+    assert!(
+        !carries_any(&dispatcher.keys, &NON_GATING_TASK_KEYS),
+        "chores.yml `test` must never be skipped as up to date or allowed to fail"
+    );
+    assert!(
+        dispatcher.cmds.iter().any(|cmd| matches!(
+            cmd,
+            ChoreCmd::Shell { command, .. } if command.contains("test:vm")
+        )),
+        "chores.yml `test` must fall to `test:vm` on a host that is not Linux, so the \
+         Linux tests always run on Linux"
+    );
+    let test_task = task("test:native");
     assert!(
         !carries_any(&test_task.keys, &NON_GATING_TASK_KEYS),
         "chores.yml `test` must never be skipped as up to date or allowed to fail"
@@ -1105,10 +1158,10 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
             _ => None,
         })
         .collect();
-    for subtask in ["test:unit", "test:oracle", "test:scripts"] {
+    for subtask in ["test:unit", "test:oracle", "test:kernel", "test:scripts"] {
         assert!(
             subtasks.contains(&subtask),
-            "chores.yml `test` must run `task: {subtask}`; it runs {subtasks:?}"
+            "chores.yml `test:native` must run `task: {subtask}`; it runs {subtasks:?}"
         );
     }
     // Spelled in two pieces so this file does not name the fixture
@@ -1118,7 +1171,7 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
     for check in ["scripts/tools.sh --check", fixtures_check.as_str()] {
         assert!(
             commands.iter().any(|c| c.trim() == check),
-            "chores.yml `test` must run `{check}` first, so a missing tool or fixture fails \
+            "chores.yml `test:native` must run `{check}` first, so a missing tool or fixture fails \
              once, naming the task that provides it; it runs {commands:?}"
         );
     }
@@ -1129,7 +1182,7 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
                 && as_cargo.contains("--release")
                 && !as_cargo.contains("test-targets.sh")
         }),
-        "chores.yml `test` must run the whole suite in the release profile; it runs \
+        "chores.yml `test:native` must run the whole suite in the release profile; it runs \
          {commands:?}"
     );
     assert!(

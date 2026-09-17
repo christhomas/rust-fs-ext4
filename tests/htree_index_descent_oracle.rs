@@ -25,9 +25,8 @@ use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::htree;
 use fs_ext4::inode::{Inode, InodeFlags};
-use fs_ext4_test_support::oracle_tool;
+use fs_ext4_test_support::oracle;
 use std::os::unix::ffi::OsStrExt;
-use std::process::Command;
 use std::sync::Arc;
 
 fn names() -> Vec<Vec<u8>> {
@@ -50,9 +49,9 @@ fn names() -> Vec<Vec<u8>> {
 }
 
 fn run(hash_alg: &str, s_flags: u32) {
-    let mkfs = oracle_tool("mkfs.ext4");
-    let e2fsck = oracle_tool("e2fsck");
-    let debugfs = oracle_tool("debugfs");
+    let mkfs = "mkfs.ext4";
+    let e2fsck = "e2fsck";
+    let debugfs = "debugfs";
     let tag = format!("{hash_alg}_{s_flags}");
     let root = fs_ext4_test_support::temp_path!("fs_ext4_htree_src_{tag}_{}", std::process::id());
     let bigdir = std::path::Path::new(&root).join("bigdir");
@@ -66,8 +65,8 @@ fn run(hash_alg: &str, s_flags: u32) {
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
 
-    let ok = |mut c: Command, what: &str| {
-        let out = c.output().unwrap_or_else(|e| panic!("{what}: {e}"));
+    let ok = |call: fs_ext4_test_support::Oracle, what: &str| {
+        let out = call.output();
         (
             out.status.code(),
             format!(
@@ -77,27 +76,24 @@ fn run(hash_alg: &str, s_flags: u32) {
             ),
         )
     };
-    let mut c = Command::new(&mkfs);
-    c.args(["-q", "-F", "-b", "1024", "-d"])
+    let call = oracle(mkfs)
+        .args(["-q", "-F", "-b", "1024", "-d"])
         .arg(&root)
         .arg(&image);
-    let (code, log) = ok(c, "mkfs.ext4");
+    let (code, log) = ok(call, "mkfs.ext4");
     assert_eq!(code, Some(0), "{log}");
     for request in [
         format!("ssv def_hash_version {hash_alg}"),
         format!("ssv flags {s_flags}"),
     ] {
-        let mut c = Command::new(&debugfs);
-        c.args(["-w", "-R"]).arg(&request).arg(&image);
-        let (code, log) = ok(c, "debugfs ssv");
+        let call = oracle(debugfs).args(["-w", "-R"]).arg(&request).arg(&image);
+        let (code, log) = ok(call, "debugfs ssv");
         assert!(
             code == Some(0) && !log.contains("Invalid"),
             "{request}: {log}"
         );
     }
-    let mut c = Command::new(&e2fsck);
-    c.args(["-fyD"]).arg(&image);
-    let (code, log) = ok(c, "e2fsck -fyD");
+    let (code, log) = ok(oracle(e2fsck).args(["-fyD"]).arg(&image), "e2fsck -fyD");
     assert!(matches!(code, Some(0 | 1)), "{log}");
 
     let fs = Filesystem::mount(Arc::new(

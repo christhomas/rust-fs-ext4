@@ -19,6 +19,16 @@ Every mkfs pins its UUID and directory hash seed, so each build has the same
 layout and checksum seeds; kernel-stamped times still differ between builds.
 A test never skips on a missing image: it fails naming `chore fixtures`.
 
+The same VM is where the ORACLE TOOLS live (`e2fsck`, `debugfs`,
+`dumpe2fs`, `tune2fs`, `mke2fs` — `scripts/vm-setup.sh` installs them) and
+where the KERNEL ORACLES mount: `chore test:kernel` loop-mounts an image
+this driver wrote and compares what Linux reads back with what was
+written. Nothing of the sort happens on the host, on any platform. A test
+reaches a tool only through `fs_ext4_test_support::oracle` and the kernel
+only through the guest-kernel helpers in the same crate; a scratch image
+therefore lives inside the repository (`./tmp`), which is the one part of
+the host the guest can see.
+
 | Image | Exercises |
 |---|---|
 | `ext4-basic.img` | minimal extent + dir entries |

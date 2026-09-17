@@ -8,26 +8,22 @@
 //! buffer cache. The reference is the same image after `e2fsck -fy`, which
 //! recovers the journal with the kernel's code.
 //!
-//! Fails when e2fsprogs is not installed (`chore tools`).
+//! The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 #![cfg(unix)]
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::error::Result;
 use fs_ext4::Filesystem;
-use std::process::Command;
 use std::sync::atomic::{AtomicBool, AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn run(program: &str, args: &[&str]) -> (Option<i32>, String) {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
+fn run(tool: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = fs_ext4_test_support::oracle(tool).args(args).output();
     (
         out.status.code(),
         format!(
-            "{program} {args:?}: {}{}",
+            "{tool} {args:?}: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ),
@@ -84,22 +80,22 @@ fn names(fs: &Filesystem, dir: &str) -> Vec<Vec<u8>> {
 
 #[test]
 fn a_read_only_mount_reads_what_the_journal_committed() {
-    let mkfs = fs_ext4_test_support::oracle_tool("mkfs.ext4");
-    let e2fsck = fs_ext4_test_support::oracle_tool("e2fsck");
-    let debugfs = fs_ext4_test_support::oracle_tool("debugfs");
+    let mkfs = "mkfs.ext4";
+    let e2fsck = "e2fsck";
+    let debugfs = "debugfs";
     let image = fs_ext4_test_support::temp_path!("fs_ext4_ro_replay_{}.img", std::process::id());
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let (code, log) = run(&mkfs, &["-q", "-F", "-b", "4096", &image]);
+    let (code, log) = run(mkfs, &["-q", "-F", "-b", "4096", &image]);
     assert_eq!(code, Some(0), "{log}");
     // A CSUM_V3 journal, as a kernel mount leaves it.
     let script = format!("{image}.cmds");
     std::fs::write(&script, "jo -c\njc\n").unwrap();
-    let (code, log) = run(&debugfs, &["-w", "-f", &script, &image]);
+    let (code, log) = run(debugfs, &["-w", "-f", &script, &image]);
     let _ = std::fs::remove_file(&script);
     assert_eq!(code, Some(0), "{log}");
-    let (code, log) = run(&e2fsck, &["-fy", &image]);
+    let (code, log) = run(e2fsck, &["-fy", &image]);
     assert!(matches!(code, Some(0 | 1)), "{log}");
 
     {
@@ -157,9 +153,9 @@ fn a_read_only_mount_reads_what_the_journal_committed() {
     // The reference: the kernel's recovery code on a copy.
     let recovered = format!("{image}.recovered");
     std::fs::copy(&image, &recovered).unwrap();
-    let (code, log) = run(&e2fsck, &["-fy", &recovered]);
+    let (code, log) = run(e2fsck, &["-fy", &recovered]);
     assert!(matches!(code, Some(0 | 1)), "{log}");
-    let (code, log) = run(&e2fsck, &["-fn", &recovered]);
+    let (code, log) = run(e2fsck, &["-fn", &recovered]);
     assert_eq!(code, Some(0), "{log}");
     let reference = Filesystem::mount(Arc::new(FileDevice::open(&recovered).unwrap())).unwrap();
     assert_eq!(ro_root, names(&reference, "/"));

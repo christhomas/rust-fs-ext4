@@ -11,19 +11,15 @@
 //! directory of names, and `e2fsck -fyD` indexes it. The driver then creates,
 //! links, renames into and unlinks from that directory, and `e2fsck -fn` must
 //! find nothing, with and without metadata_csum. Fails without e2fsprogs
-//! (`chore tools`).
+//! (they run in the harness VM).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::InodeFlags;
-use std::process::Command;
 use std::sync::Arc;
 
-fn run(cmd: &str, args: &[&str]) -> (Option<i32>, String) {
-    let out = Command::new(fs_ext4_test_support::oracle_tool(cmd))
-        .args(args)
-        .output()
-        .unwrap();
+fn run(tool: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = fs_ext4_test_support::oracle(tool).args(args).output();
     (
         out.status.code(),
         format!(

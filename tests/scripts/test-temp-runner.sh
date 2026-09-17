@@ -1,71 +1,54 @@
 #!/usr/bin/env bash
+# scripts/test.sh's scratch policy, exercised as a caller sees it.
+#
+# ONE RULE: the scratch directory is inside this repository. The oracle
+# tools run inside the fs-linux-test-harness VM, which sees this
+# repository at the path the host knows it by and nothing else of the
+# host — so an image under /tmp or $RUNNER_TEMP is a path the tool asked
+# to read it cannot open. The Rust side of the same rule is
+# `select_temp_dir` (tests/test_temp_policy.rs).
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
-TEST_BASE="$REPO/tmp/runner-policy-test"
 OUTPUT="$REPO/tmp/runner-policy-output.txt"
+EXACT="$REPO/tmp/runner-policy-exact"
 
 cleanup() {
     rm -f "$OUTPUT"
-    rmdir "$TEST_BASE" 2>/dev/null || true
+    rmdir "$EXACT" 2>/dev/null || true
 }
 trap cleanup EXIT HUP INT TERM
 
-mkdir -p "$TEST_BASE"
-FS_EXT4_TEST_TMP_BASE="$TEST_BASE" "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
-SELECTED="$(cat "$OUTPUT")"
+fail() { echo "FAIL  $1" >&2; exit 1; }
 
-case "$SELECTED" in
-    "$TEST_BASE"/fs-ext4-tests.*) ;;
-    *)
-        echo "FAIL  selected scratch directory is outside the requested base: $SELECTED" >&2
-        exit 1
-        ;;
+# 1. No environment at all: an owned directory under the repository's
+#    tmp/, cleaned up on the way out.
+env -u FS_EXT4_TEST_TMPDIR -u TMPDIR "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
+selected="$(cat "$OUTPUT")"
+case "$selected" in
+    "$REPO"/tmp/fs-ext4-tests.*) ;;
+    *) fail "the default scratch directory is not inside the repository: $selected" ;;
+esac
+[[ -e "$selected" ]] && fail "runner did not clean its owned scratch directory: $selected"
+
+# 2. An exact directory inside the repository is used as given, and is
+#    the caller's to remove.
+mkdir -p "$EXACT"
+FS_EXT4_TEST_TMPDIR="$EXACT" "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
+[[ "$(cat "$OUTPUT")" == "$EXACT" ]] || fail "an exact FS_EXT4_TEST_TMPDIR was not used as given"
+[[ -d "$EXACT" ]] || fail "the runner deleted a directory the caller supplied"
+
+# 3. A directory outside the repository is REFUSED, and says why. This is
+#    the case that used to be normal (/tmp, $RUNNER_TEMP) and now cannot
+#    work: the guest would not find the image.
+set +e
+message="$(FS_EXT4_TEST_TMPDIR=/tmp/fs-ext4-outside "$REPO/scripts/test.sh" --print-temp-dir 2>&1)"
+status=$?
+set -e
+[[ "$status" -ne 0 ]] || fail "a scratch directory outside the repository was accepted"
+case "$message" in
+    *"outside"*) ;;
+    *) fail "the refusal does not say why: $message" ;;
 esac
 
-if [[ -e "$SELECTED" ]]; then
-    echo "FAIL  runner did not clean its owned scratch directory: $SELECTED" >&2
-    exit 1
-fi
-
-FS_EXT4_TEST_TMPDIR= FS_EXT4_TEST_TMP_BASE= \
-    GITHUB_ACTIONS=true RUNNER_TEMP="$TEST_BASE" TMPDIR=/must-not-be-used \
-    "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
-SELECTED="$(cat "$OUTPUT")"
-
-case "$SELECTED" in
-    "$TEST_BASE"/fs-ext4-tests.*) ;;
-    *)
-        echo "FAIL  GitHub scratch directory is outside RUNNER_TEMP: $SELECTED" >&2
-        exit 1
-        ;;
-esac
-
-if [[ -e "$SELECTED" ]]; then
-    echo "FAIL  runner did not clean its GitHub scratch directory: $SELECTED" >&2
-    exit 1
-fi
-
-# A Raspberry Pi deliberately selects the worktree-backed NVMe path here, so
-# exercise the platform-default fallback on the non-Pi hosted runners instead.
-if [[ ! -r /proc/device-tree/model ]] || ! grep -aq 'Raspberry Pi' /proc/device-tree/model; then
-    FS_EXT4_TEST_TMPDIR= FS_EXT4_TEST_TMP_BASE= \
-        GITHUB_ACTIONS=false RUNNER_TEMP= env -u TMPDIR \
-        "$REPO/scripts/test.sh" --print-temp-dir > "$OUTPUT"
-    SELECTED="$(cat "$OUTPUT")"
-
-    case "$(basename "$SELECTED")" in
-        fs-ext4-tests.*) ;;
-        *)
-            echo "FAIL  platform fallback did not create an isolated scratch directory: $SELECTED" >&2
-            exit 1
-            ;;
-    esac
-
-    if [[ -e "$SELECTED" ]]; then
-        echo "FAIL  runner did not clean its platform scratch directory: $SELECTED" >&2
-        exit 1
-    fi
-fi
-
-echo "PASS  test runner selects and cleans an owned scratch directory"
+echo "PASS  the test runner keeps scratch inside the repository and cleans what it owns"
