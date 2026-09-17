@@ -2125,6 +2125,22 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Buffer-side OR of `bits` into the SB's `s_feature_compat` (0x5C).
+    pub(crate) fn buffer_patch_sb_compat(&self, buf: &mut BlockBuffer, bits: u32) -> Result<()> {
+        let bs = self.sb.block_size() as u64;
+        let sb_offset = crate::superblock::SUPERBLOCK_OFFSET;
+        let block = buf.get_mut(self, sb_offset / bs)?;
+        let off = (sb_offset % bs) as usize;
+        let sb = &mut block[off..off + 1024];
+        let compat = u32::from_le_bytes(sb[0x5C..0x60].try_into().unwrap());
+        sb[0x5C..0x60].copy_from_slice(&(compat | bits).to_le_bytes());
+        if self.csum.enabled {
+            let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+            sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        }
+        Ok(())
+    }
+
     /// Buffer-side patch of the SB's `s_last_orphan` field at byte
     /// 0xE8. Used by orphan recovery (Phase 6.2) to clear / advance the
     /// chain head atomically with the inode/block frees.
@@ -2799,6 +2815,14 @@ impl Filesystem {
         // Multi-block transaction: xattr block bytes + (alloc-side bitmap +
         // BGD + SB when fresh-block) + inode body. Atomic across the op.
         let mut buf = BlockBuffer::new(bs);
+        // An xattr block on a volume without COMPAT_EXT_ATTR is one e2fsck
+        // ignores: it clears i_file_acl and frees the block. The kernel's
+        // `ext4_xattr_update_super_block` sets the feature on the first
+        // xattr; so does this, in the same transaction (#88). This crate's
+        // mkfs does not set it.
+        if self.sb.feature_compat & features::Compat::EXT_ATTR.bits() == 0 {
+            self.buffer_patch_sb_compat(&mut buf, features::Compat::EXT_ATTR.bits())?;
+        }
 
         // Path A: existing external block — rewrite in-buffer, re-checksum.
         if inode.file_acl != 0 {

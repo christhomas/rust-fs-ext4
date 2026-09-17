@@ -1,10 +1,8 @@
 //! Wide op-coverage sweep on a metadata_csum filesystem (ext4-csum-seed.img),
 //! to flush out remaining write-path checksum/metadata bugs beyond the original
 //! mkdir+symlink+unlink repro. Each test exercises one op class against a fresh
-//! copy and leaves the mutated image in the selected scratch directory for an Alpine-VM
-//! e2fsck pass:
-//!
-//!   RFE_KEEP_IMAGES=1 ./scripts/test.sh --test repro_csum_seed_op_coverage
+//! copy and requires `e2fsck -fn` to pass on the mutated image
+//! (`RFE_KEEP_IMAGES=1` keeps it).
 //!
 //! The driver's own readers can't see metadata_csum mistakes, so a real Linux
 //! e2fsck is the oracle. `is_clean()` here is just a cheap smoke check.
@@ -45,6 +43,7 @@ fn done(path: &str, tag: &str) {
     // in-process readers can't see metadata_csum mistakes. Keep the image only
     // when explicitly hunting (RFE_KEEP_IMAGES set); otherwise clean up so the
     // committed test leaves nothing in the scratch directory.
+    fs_ext4_test_support::assert_e2fsck_clean(path, tag);
     if std::env::var_os("RFE_KEEP_IMAGES").is_some() {
         eprintln!("[{tag}] image: {path}");
     } else {

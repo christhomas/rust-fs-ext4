@@ -5,10 +5,8 @@
 //! here), and with no `has_journal` feature the apply_* ops write directly
 //! rather than through a JournalWriter transaction. `all_images_rw_smoke`
 //! already does a trivial create/write/unlink here, but with no e2fsck oracle;
-//! this adds the full op matrix and leaves each mutated image in the selected scratch directory for a
-//! real Linux e2fsck pass:
-//!
-//!   RFE_KEEP_IMAGES=1 ./scripts/test.sh --test repro_no_csum_op_coverage
+//! this adds the full op matrix and requires `e2fsck -fn` to pass on each
+//! mutated image (`RFE_KEEP_IMAGES=1` keeps them).
 //!
 //! ext4-no-csum.img is small (~3.4 MiB free, 4 KiB blocks) but each test gets
 //! its own fresh copy, so the ops are sized to fit one image at a time.
@@ -43,6 +41,7 @@ fn done(path: &str, tag: &str) {
     {
         let _ = Filesystem::mount(Arc::new(FileDevice::open(path).expect("ro"))).expect("remount");
     }
+    fs_ext4_test_support::assert_e2fsck_clean(path, tag);
     if std::env::var_os("RFE_KEEP_IMAGES").is_some() {
         eprintln!("[{tag}] image: {path}");
     } else {

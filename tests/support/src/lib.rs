@@ -149,3 +149,38 @@ pub fn fixture(manifest_dir: &str, name: &str) -> String {
     path
 }
 
+
+/// `e2fsck -fn` on `image` must exit 0, or the test fails with its report
+/// (#88).
+///
+/// The oracle suites checked their images with this crate's own reader,
+/// which cannot see a wrong checksum, and left the external check to
+/// someone running `scripts/vm-e2fsck.sh` by hand, which nothing did.
+/// Where e2fsprogs is not installed this skips with a note, except under CI
+/// (`CI` set, as GitHub Actions sets it), which installs it: there a
+/// missing checker is a failure rather than a silent pass.
+#[track_caller]
+pub fn assert_e2fsck_clean(image: &str, tag: &str) {
+    let Some(e2fsck) = ["/usr/sbin/e2fsck", "/sbin/e2fsck", "/usr/bin/e2fsck", "/bin/e2fsck"]
+        .into_iter()
+        .find(|p| Path::new(p).exists())
+    else {
+        assert!(
+            std::env::var_os("CI").is_none(),
+            "[{tag}] e2fsck is not installed, and CI must run the oracle"
+        );
+        eprintln!("[{tag}] skip e2fsck: e2fsprogs not installed");
+        return;
+    };
+    let out = std::process::Command::new(e2fsck)
+        .args(["-fn", image])
+        .output()
+        .unwrap_or_else(|error| panic!("[{tag}] run {e2fsck}: {error}"));
+    assert_eq!(
+        out.status.code(),
+        Some(0),
+        "[{tag}] e2fsck -fn {image}:\n{}{}",
+        String::from_utf8_lossy(&out.stdout),
+        String::from_utf8_lossy(&out.stderr)
+    );
+}

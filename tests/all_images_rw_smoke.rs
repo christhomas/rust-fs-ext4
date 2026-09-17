@@ -281,20 +281,10 @@ fn ext4_inline() {
 fn ext4_largedir() {
     run_round_trip("ext4-largedir")
 }
-/// KNOWN LIMITATION — `fs_ext4_create` returns 0 with `errno=5 (EIO)` when
-/// adding a 516th entry to the root of `ext4-manyfiles.img`. Diagnosed via
-/// `fs_ext4_get_volume_info`:
-///   * 3572 / 4096 inodes free (plenty of inode capacity)
-///   * 2257 / 4096 blocks free (plenty of data capacity)
-///
-/// So this is not exhaustion — it's an htree-directory write edge case in
-/// the underlying rust-fs-ext4 driver that the smaller fixtures don't hit.
-/// Run explicitly with `--ignored` to reproduce.
-///
-/// TODO: investigate htree leaf insert path in rust-fs-ext4 around 500+
-/// entries; the crate's status table claims depth-1 inserts work.
+/// A 512-file root, indexed. This was ignored for an EIO on the 516th create,
+/// an htree-write defect; the htree insert fixes since have closed it (a
+/// `mkfs.ext4 -d` + `e2fsck -fyD` equivalent of this fixture passes) (#88).
 #[test]
-#[ignore = "exposes htree-write bug at ~500-entry directories — see diagnostics in fn header"]
 fn ext4_manyfiles() {
     run_round_trip("ext4-manyfiles")
 }

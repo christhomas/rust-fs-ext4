@@ -1,7 +1,7 @@
 //! Format a fresh filesystem with the driver's own `mkfs::format_filesystem`
-//! and leave it in the selected scratch directory for a real Linux e2fsck pass:
-//!
-//!   FS_EXT4_TEST_TMPDIR="$PWD/tmp/oracle" ./scripts/test.sh --test mkfs_e2fsck_oracle
+//! and require `e2fsck -fn` to pass on it
+//! (`fs_ext4_test_support::assert_e2fsck_clean`; `RFE_KEEP_IMAGES=1` keeps the
+//! images).
 //!
 //! `mkfs_roundtrip` and `mkfs_bin_smoke` already format + re-mount through the
 //! driver's OWN reader, but that reader can't see a wrong checksum (the exact
@@ -100,6 +100,7 @@ fn check_and_done(path: &str, tag: &str, block_size: u32, expect_groups: usize) 
             report.anomalies
         );
     }
+    fs_ext4_test_support::assert_e2fsck_clean(path, tag);
     if std::env::var_os("RFE_KEEP_IMAGES").is_some() {
         eprintln!("[{tag}] image: {path}");
     } else {
