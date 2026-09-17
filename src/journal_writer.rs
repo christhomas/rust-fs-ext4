@@ -15,13 +15,23 @@
 //!
 //! ```text
 //!   1. Write transaction blocks (descriptor + data + commit) to journal
-//!      logical blocks [1, 1+N) → flush.
+//!      logical blocks [1, 1+N), set `needs_recovery` in the ext4
+//!      superblock → flush.
 //!   2. Set jsb.start = 1 (mark journal dirty), keep jsb.sequence as-is →
 //!      flush.
 //!   3. Write each fs block in the transaction to its final on-disk
 //!      location → flush.
-//!   4. Set jsb.start = 0 (clean), bump jsb.sequence → flush.
+//!   4. Set jsb.start = 0 (clean), bump jsb.sequence, clear
+//!      `needs_recovery` → flush.
 //! ```
+//!
+//! `needs_recovery` (`INCOMPAT_RECOVER`) is what Linux replays on: a
+//! filesystem without it has its journal wiped at mount, whatever `s_start`
+//! says (#228). So it reaches the disk before the journal is marked dirty,
+//! and a transaction that journals the superblock block carries it set,
+//! or step 3 would clear it while the journal is still live. Clearing it
+//! in the same flush as the clean journal superblock is safe either way
+//! round: by then step 3 is on disk, so a wiped journal loses nothing.
 //!
 //! Crash analysis:
 //!
@@ -234,6 +244,24 @@ impl JournalWriter {
             ));
         }
 
+        // The superblock block, if journaled, keeps `needs_recovery` set
+        // until step 4 clears it (#228) -- in every write to it, since a
+        // transaction may carry more than one and step 3 applies them all
+        // in order.
+        let sb_block = self.sb_block();
+        let patched;
+        let tx = if tx.writes.iter().any(|w| w.fs_block == sb_block) {
+            let mut copy = tx.clone();
+            let off = self.sb_offset_in_block();
+            for w in copy.writes.iter_mut().filter(|w| w.fs_block == sb_block) {
+                crate::journal_apply::set_needs_recovery_in(&mut w.bytes[off..off + 1024], true);
+            }
+            patched = copy;
+            &patched
+        } else {
+            tx
+        };
+
         // With every checksum the journal declares: a zero there is a
         // transaction Linux's recovery stops at (#80).
         let blocks = tx.commit_for(&self.jsb)?;
@@ -266,6 +294,7 @@ impl JournalWriter {
             )?;
             dev.write_at(at, block)?;
         }
+        crate::journal_apply::write_needs_recovery(dev, true)?;
         dev.flush()?;
 
         // -- Step 2: mark journal dirty. start = first txn block; sequence
@@ -290,9 +319,19 @@ impl JournalWriter {
         self.jsb.start = 0;
         self.jsb.sequence = self.jsb.sequence.wrapping_add(1);
         self.write_jsb(dev)?;
+        crate::journal_apply::write_needs_recovery(dev, false)?;
         dev.flush()?;
 
         Ok(())
+    }
+
+    /// The fs block holding the primary superblock: 0, or 1 at 1 KiB.
+    fn sb_block(&self) -> u64 {
+        crate::superblock::SUPERBLOCK_OFFSET / u64::from(self.block_size)
+    }
+
+    fn sb_offset_in_block(&self) -> usize {
+        (crate::superblock::SUPERBLOCK_OFFSET % u64::from(self.block_size)) as usize
     }
 
     /// Re-emit the JBD2 superblock at journal logical block 0 from the

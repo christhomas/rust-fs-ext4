@@ -16,23 +16,87 @@
 //!
 //! ```text
 //!   1. A read-only device: return, replaying nothing.
-//!   2. Parse the JBD2 superblock via jbd2::read_superblock; clean: return.
+//!   2. Parse the JBD2 superblock via jbd2::read_superblock; clean: clear a
+//!      leftover needs_recovery and return.
 //!   3. Refuse a volume with a write-breaking INCOMPAT bit.
 //!   4. plan = journal::walk(&fs, &jsb)?; journal_apply::apply(&fs, &plan)?
-//!   5. The mount continues, read-write.
+//!   5. Mark the journal clean, then clear needs_recovery.
+//!   6. The mount continues, read-write.
 //! ```
 //!
-//! Replay does not clear `jsb.start`. Nothing named `mark_journal_clean`
-//! exists: the journal is marked clean by the next transaction this driver
-//! commits (`journal_writer`, whose last step writes `start = 0`). Until
-//! then a remount replays the same transactions again, which is a no-op
-//! because each replayed write is idempotent (#90).
+//! Once the writes are flushed, the journal superblock gets `s_start = 0`
+//! and the sequence after the last committed transaction, and the ext4
+//! superblock loses `needs_recovery` (#228). Left dirty, every later mount
+//! replayed the same log again and `e2fsck` reported a journal with data
+//! in it. The order matters: a crash between the two leaves a clean
+//! journal flagged for recovery, which recovers nothing; the reverse would
+//! be a live journal Linux wipes.
 
 use crate::error::{Error, Result};
 use crate::fs::Filesystem;
 use crate::inode::Inode;
 use crate::jbd2::{self, JournalSuperblock};
 use crate::journal::ReplayPlan;
+
+/// Set or clear `INCOMPAT_RECOVER` (`needs_recovery`) in a 1024-byte
+/// superblock image, redoing its checksum under `metadata_csum`.
+pub(crate) fn set_needs_recovery_in(sb: &mut [u8], on: bool) {
+    let recover = crate::features::Incompat::RECOVER.bits();
+    let incompat = u32::from_le_bytes(sb[0x60..0x64].try_into().unwrap());
+    let incompat = if on {
+        incompat | recover
+    } else {
+        incompat & !recover
+    };
+    sb[0x60..0x64].copy_from_slice(&incompat.to_le_bytes());
+    let ro_compat = u32::from_le_bytes(sb[0x64..0x68].try_into().unwrap());
+    if ro_compat & crate::features::RoCompat::METADATA_CSUM.bits() != 0 {
+        let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+        sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+    }
+}
+
+/// Set or clear `needs_recovery` in the primary superblock on `dev`. Linux
+/// replays a journal only when this is set, and wipes one when it is not.
+pub(crate) fn write_needs_recovery(dev: &dyn crate::block_io::BlockDevice, on: bool) -> Result<()> {
+    let at = crate::superblock::SUPERBLOCK_OFFSET;
+    let mut sb = vec![0u8; 1024];
+    dev.read_at(at, &mut sb)?;
+    set_needs_recovery_in(&mut sb, on);
+    dev.write_at(at, &sb)
+}
+
+/// Record a replayed journal as done: `s_start = 0` and `s_sequence` the one
+/// after `last_commit` (the next transaction's), checksum redone, flushed.
+fn mark_journal_clean(fs: &Filesystem, jsb: &JournalSuperblock, plan: &ReplayPlan) -> Result<()> {
+    let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
+    let jinode = Inode::parse(&raw)?;
+    let phys = jbd2::journal_block_to_physical(fs, &jinode, 0)?
+        .ok_or(Error::Corrupt("journal_apply: journal superblock unmapped"))?;
+    let at = byte_offset_of(fs, phys)?;
+    let mut buf = vec![0u8; 1024];
+    fs.dev.read_at(at, &mut buf)?;
+    if u32::from_be_bytes(buf[0..4].try_into().unwrap()) != jbd2::JBD2_MAGIC_NUMBER {
+        return Err(Error::Corrupt(
+            "journal_apply: journal superblock lost its magic during replay",
+        ));
+    }
+    // `last_commit` stays 0 when the walk found no committed transaction.
+    let sequence = if plan.last_commit == 0 {
+        jsb.sequence
+    } else {
+        plan.last_commit.wrapping_add(1)
+    };
+    buf[0x18..0x1C].copy_from_slice(&sequence.to_be_bytes());
+    buf[0x1C..0x20].copy_from_slice(&0u32.to_be_bytes());
+    if jsb.uses_csum_v2_or_v3() {
+        buf[0xFC..0x100].fill(0);
+        let csum = crate::checksum::linux_crc32c(!0, &buf);
+        buf[0xFC..0x100].copy_from_slice(&csum.to_be_bytes());
+    }
+    fs.dev.write_at(at, &buf)?;
+    fs.dev.flush()
+}
 
 /// Where a block number lands on the device, or a refusal.
 ///
@@ -181,6 +245,12 @@ pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
         return Ok(0); // no journal inode → nothing to replay
     };
     if jsb.is_clean() {
+        // A crash between the clean journal and the cleared flag leaves
+        // the flag behind with nothing to recover.
+        if fs.sb.feature_incompat & crate::features::Incompat::RECOVER.bits() != 0 {
+            write_needs_recovery(fs.dev.as_ref(), false)?;
+            fs.dev.flush()?;
+        }
         return Ok(0);
     }
     // Replay writes to the volume, so it refuses what every other write
@@ -191,7 +261,11 @@ pub fn replay_if_dirty(fs: &Filesystem) -> Result<usize> {
         return Err(crate::Error::UnsupportedIncompat(write_breaking));
     }
     let plan = crate::journal::walk(fs, &jsb)?;
-    apply(fs, &plan)
+    let applied = apply(fs, &plan)?;
+    mark_journal_clean(fs, &jsb, &plan)?;
+    write_needs_recovery(fs.dev.as_ref(), false)?;
+    fs.dev.flush()?;
+    Ok(applied)
 }
 
 /// Describe the JBD2 superblock fields most relevant to replay decisions.

@@ -10,11 +10,21 @@
   and a crash mid-operation was never repaired. A CSUM_V3 tag is also 16
   bytes without 64-bit block numbers, as the kernel reads it.
 - Replay believes only a committed transaction whose checksums hold. A
-  torn commit or descriptor ends the log; a damaged data or revoke block
-  in a committed transaction refuses the replay. The tag after one
-  carrying a UUID is read where it is, and a journal declaring
-  `ASYNC_COMMIT`, `FAST_COMMIT` or an unknown incompat feature, or a block
-  size other than the filesystem's, is refused.
+  torn commit ends the log, as does a damaged descriptor with no valid
+  commit after it; a damaged descriptor, data or revoke block in a
+  committed transaction refuses the replay. The tag after one carrying a
+  UUID is read where it is, and a journal declaring `ASYNC_COMMIT`,
+  `FAST_COMMIT`, an unknown incompat feature, CSUM_V2 with CSUM_V3 or a
+  checksum type other than crc32c, or a block size other than the
+  filesystem's, is refused.
+- A commit sets `needs_recovery` before its journal goes live and clears
+  it once the journal is clean again, including in a superblock block the
+  transaction journals. Linux replays only a filesystem carrying that
+  flag and wipes the journal of one without it, so a crash mid-commit was
+  discarded rather than recovered.
+- Replay marks the journal clean and clears `needs_recovery` once the
+  writes are on disk. It left both set, so every mount replayed the same
+  log again and `e2fsck` reported a journal still holding data.
 
 ## [0.5.1] — 2026-09-06
 
