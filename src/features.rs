@@ -63,16 +63,20 @@ bitflags! {
     }
 }
 
-/// INCOMPAT bits we know how to handle (Phase 1 read-only goal).
-/// Anything else in feature_incompat means refuse-to-mount.
+/// INCOMPAT bits this driver mounts. Anything else in feature_incompat
+/// means refuse-to-mount. Some of these can be read and not written: see
+/// [`WRITE_BREAKING_INCOMPAT`].
 pub const SUPPORTED_INCOMPAT: u32 = Incompat::FILETYPE.bits()
     | Incompat::EXTENTS.bits()
     | Incompat::BIT64.bits()
     | Incompat::FLEX_BG.bits()
     | Incompat::CSUM_SEED.bits()
-    // The features below are tolerated for read-only mount even if not fully implemented:
-    | Incompat::RECOVER.bits()      // we'll skip journal replay for now (warn)
-    | Incompat::MMP.bits()          // ignore for read-only
+    // A dirty journal: replayed by a writable mount
+    // (`journal_apply::replay_if_dirty`); a read-only mount does not
+    // replay it and reads the volume as it stands (#72).
+    | Incompat::RECOVER.bits()
+    // Read-only only: see WRITE_BREAKING_INCOMPAT.
+    | Incompat::MMP.bits()
     | Incompat::INLINE_DATA.bits()  // we'll handle the flag, even if data overflow uses xattr later
     | Incompat::LARGEDIR.bits()
     | Incompat::EA_INODE.bits()
@@ -118,7 +122,8 @@ pub fn write_breaking_incompat(feature_incompat: u32) -> u32 {
     feature_incompat & WRITE_BREAKING_INCOMPAT
 }
 
-/// RO_COMPAT bits we tolerate (since we mount read-only anyway).
+/// RO_COMPAT bits a mount accepts. Accepting one is not the same as keeping
+/// it correct through a write: see [`MAINTAINED_RO_COMPAT`].
 pub const SUPPORTED_RO_COMPAT: u32 = RoCompat::SPARSE_SUPER.bits()
     | RoCompat::LARGE_FILE.bits()
     | RoCompat::HUGE_FILE.bits()

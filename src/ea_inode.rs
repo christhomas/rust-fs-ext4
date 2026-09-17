@@ -12,8 +12,8 @@
 //! data lives via the same extent-tree/inline-data mechanisms as a regular
 //! file.
 //!
-//! Phase 1 (this landing): read only. Write-path is deferred to when
-//! the filesystem gains an inode allocator (E6) integration.
+//! Read only: `xattr.rs` follows a value here when it resolves one, and
+//! nothing in this crate creates or rewrites an EA inode.
 
 use crate::error::{Error, Result};
 use crate::file_io;

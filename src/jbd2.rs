@@ -11,7 +11,9 @@
 //! extent tree maps the journal file. Journal block N = logical block N of
 //! that inode; convert to a physical fs block via the extent tree.
 //!
-//! Phase 1: parse only. Transaction replay (E4) lives in a separate module.
+//! This module parses the journal superblock. Walking transactions is
+//! [`crate::journal`], replaying them [`crate::journal_apply`], and writing
+//! them [`crate::journal_writer`].
 //!
 //! Layout summary:
 //! ```text

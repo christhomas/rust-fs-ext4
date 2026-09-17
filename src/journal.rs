@@ -2,9 +2,9 @@
 //!
 //! Walks the on-disk journal starting at `jsb.start`, decodes descriptor /
 //! commit / revoke blocks, and yields a `ReplayPlan` describing what WOULD
-//! be written during replay. Phase 1: we never mutate the filesystem; the
-//! plan is just the evidence that replay is possible and correct. Phase 4
-//! will feed the plan into the write path wrapped in a real transaction.
+//! be written during replay. This module only reads; the plan goes to
+//! [`crate::journal_apply::apply`], which writes each block to its final
+//! location when a writable mount replays a dirty journal.
 //!
 //! All JBD2 on-disk data is **big-endian**. Journal block numbers are
 //! relative to the journal file (logical block 0 = superblock); the caller
