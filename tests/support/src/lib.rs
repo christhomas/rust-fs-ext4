@@ -127,3 +127,25 @@ macro_rules! temp_path {
         $crate::formatted_temp_path(format_args!($($argument)*))
     };
 }
+
+/// The path of a generated fixture under `test-disks/`, or a panic that
+/// says how to build it (#137).
+///
+/// The images are gitignored and built by
+/// `test-disks/build-ext4-feature-images.sh`. Without them a mount failed
+/// deep inside `open` with a bare `No such file or directory`, once per
+/// test, which read as that many defects in whatever branch was being
+/// checked. Only for suites that cannot say anything without the image;
+/// the ones that skip honestly when it is absent keep doing so.
+#[track_caller]
+pub fn fixture(manifest_dir: &str, name: &str) -> String {
+    let path = format!("{manifest_dir}/test-disks/{name}");
+    assert!(
+        Path::new(&path).exists(),
+        "test-disks/{name} is missing: the fixtures are gitignored and generated. \
+         Build them with `bash test-disks/build-ext4-feature-images.sh` (Linux, or \
+         the oracle VM) and run the tests again."
+    );
+    path
+}
+

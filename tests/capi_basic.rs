@@ -10,7 +10,12 @@ use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
-const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
+/// `test-disks/ext4-basic.img`, or a failure that names the command that
+/// builds it (#137).
+#[track_caller]
+fn test_image() -> String {
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img")
+}
 
 fn last_err_str() -> String {
     unsafe {
@@ -24,7 +29,7 @@ fn last_err_str() -> String {
 
 #[test]
 fn mount_and_umount_basic_image() {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null(), "mount returned NULL: {}", last_err_str());
     unsafe { fs_ext4_umount(fs) };
@@ -44,7 +49,7 @@ fn mount_rejects_missing_file() {
 
 #[test]
 fn volume_info_reports_expected_fields() {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null(), "mount failed: {}", last_err_str());
 
@@ -110,7 +115,7 @@ fn volume_info_flags_dirty_image() {
 
 #[test]
 fn stat_root_returns_directory() {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null(), "mount failed: {}", last_err_str());
 
@@ -145,7 +150,7 @@ fn null_inputs_return_error_not_crash() {
 
 #[test]
 fn dir_open_root_lists_entries() {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null(), "mount failed: {}", last_err_str());
 
@@ -183,7 +188,7 @@ fn dir_open_root_lists_entries() {
 
 #[test]
 fn stat_non_root_path() {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null());
 
@@ -220,7 +225,7 @@ fn stat_non_root_path() {
 
 #[test]
 fn stat_missing_path_returns_error() {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null());
 
@@ -237,7 +242,7 @@ fn stat_missing_path_returns_error() {
 fn read_file_returns_expected_content() {
     // test-disks/ext4-basic.img has /test.txt = "hello from ext4.\n"
     // (per instance 5's end-to-end milestone announcement)
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null());
 
