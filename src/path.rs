@@ -8,11 +8,11 @@
 //! path component look up the entry by name in the current directory's data
 //! blocks, then descend into the matching child inode.
 //!
-//! Phase 1 supports **linear directory scans only**. HTree-indexed directories
-//! work transparently because the linear block representation is still valid —
-//! htree is an acceleration on top, not a replacement. Phase 2 adds htree
-//! fast-path lookups using `hash::ext4_htree_hash` once `dir::htree_lookup`
-//! lands.
+//! An htree-indexed directory is searched through its index first
+//! (`htree::lookup_leaf_with`), and a name the index does not lead to is
+//! then found by a linear scan, which is always valid because the index is
+//! an acceleration over ordinary directory blocks, not a replacement for
+//! them. Other directories are scanned linearly.
 
 use crate::block_io::BlockDevice;
 use crate::dir::{self, DirEntry};

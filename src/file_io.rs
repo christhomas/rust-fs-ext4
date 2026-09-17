@@ -1,7 +1,7 @@
 //! Read file (or directory) contents using extent traversal.
 //!
 //! Composes `inode::Inode` + `extent::lookup` + `block_io::BlockDevice` into
-//! a Read/Seek-style API. Phase 1 read-only.
+//! a Read/Seek-style API. Reads only; writes go through `Filesystem`.
 
 use crate::error::{Error, Result};
 use crate::extent;

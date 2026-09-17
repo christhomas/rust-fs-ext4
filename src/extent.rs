@@ -38,7 +38,7 @@
 //!
 //! Checksums: when `METADATA_CSUM` or `GDT_CSUM` is enabled, each extent block
 //! (i.e. internal-node data, not the inline i_block) has a trailing
-//! `ext4_extent_tail` (4-byte CRC32c). We parse but don't verify in Phase 1.
+//! `ext4_extent_tail` (4-byte CRC32c), verified as each block is read.
 
 use crate::block_io::BlockDevice;
 use crate::checksum::Checksummer;

@@ -19,10 +19,15 @@
 //!   - [`Checksummer::seed`] — derived once at mount time
 //!   - [`Checksummer::superblock`], [`Checksummer::inode`], etc.
 //!
-//! Phase 1: read-only verification. We do NOT recompute checksums on writes
-//! (no writes yet). Verification is currently INFORMATIONAL — corrupt
-//! metadata would still parse; this module just lets callers decide whether
-//! to trust the result.
+//! Verification is enforced, not informational. A superblock or group
+//! descriptor whose checksum does not match aborts the mount with
+//! `Error::BadChecksum`, as does an inode read through
+//! `Filesystem::read_inode_verified`, and extent and directory blocks are
+//! checked as they are read. Every write recomputes the checksums of what it
+//! rewrites -- inodes in `finalize_inode_raw`, group descriptors and the
+//! superblock in `buffer_patch_bgd_counters` / `buffer_patch_sb_counters`,
+//! and the tails of directory and extent blocks -- so a new write path that
+//! rewrites a metadata block must recompute its checksum too (#90).
 
 use crate::features::{Incompat, RoCompat};
 use crate::superblock::Superblock;
