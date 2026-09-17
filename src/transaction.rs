@@ -30,15 +30,25 @@
 //!
 //! ### Checksum scope
 //!
-//! v1 (classical CSUM_V2): each tag carries a 16-bit crc32 of the data block
-//! it names. v3 tags carry a 32-bit crc32c in a 16-byte tag layout. A v3
-//! commit block also ends with a 32-bit checksum of the entire commit block.
-//! For this initial landing we emit zero checksums and verify round-trip on
-//! the tag/data layout; wiring real CRC32C to JBD2 inputs is tracked
-//! separately (it composes with @5's `checksum.rs`).
+//! A journal declaring CSUM_V2 or CSUM_V3 checksums three things, all seeded
+//! from the crc32c of its UUID: every tag (the sequence and the data block
+//! it names -- 32 bits in a v3 tag, the low 16 in a v2 one), the descriptor
+//! and revoke blocks (a four-byte tail over the rest of the block), and the
+//! commit block (`h_chksum[0]`). Linux's recovery takes a commit that fails
+//! its checksum for the end of the log, so a transaction written with zeros
+//! there is one only this crate would replay (#80).
+//!
+//! [`Transaction::commit_for`] lays the blocks out for a given journal and
+//! fills every checksum it declares. [`Transaction::commit`] knows only the
+//! flags the transaction was begun with and no seed: it lays out the same
+//! blocks with the checksum fields zero, which is right only for a journal
+//! without checksums.
 
 use crate::error::{Error, Result};
-use crate::jbd2::{JBD2_COMMIT_BLOCK, JBD2_DESCRIPTOR_BLOCK, JBD2_MAGIC_NUMBER, JBD2_REVOKE_BLOCK};
+use crate::jbd2::{
+    self, JbdIncompat, JournalSuperblock, BLOCK_TAIL_BYTES, COMMIT_CHECKSUM_AT, JBD2_COMMIT_BLOCK,
+    JBD2_DESCRIPTOR_BLOCK, JBD2_MAGIC_NUMBER, JBD2_REVOKE_BLOCK,
+};
 use crate::journal::{TAG_LAST, TAG_SAME_UUID};
 
 /// One buffered write the transaction will journal.
@@ -49,6 +59,19 @@ pub struct JournaledBlock {
     pub fs_block: u64,
     /// Full block contents (must be exactly `block_size` bytes).
     pub bytes: Vec<u8>,
+}
+
+/// How a journal lays out and checksums its transaction blocks.
+#[derive(Debug, Clone, Copy)]
+struct Layout {
+    tag_bytes: usize,
+    uses_64bit: bool,
+    /// The tail reserved at the end of descriptor and revoke blocks.
+    tail_bytes: usize,
+    /// `Some(seed)` when the checksum fields are to be filled.
+    seed: Option<u32>,
+    /// CSUM_V3 (32-bit tag checksum) rather than CSUM_V2 (16-bit).
+    csum_v3: bool,
 }
 
 /// Transaction builder. Call [`Transaction::add_write`] to buffer a mutated
@@ -100,38 +123,81 @@ impl Transaction {
     ///
     /// Empty transactions (no writes, no revokes) return a single commit
     /// block — matches kernel's "empty transaction" handling.
+    ///
+    /// The checksum fields are left zero; a journal that declares checksums
+    /// needs [`Self::commit_for`].
     pub fn commit(&self) -> Result<Vec<Vec<u8>>> {
+        let layout = if self.uses_csum_v3 {
+            Layout {
+                tag_bytes: 16,
+                uses_64bit: self.uses_64bit,
+                tail_bytes: BLOCK_TAIL_BYTES,
+                seed: None,
+                csum_v3: true,
+            }
+        } else {
+            Layout {
+                tag_bytes: if self.uses_64bit { 12 } else { 8 },
+                uses_64bit: self.uses_64bit,
+                tail_bytes: 0,
+                seed: None,
+                csum_v3: false,
+            }
+        };
+        self.serialize(layout)
+    }
+
+    /// Serialize for `jsb`'s journal, with every checksum it declares
+    /// filled in (#80). Refuses a journal whose incompat bits this driver
+    /// does not handle, and a transaction begun for a different block size
+    /// or tag width than `jsb` declares.
+    pub fn commit_for(&self, jsb: &JournalSuperblock) -> Result<Vec<Vec<u8>>> {
+        if jsb.unsupported_incompat() != 0 {
+            return Err(Error::Unsupported(
+                "journal declares an incompat feature this driver does not write",
+            ));
+        }
+        if self.block_size != jsb.block_size
+            || self.uses_64bit != jsb.uses_64bit()
+            || self.uses_csum_v3 != jsb.uses_csum_v3()
+        {
+            return Err(Error::InvalidArgument(
+                "transaction was begun for a different journal layout",
+            ));
+        }
+        let checksummed = jsb.uses_csum_v2_or_v3();
+        self.serialize(Layout {
+            tag_bytes: jsb.tag_bytes(),
+            uses_64bit: jsb.uses_64bit(),
+            tail_bytes: if checksummed { BLOCK_TAIL_BYTES } else { 0 },
+            seed: checksummed.then(|| jsb.csum_seed()),
+            csum_v3: jsb.feature_incompat & JbdIncompat::CSUM_V3.bits() != 0,
+        })
+    }
+
+    fn serialize(&self, layout: Layout) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
 
         if !self.writes.is_empty() {
             // Descriptor block + data blocks.
-            out.push(self.build_descriptor_block()?);
+            out.push(self.build_descriptor_block(layout)?);
             for w in &self.writes {
                 out.push(w.bytes.clone());
             }
         }
         if !self.revokes.is_empty() {
-            out.push(self.build_revoke_block()?);
+            out.push(self.build_revoke_block(layout)?);
         }
-        out.push(self.build_commit_block()?);
+        out.push(self.build_commit_block(layout)?);
         Ok(out)
     }
 
-    fn build_descriptor_block(&self) -> Result<Vec<u8>> {
+    fn build_descriptor_block(&self, layout: Layout) -> Result<Vec<u8>> {
         let mut blk = vec![0u8; self.block_size as usize];
         self.write_header(&mut blk, JBD2_DESCRIPTOR_BLOCK);
 
-        let tag_size = if self.uses_csum_v3 {
-            if self.uses_64bit {
-                16
-            } else {
-                12
-            }
-        } else if self.uses_64bit {
-            12
-        } else {
-            8
-        };
+        let tag_size = layout.tag_bytes;
+        let usable = blk.len() - layout.tail_bytes;
         let mut pos = 12usize;
         let last_idx = self.writes.len().saturating_sub(1);
         for (i, w) in self.writes.iter().enumerate() {
@@ -140,61 +206,83 @@ impl Transaction {
             // (journal's own s_uuid is used implicitly).
             flags |= TAG_SAME_UUID;
 
-            if pos + tag_size > blk.len() {
+            if pos + tag_size > usable {
                 return Err(Error::Corrupt("descriptor block overflow (too many tags)"));
             }
 
             let blocknr_lo = (w.fs_block & 0xFFFF_FFFF) as u32;
             blk[pos..pos + 4].copy_from_slice(&blocknr_lo.to_be_bytes());
+            let checksum = layout
+                .seed
+                .map(|seed| jbd2::tag_checksum(seed, self.sequence, &w.bytes));
 
-            if self.uses_csum_v3 {
+            if layout.csum_v3 {
+                // journal_block_tag3_t: t_blocknr, t_flags, t_blocknr_high,
+                // t_checksum -- 16 bytes whether or not the high half is used.
                 blk[pos + 4..pos + 8].copy_from_slice(&flags.to_be_bytes());
-                if self.uses_64bit {
+                if layout.uses_64bit {
                     let hi = (w.fs_block >> 32) as u32;
                     blk[pos + 8..pos + 12].copy_from_slice(&hi.to_be_bytes());
-                    // pos+12..pos+16 = t_checksum (zeroed for now)
+                }
+                if let Some(c) = checksum {
+                    blk[pos + 12..pos + 16].copy_from_slice(&c.to_be_bytes());
                 }
             } else {
                 // Classical: __be16 t_checksum + __be16 t_flags
-                blk[pos + 4..pos + 6].copy_from_slice(&0u16.to_be_bytes());
+                let c16 = checksum.map_or(0, |c| c as u16);
+                blk[pos + 4..pos + 6].copy_from_slice(&c16.to_be_bytes());
                 blk[pos + 6..pos + 8].copy_from_slice(&(flags as u16).to_be_bytes());
-                if self.uses_64bit {
+                if layout.uses_64bit {
                     let hi = (w.fs_block >> 32) as u32;
                     blk[pos + 8..pos + 12].copy_from_slice(&hi.to_be_bytes());
                 }
             }
             pos += tag_size;
         }
+        Self::seal_tail(&mut blk, layout);
         Ok(blk)
     }
 
-    fn build_revoke_block(&self) -> Result<Vec<u8>> {
+    /// Fill a descriptor or revoke block's checksum tail.
+    fn seal_tail(blk: &mut [u8], layout: Layout) {
+        if let Some(seed) = layout.seed {
+            let c = jbd2::block_tail_checksum(seed, blk);
+            let at = blk.len() - BLOCK_TAIL_BYTES;
+            blk[at..].copy_from_slice(&c.to_be_bytes());
+        }
+    }
+
+    fn build_revoke_block(&self, layout: Layout) -> Result<Vec<u8>> {
         let mut blk = vec![0u8; self.block_size as usize];
         self.write_header(&mut blk, JBD2_REVOKE_BLOCK);
 
-        let record_size = if self.uses_64bit { 8 } else { 4 };
+        let record_size = if layout.uses_64bit { 8 } else { 4 };
         let records_bytes = self.revokes.len() * record_size;
         let total_bytes = 16 + records_bytes; // header(12) + count(4) + records
-        if total_bytes > blk.len() {
+        if total_bytes > blk.len() - layout.tail_bytes {
             return Err(Error::Corrupt("revoke block overflow"));
         }
         blk[12..16].copy_from_slice(&(total_bytes as u32).to_be_bytes());
         let mut pos = 16usize;
         for &b in &self.revokes {
-            if self.uses_64bit {
+            if layout.uses_64bit {
                 blk[pos..pos + 8].copy_from_slice(&b.to_be_bytes());
             } else {
                 blk[pos..pos + 4].copy_from_slice(&(b as u32).to_be_bytes());
             }
             pos += record_size;
         }
+        Self::seal_tail(&mut blk, layout);
         Ok(blk)
     }
 
-    fn build_commit_block(&self) -> Result<Vec<u8>> {
+    fn build_commit_block(&self, layout: Layout) -> Result<Vec<u8>> {
         let mut blk = vec![0u8; self.block_size as usize];
         self.write_header(&mut blk, JBD2_COMMIT_BLOCK);
-        // v3 commit blocks have a checksum trailer; zero for now.
+        if let Some(seed) = layout.seed {
+            let c = jbd2::commit_block_checksum(seed, &blk);
+            blk[COMMIT_CHECKSUM_AT..COMMIT_CHECKSUM_AT + 4].copy_from_slice(&c.to_be_bytes());
+        }
         Ok(blk)
     }
 
@@ -316,8 +404,9 @@ mod tests {
         assert_eq!(seen[2].1 & TAG_LAST, TAG_LAST);
     }
 
-    /// V3 tag layout is 12 bytes (no BIT64), so more tags fit in 4096 bytes:
-    /// (4096 - 12) / 12 = 340 max. Exercise the v3 path for encoding at least.
+    /// V3 tags are 16 bytes with or without BIT64: without it the
+    /// `t_blocknr_high` slot is zero but still there. Exercise the v3 path
+    /// for encoding at least.
     #[test]
     fn v3_tag_layout_32bit_flags() {
         let mut tx = Transaction::begin(50, 4096, false, true);
@@ -330,6 +419,117 @@ mod tests {
         let flags = u32::from_be_bytes(desc[16..20].try_into().unwrap());
         assert_eq!(flags & TAG_LAST, TAG_LAST);
         assert_eq!(flags & TAG_SAME_UUID, TAG_SAME_UUID);
+    }
+
+    fn csum_jsb(incompat: u32) -> JournalSuperblock {
+        JournalSuperblock {
+            block_type: JBD2_SUPERBLOCK_V2,
+            header_sequence: 0,
+            block_size: 4096,
+            max_len: 1024,
+            first: 1,
+            sequence: 9,
+            start: 0,
+            errno: 0,
+            feature_compat: 0,
+            feature_incompat: incompat,
+            feature_ro_compat: 0,
+            uuid: *b"0123456789abcdef",
+            nr_users: 1,
+            checksum_type: 4,
+            num_fc_blocks: 0,
+            checksum: 0,
+        }
+    }
+
+    fn be32(b: &[u8], at: usize) -> u32 {
+        u32::from_be_bytes(b[at..at + 4].try_into().unwrap())
+    }
+
+    /// Every checksum a CSUM_V3 journal declares is filled, in a 16-byte tag
+    /// even without BIT64 (#80).
+    #[test]
+    fn commit_for_fills_csum_v3_checksums() {
+        let jsb = csum_jsb(JbdIncompat::REVOKE.bits() | JbdIncompat::CSUM_V3.bits());
+        let seed = jsb.csum_seed();
+        let mut tx = Transaction::begin(9, 4096, false, true);
+        tx.add_write(100, vec![0x11; 4096]).unwrap();
+        tx.add_write(200, vec![0x22; 4096]).unwrap();
+        tx.add_revoke(300);
+        let blocks = tx.commit_for(&jsb).unwrap();
+        assert_eq!(blocks.len(), 5, "descriptor, two data, revoke, commit");
+
+        let desc = &blocks[0];
+        for (i, data) in [&blocks[1], &blocks[2]].iter().enumerate() {
+            let tag = 12 + 16 * i;
+            assert_eq!(be32(desc, tag), [100, 200][i]);
+            assert_eq!(be32(desc, tag + 12), jbd2::tag_checksum(seed, 9, data));
+        }
+        assert_eq!(be32(desc, 4092), jbd2::block_tail_checksum(seed, desc));
+        assert_eq!(
+            be32(&blocks[3], 4092),
+            jbd2::block_tail_checksum(seed, &blocks[3])
+        );
+        assert_eq!(
+            be32(&blocks[4], COMMIT_CHECKSUM_AT),
+            jbd2::commit_block_checksum(seed, &blocks[4])
+        );
+        assert_ne!(be32(&blocks[4], COMMIT_CHECKSUM_AT), 0);
+    }
+
+    /// CSUM_V2: classical tags two bytes longer, the low 16 bits of the
+    /// checksum in `t_checksum`.
+    #[test]
+    fn commit_for_lays_csum_v2_tags() {
+        let jsb = csum_jsb(JbdIncompat::CSUM_V2.bits());
+        let seed = jsb.csum_seed();
+        let mut tx = Transaction::begin(9, 4096, false, false);
+        tx.add_write(100, vec![0x11; 4096]).unwrap();
+        tx.add_write(200, vec![0x22; 4096]).unwrap();
+        let blocks = tx.commit_for(&jsb).unwrap();
+        let desc = &blocks[0];
+        assert_eq!(be32(desc, 12 + 10), 200, "second tag starts ten bytes on");
+        let c16 = u16::from_be_bytes(desc[12 + 10 + 4..12 + 10 + 6].try_into().unwrap());
+        assert_eq!(c16, jbd2::tag_checksum(seed, 9, &blocks[2]) as u16);
+        assert_eq!(be32(desc, 4092), jbd2::block_tail_checksum(seed, desc));
+    }
+
+    #[test]
+    fn commit_for_refuses_what_it_cannot_write() {
+        let tx = Transaction::begin(9, 4096, false, true);
+        let v3 = JbdIncompat::CSUM_V3.bits();
+        for incompat in [
+            v3 | JbdIncompat::ASYNC_COMMIT.bits(),
+            v3 | JbdIncompat::FAST_COMMIT.bits(),
+        ] {
+            assert!(matches!(
+                tx.commit_for(&csum_jsb(incompat)),
+                Err(Error::Unsupported(_))
+            ));
+        }
+        for incompat in [0, v3 | JbdIncompat::BIT64.bits()] {
+            assert!(matches!(
+                tx.commit_for(&csum_jsb(incompat)),
+                Err(Error::InvalidArgument(_))
+            ));
+        }
+    }
+
+    /// The tail is not record space: a revoke block of 64-bit records holds
+    /// (4096 - 16) / 8 = 510 without one and 509 with it.
+    #[test]
+    fn revoke_tail_is_reserved() {
+        let b64 = JbdIncompat::BIT64.bits();
+        let mut tx = Transaction::begin(9, 4096, true, true);
+        for b in 0..509 {
+            tx.add_revoke(1000 + b);
+        }
+        tx.commit_for(&csum_jsb(JbdIncompat::CSUM_V3.bits() | b64))
+            .unwrap();
+        tx.add_revoke(2000);
+        assert!(tx
+            .commit_for(&csum_jsb(JbdIncompat::CSUM_V3.bits() | b64))
+            .is_err());
     }
 
     #[test]
