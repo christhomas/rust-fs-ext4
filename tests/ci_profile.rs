@@ -2,20 +2,42 @@
 //!
 //! `overflow-checks` is on in debug and off in release, so a defect
 //! whose only symptom is an arithmetic overflow panic cannot be
-//! observed by a release-only test run. This repository already runs a
-//! debug suite -- `release.yml:59`, `cargo test --locked --all-targets`
-//! -- and that is NOT the same fact as the pull-request gate being able
-//! to see the defect: `release.yml` triggers on a version tag, after
-//! the change has already merged. A wrapping bug merges green here and
-//! surfaces only when someone else cuts the next release, detached from
-//! the change and the person who could have caught it.
+//! observed by a release-only test run. `release.yml` runs a debug suite
+//! too -- its `chore test` starts with `task: test:unit` -- and that is
+//! NOT the same fact as the pull-request gate being able to see the
+//! defect: `release.yml` triggers on a version tag, after the change
+//! has already merged. A wrapping bug merges green here and surfaces
+//! only when someone else cuts the next release, detached from the
+//! change and the person who could have caught it.
 //!
 //! So `ci.yml` -- the workflow that actually gates a merge -- needs its
 //! own debug run, and this file is what keeps it there. It checks
 //! `ci.yml` specifically and is not satisfied by `release.yml` having
-//! one; see `a_debug_run_in_release_yml_alone_does_not_satisfy_the_gate`
+//! one; see `a_checking_debug_run_that_is_not_in_ci_yml_does_not_satisfy_this_guard`
 //! for that distinction pinned as a test rather than left as a comment
 //! someone could stop believing.
+//!
+//! # The run lives in `chores.yml`, one indirection away
+//!
+//! Every CI job runs chore tasks, so a green local `chore test` is the
+//! same evidence as a green CI run. The debug run is therefore not
+//! spelled in `ci.yml` at all: the `unit` job runs `chore test:unit`,
+//! and it is `chores.yml`'s `test:unit` task that carries
+//! `EXPECT_OVERFLOW_CHECKS=1` and the `cargo test` (through
+//! `scripts/test.sh`, which ends in `cargo test "$@"`). The guard FOLLOWS
+//! THAT INDIRECTION rather than accepting the task's name: a `chore
+//! <task>` line in a gating step is resolved in `chores.yml`, through any
+//! `task:` items, and the commands found there are held to the same rules
+//! as a command written in the step. See [`chore_checking_debug_runs`]
+//! for the ways a task stops gating (chore may skip it as up to date, or
+//! discard its failure).
+//!
+//! The same indirection carries the rest of the gate: which jobs run on
+//! which architecture, where the fixtures come from (the
+//! fs-linux-test-harness VM, under KVM, on the x86_64 `fixtures` job --
+//! GitHub's arm64 runners have no KVM), and that `ci-ok` waits on every
+//! job. Those are pinned by
+//! `the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectures_through_chore`.
 //!
 //! # Why this is an integration test and not a module under `src/`
 //!
@@ -28,8 +50,8 @@
 //!
 //! # The other half: does the debug run actually ask anything
 //!
-//! `ci.yml` quoting a debug command inside the comment explaining it
-//! (see the comment above the step this file is pinning) means a scan
+//! A workflow or task file quoting a debug command inside the comment
+//! explaining it means a scan
 //! that ignored comments would keep passing after the step itself was
 //! deleted. And a debug step that compiles but never checks anything is
 //! costing a compile for nothing, so the scan also requires the
@@ -79,6 +101,15 @@ fn read_or_panic(path: &Path) -> String {
 ///
 /// And the run must carry `EXPECT_OVERFLOW_CHECKS=1` -- a debug step
 /// that never asks the build anything buys nothing over deleting it.
+///
+/// `scripts/test.sh` IS `cargo test`, and is read as one. It picks a
+/// scratch directory and then runs `cargo test "$@"`, so every argument
+/// it is given -- `--release`, `-r` -- is cargo's, and the rules above
+/// apply to it word for word. `chores.yml` runs the suite through it.
+/// That the script still ends that way is pinned by
+/// `scripts_test_sh_is_still_cargo_test_with_its_arguments`: if it
+/// stopped passing its arguments through, reading it as `cargo test`
+/// would be a lie this guard tells.
 fn checking_debug_runs(script: &str) -> Vec<String> {
     script
         .lines()
@@ -88,22 +119,26 @@ fn checking_debug_runs(script: &str) -> Vec<String> {
                 return None;
             }
             let command = line.split(" #").next().unwrap_or(line).trim();
-            if !command.contains("cargo test") {
+            let as_cargo = command.replace(TEST_WRAPPER, "cargo test");
+            if !as_cargo.contains("cargo test") {
                 return None;
             }
-            if command.contains("--release")
-                || command.contains("--profile")
-                || selects_release_by_short_flag(command)
+            if as_cargo.contains("--release")
+                || as_cargo.contains("--profile")
+                || selects_release_by_short_flag(&as_cargo)
             {
                 return None;
             }
-            if !command.contains("EXPECT_OVERFLOW_CHECKS=1") {
+            if !as_cargo.contains("EXPECT_OVERFLOW_CHECKS=1") {
                 return None;
             }
             Some(command.to_string())
         })
         .collect()
 }
+
+/// The repository's `cargo test` wrapper. See [`checking_debug_runs`].
+const TEST_WRAPPER: &str = "scripts/test.sh";
 
 /// Whether `command` runs `cargo test` with the release profile selected
 /// by its short flag (#158).
@@ -514,7 +549,7 @@ fn carries_a_non_gating_key(keys: &[String]) -> bool {
 /// pull-request gate could see an overflow when the step it names does
 /// not run. Sharing the walk is what stops the two drifting apart
 /// again, rather than fixing them separately twice.
-fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> Vec<String> {
+fn scan_steps(workflow: &str, gating: bool, select: &dyn Fn(&str) -> Vec<String>) -> Vec<String> {
     let wf = parse_workflow(workflow);
     if gating && !runs_on_pull_request(&wf) {
         return Vec::new();
@@ -534,77 +569,397 @@ fn scan_steps(workflow: &str, gating: bool, select: fn(&str) -> Vec<String>) -> 
     out
 }
 
-/// The checking debug runs of steps that ACTUALLY GATE a pull request.
+/// A task in `chores.yml`, structured just far enough to answer the
+/// same question [`Step`] answers: does running it gate on its commands?
+#[derive(Debug)]
+struct ChoreTask {
+    keys: Vec<String>,
+    cmds: Vec<ChoreCmd>,
+}
+
+/// One item of a task's `cmds:`. Taskfile v3 spells it as a bare string,
+/// or a mapping carrying `cmd:` (a shell command) or `task:` (another
+/// task's name) beside keys such as `ignore_error:`.
+#[derive(Debug)]
+enum ChoreCmd {
+    Shell {
+        keys: Vec<String>,
+        command: String,
+    },
+    Task {
+        keys: Vec<String>,
+        name: String,
+    },
+    /// `defer:` and anything else chore grows. Never counted: what the
+    /// guard cannot read, it cannot say gates.
+    Other,
+}
+
+/// Parse `chores.yml`'s `tasks:` into [`ChoreTask`]s, by name.
+///
+/// Panics on text it cannot parse, for the reason [`parse_workflow`]
+/// does: a resolver that returned no tasks would turn every `chore`
+/// line into a panic naming the wrong cause, and one that returned early
+/// with a pass would be blind.
+fn parse_chores(text: &str) -> std::collections::BTreeMap<String, ChoreTask> {
+    let documents = Yaml::load_from_str(text).unwrap_or_else(|e| {
+        panic!(
+            "chores.yml is not valid YAML: {e}. The guard follows `chore <task>` into it, so \
+             a file it cannot parse is a failure and never a pass."
+        )
+    });
+    let mut tasks = std::collections::BTreeMap::new();
+    let Some(mapping) = documents
+        .first()
+        .and_then(|document| field(document, "tasks"))
+        .and_then(Yaml::as_mapping)
+    else {
+        return tasks;
+    };
+    for (name, body) in mapping.iter() {
+        let Some(name) = name.as_str() else { continue };
+        let cmds = field(body, "cmds")
+            .and_then(Yaml::as_sequence)
+            .into_iter()
+            .flatten()
+            .map(|item| {
+                if let Some(command) = item.as_str() {
+                    return ChoreCmd::Shell {
+                        keys: Vec::new(),
+                        command: command.to_string(),
+                    };
+                }
+                let keys = keys_of(item);
+                if let Some(name) = field(item, "task").and_then(Yaml::as_str) {
+                    ChoreCmd::Task {
+                        keys,
+                        name: name.to_string(),
+                    }
+                } else if let Some(command) = field(item, "cmd").and_then(Yaml::as_str) {
+                    ChoreCmd::Shell {
+                        keys,
+                        command: command.to_string(),
+                    }
+                } else {
+                    ChoreCmd::Other
+                }
+            })
+            .collect();
+        tasks.insert(
+            name.to_string(),
+            ChoreTask {
+                keys: keys_of(body),
+                cmds,
+            },
+        );
+    }
+    tasks
+}
+
+/// Keys whose presence on a chore TASK means running it may not run its
+/// commands, or may not fail when they do.
+///
+/// `sources:`, `generates:` and `status:` are how a task tells chore it
+/// is up to date, and an up-to-date task is SKIPPED: its commands do not
+/// run and the step is green. That is exactly `if:` one file away. The
+/// rest are the task-level spellings of `if:` and `continue-on-error:`
+/// themselves. Presence, not value, as with [`NON_GATING_KEYS`], and for
+/// the same reason: a guard that evaluated a fingerprint or a platform
+/// list would acquire a new defeat whenever chore's syntax grows.
+const NON_GATING_TASK_KEYS: [&str; 6] = [
+    "sources",
+    "generates",
+    "status",
+    "ignore_error",
+    "platforms",
+    "if",
+];
+
+/// Keys whose presence on one `cmds:` item means its failure is not the
+/// task's failure, or that it may not run.
+const NON_GATING_CMD_KEYS: [&str; 3] = ["ignore_error", "platforms", "if"];
+
+fn carries_any(keys: &[String], forbidden: &[&str]) -> bool {
+    keys.iter().any(|k| forbidden.contains(&k.as_str()))
+}
+
+/// The task names a step's `run:` hands to chore, in order.
+///
+/// A command -- as [`shell_commands`] splits a line -- whose first word
+/// is `chore` (after any `NAME=value` assignments) names its task in the
+/// first word after it that is not a flag, so `chore test:unit --force`
+/// is `test:unit`. Comment lines and trailing comments are not commands,
+/// as in [`checking_debug_runs`].
+///
+/// `! chore x` is NOT an invocation of `x` for this purpose: the `!`
+/// inverts it, so the step is green exactly when the task fails.
+fn chore_invocations(script: &str) -> Vec<String> {
+    let mut found = Vec::new();
+    for raw in script.lines() {
+        let line = raw.trim_start();
+        if line.starts_with('#') {
+            continue;
+        }
+        let line = line.split(" #").next().unwrap_or(line);
+        for words in shell_commands(line) {
+            let mut words = words
+                .iter()
+                .map(String::as_str)
+                .skip_while(|w| w.contains('=') && !w.starts_with('-'));
+            let Some(program) = words.next() else {
+                continue;
+            };
+            if program != "chore" && !program.ends_with("/chore") {
+                continue;
+            }
+            if let Some(task) = words.find(|w| !w.starts_with('-')) {
+                found.push(task.to_string());
+            }
+        }
+    }
+    found
+}
+
+/// The checking debug runs chore performs, and cannot skip or discard,
+/// when asked to run `task` -- following `task:` items down.
+///
+/// A task gates on its commands only if neither it nor any task on the
+/// path to it carries a key from [`NON_GATING_TASK_KEYS`], and a command
+/// counts only if its own item carries no key from
+/// [`NON_GATING_CMD_KEYS`]. Each command is then held to
+/// [`checking_debug_runs`], exactly as a command in a workflow step is.
+///
+/// A task naming itself, directly or through others, does not loop: the
+/// repeated edge contributes nothing, which can only under-count.
+///
+/// # A TASK THAT DOES NOT EXIST IS A PANIC
+///
+/// Not an empty result. `chore test:unti` fails the CI step, so the
+/// guard would report "no debug run gates" and send the reader looking
+/// for a missing handshake; naming the task that is not there names the
+/// real cause.
+fn chore_checking_debug_runs(
+    tasks: &std::collections::BTreeMap<String, ChoreTask>,
+    task: &str,
+    path: &mut Vec<String>,
+) -> Vec<String> {
+    if path.iter().any(|on_path| on_path == task) {
+        return Vec::new();
+    }
+    let Some(body) = tasks.get(task) else {
+        let mut via = path.join(" -> ");
+        if via.is_empty() {
+            via.push_str("a workflow step");
+        }
+        panic!(
+            "`chore {task}` (from {via}) names no task in chores.yml. Its tasks: {:?}",
+            tasks.keys().collect::<Vec<_>>()
+        );
+    };
+    if carries_any(&body.keys, &NON_GATING_TASK_KEYS) {
+        return Vec::new();
+    }
+    path.push(task.to_string());
+    let mut out = Vec::new();
+    for cmd in &body.cmds {
+        match cmd {
+            ChoreCmd::Shell { keys, command } if !carries_any(keys, &NON_GATING_CMD_KEYS) => {
+                out.extend(
+                    checking_debug_runs(command)
+                        .into_iter()
+                        .map(|run| format!("chore {}: {run}", path.join(" -> "))),
+                );
+            }
+            ChoreCmd::Task { keys, name } if !carries_any(keys, &NON_GATING_CMD_KEYS) => {
+                out.extend(chore_checking_debug_runs(tasks, name, path));
+            }
+            _ => {}
+        }
+    }
+    path.pop();
+    out
+}
+
+/// The checking debug runs of steps that ACTUALLY GATE a pull request,
+/// following each `chore <task>` into `chores`, the text of chores.yml.
 ///
 /// This is the function the guard below asks, and the whole of the
 /// difference: [`checking_debug_runs`] finds the command, this asks
 /// whether anything reads its result. Adding `if: false` to the
 /// guarded step in `ci.yml`, or `continue-on-error: true`, left all
 /// the guard's tests green while the gate stopped gating. See #142.
+///
+/// The chores text is a PARAMETER, not read here, so the rules can be
+/// proved against small fixtures; the real guard hands it the
+/// repository's own `chores.yml`.
+fn gating_checking_debug_runs_via_chore(workflow: &str, chores: &str) -> Vec<String> {
+    let tasks = parse_chores(chores);
+    scan_steps(workflow, true, &|run| {
+        let mut found = checking_debug_runs(run);
+        for task in chore_invocations(run) {
+            found.extend(chore_checking_debug_runs(&tasks, &task, &mut Vec::new()));
+        }
+        found
+    })
+}
+
+/// [`gating_checking_debug_runs_via_chore`] with no chore tasks at all,
+/// for the workflow-only fixtures in `mod gating`. A `chore` line in the
+/// workflow panics here, as naming a task that does not exist.
 fn gating_checking_debug_runs(workflow: &str) -> Vec<String> {
-    scan_steps(workflow, true, checking_debug_runs)
+    gating_checking_debug_runs_via_chore(workflow, "tasks: {}\n")
+}
+
+fn workflow_path(name: &str) -> PathBuf {
+    manifest_dir().join(".github").join("workflows").join(name)
 }
 
 /// The guard. Reads `ci.yml` -- the workflow that gates a pull request
 /// -- and refuses if nothing there compiles the overflow checks and
-/// asks the build to prove it.
+/// asks the build to prove it, whether a step spells the run itself or
+/// runs a `chores.yml` task that does.
 ///
-/// `ci.yml` specifically, not `release.yml`. `release.yml` already has
-/// a debug run and always has; it does not run on a pull request, so
-/// its presence says nothing about whether a merge was gated by it.
+/// `ci.yml` specifically, not `release.yml`. `release.yml` runs the
+/// same debug task through `chore test`; it does not run on a pull
+/// request, so its presence says nothing about whether a merge was
+/// gated by it.
 #[test]
 fn the_pr_gate_still_tests_in_a_profile_that_can_see_an_overflow() {
-    let path = manifest_dir()
-        .join(".github")
-        .join("workflows")
-        .join("ci.yml");
+    let path = workflow_path("ci.yml");
     let workflow = read_or_panic(&path);
+    let chores = read_or_panic(&manifest_dir().join("chores.yml"));
 
     if let Some(why) = not_a_pull_request_gate(&workflow) {
         panic!("{}: {why}", path.display());
     }
-    let debug_runs = gating_checking_debug_runs(&workflow);
+    let debug_runs = gating_checking_debug_runs_via_chore(&workflow, &chores);
     assert!(
         !debug_runs.is_empty(),
-        "no `cargo test` in {} runs without `--release` while setting \
-         EXPECT_OVERFLOW_CHECKS=1 IN A STEP WHOSE RESULT GATES A PULL \
-         REQUEST, so a defect whose only symptom is an \
-         arithmetic overflow panic can merge without the PR gate ever \
-         seeing it. release.yml already runs a debug suite, and that \
-         does not help: it triggers on a version tag, after the change \
-         has merged. If the debug step in ci.yml looked redundant beside \
-         the release one, it is not -- see the comment above it.",
+        "no `cargo test` reached from {} -- in a step, or in the chores.yml task a \
+         `chore <task>` step runs -- runs without `--release` while setting \
+         EXPECT_OVERFLOW_CHECKS=1 IN A STEP WHOSE RESULT GATES A PULL REQUEST, so a \
+         defect whose only symptom is an arithmetic overflow panic can merge without \
+         the PR gate ever seeing it. The run belongs in chores.yml's `test:unit`, run \
+         by ci.yml's `unit` job; a task carrying sources/generates/status (chore may \
+         skip it) or a cmd carrying ignore_error does not count. release.yml running \
+         it does not help: it triggers on a version tag, after the change has merged.",
         path.display()
     );
 }
 
-/// Both supported host architectures must run the real fixture generator and
-/// the complete Rust gate natively. The GitHub runner is already real Linux,
-/// so fixture generation there must use its native kernel rather than require
-/// nested virtualisation. Local macOS development still uses the matching VM.
-#[test]
-fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
-    let path = manifest_dir()
-        .join(".github")
-        .join("workflows")
-        .join("ci.yml");
-    let workflow = read_or_panic(&path);
-    let documents = Yaml::load_from_str(&workflow)
-        .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
-    let document = documents
-        .first()
-        .unwrap_or_else(|| panic!("{} is empty", path.display()));
-    let test_job = field(document, "jobs")
-        .and_then(|jobs| field(jobs, "test"))
-        .unwrap_or_else(|| panic!("{} has no jobs.test", path.display()));
+/// The parsed first document of `text`, read from `path`, or a panic
+/// naming the file.
+fn load_document<'t>(text: &'t str, path: &Path) -> Yaml<'t> {
+    Yaml::load_from_str(text)
+        .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()))
+        .into_iter()
+        .next()
+        .unwrap_or_else(|| panic!("{} is empty", path.display()))
+}
 
+fn job<'a, 't>(document: &'a Yaml<'t>, name: &str, path: &Path) -> &'a Yaml<'t> {
+    field(document, "jobs")
+        .and_then(|jobs| field(jobs, name))
+        .unwrap_or_else(|| panic!("{} has no jobs.{name}", path.display()))
+}
+
+fn steps_of<'a, 't>(job: &'a Yaml<'t>, name: &str) -> &'a [Yaml<'t>] {
+    field(job, "steps")
+        .and_then(Yaml::as_sequence)
+        .map(Vec::as_slice)
+        .unwrap_or_else(|| panic!("jobs.{name} has no steps"))
+}
+
+fn run_of<'a>(step: &'a Yaml) -> &'a str {
+    field(step, "run").and_then(Yaml::as_str).unwrap_or("")
+}
+
+/// A job's `needs:`, which GitHub accepts as one name or a list of them.
+fn needs_of(job: &Yaml) -> Vec<String> {
+    match field(job, "needs") {
+        Some(needs) if needs.as_sequence().is_some() => needs
+            .as_sequence()
+            .into_iter()
+            .flatten()
+            .filter_map(|n| n.as_str().map(str::to_string))
+            .collect(),
+        Some(needs) => needs.as_str().map(str::to_string).into_iter().collect(),
+        None => Vec::new(),
+    }
+}
+
+/// Whether `step` is an `actions/<action>` step whose `with.name` is `artifact`.
+fn is_artifact_step(step: &Yaml, action: &str, artifact: &str) -> bool {
+    field(step, "uses")
+        .and_then(Yaml::as_str)
+        .is_some_and(|uses| uses.starts_with(&format!("actions/{action}@")))
+        && field(step, "with")
+            .and_then(|with| field(with, "name"))
+            .and_then(Yaml::as_str)
+            == Some(artifact)
+}
+
+/// Every step of `job` carries no non-gating key, and neither does the
+/// job: the structure below is only the gate if all of it runs and all
+/// of its failures count.
+fn assert_unconditional(job: &Yaml, name: &str, workflow: &str) {
+    assert!(
+        !carries_a_non_gating_key(&keys_of(job)),
+        "{workflow} jobs.{name} must not be conditional or allowed to fail"
+    );
+    for (at, step) in steps_of(job, name).iter().enumerate() {
+        assert!(
+            !carries_a_non_gating_key(&keys_of(step)),
+            "{workflow} jobs.{name} step {at} ({:?}) must not be conditional or allowed to fail",
+            field(step, "name")
+                .and_then(Yaml::as_str)
+                .unwrap_or(run_of(step))
+        );
+    }
+}
+
+/// Whether some step of `steps` runs `chore <task>`.
+fn runs_chore(steps: &[Yaml], task: &str) -> bool {
+    steps
+        .iter()
+        .any(|step| chore_invocations(run_of(step)).iter().any(|t| t == task))
+}
+
+/// THE PULL-REQUEST GATE'S SHAPE, now that every job runs chore tasks.
+///
+/// - `fixtures` builds the kernel-made images ONCE, in the
+///   fs-linux-test-harness VM under KVM, on an x86_64 runner, and uploads
+///   them. They are disk images, the same for every architecture.
+/// - `test` runs on BOTH native architectures -- aarch64 matters on its
+///   own: `c_char` is unsigned there, and it is what DiskJockey ships on
+///   -- and downloads those images rather than building them, because
+///   GitHub's arm64 runners have no KVM. So no step of it may start a VM.
+/// - `unit` runs the tier that needs no tool and no fixture, which is
+///   where the overflow handshake lives (the guard above).
+/// - `ci-ok` is the one required check. It runs `if: always()` and must
+///   need EVERY other job: a job it does not wait on can fail, or be
+///   skipped, under a green required check. The set is computed from the
+///   parsed jobs, so adding a job and forgetting ci-ok fails here.
+///
+/// And the tasks those jobs run must still be what they say:
+/// `chore test` is unit, the tool and fixture checks, the whole suite in
+/// release, and the script tests; `chore lint` is clippy with warnings
+/// denied.
+#[test]
+fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectures_through_chore() {
+    let path = workflow_path("ci.yml");
+    let text = read_or_panic(&path);
+    let document = load_document(&text, &path);
+
+    // jobs.test
+    let test = job(&document, "test", &path);
+    assert_unconditional(test, "test", "ci.yml");
     assert_eq!(
-        field(test_job, "runs-on").and_then(Yaml::as_str),
+        field(test, "runs-on").and_then(Yaml::as_str),
         Some("${{ matrix.os }}"),
         "jobs.test must run each matrix row on its native runner"
     );
-
-    let rows = field(test_job, "strategy")
+    let rows = field(test, "strategy")
         .and_then(|strategy| field(strategy, "matrix"))
         .and_then(|matrix| field(matrix, "include"))
         .and_then(Yaml::as_sequence)
@@ -620,103 +975,260 @@ fn the_pr_gate_tests_x86_64_and_aarch64_natively() {
         .collect();
     assert_eq!(
         actual,
-        vec![("x86_64", "ubuntu-24.04"), ("aarch64", "ubuntu-24.04-arm"),],
+        vec![("x86_64", "ubuntu-24.04"), ("aarch64", "ubuntu-24.04-arm")],
         "the test job must cover both native standard Linux runner architectures"
     );
-
-    let steps = field(test_job, "steps")
-        .and_then(Yaml::as_sequence)
-        .unwrap_or_else(|| panic!("jobs.test has no steps"));
     assert!(
-        !carries_a_non_gating_key(&keys_of(test_job)),
-        "jobs.test must not be conditional or allowed to fail"
+        needs_of(test).iter().any(|n| n == "fixtures"),
+        "jobs.test must need jobs.fixtures, whose artifact it tests against"
     );
-    for required in [
-        "build-ext4-feature-images-native-linux.sh",
-        "cargo clippy --locked --all-targets -- -D warnings",
-        "cargo test --locked --release",
-        "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib",
-        "tests/scripts/*.sh",
-    ] {
+    let steps = steps_of(test, "test");
+    for task in ["tools", "lint", "test"] {
         assert!(
-            steps.iter().any(|step| {
-                field(step, "run")
-                    .and_then(Yaml::as_str)
-                    .is_some_and(|script| script.contains(required))
-                    && !carries_a_non_gating_key(&keys_of(step))
-            }),
-            "jobs.test does not run `{required}` unconditionally on every native matrix row"
+            runs_chore(steps, task),
+            "jobs.test does not run `chore {task}` on every native matrix row"
+        );
+    }
+    assert!(
+        steps
+            .iter()
+            .any(|step| is_artifact_step(step, "download-artifact", "fixtures")),
+        "jobs.test must download the `fixtures` artifact the fixtures job built"
+    );
+    for step in steps {
+        let run = run_of(step);
+        assert!(
+            !run.contains("qemu-system-") && !run.contains("ci-setup-linux.sh"),
+            "jobs.test runs on GitHub's arm64 runners, which have no KVM, so it must not \
+             start a VM: {run:?}"
         );
     }
 
+    // jobs.fixtures
+    let fixtures = job(&document, "fixtures", &path);
+    assert_unconditional(fixtures, "fixtures", "ci.yml");
+    let runner = field(fixtures, "runs-on")
+        .and_then(Yaml::as_str)
+        .unwrap_or("");
+    assert!(
+        runner.starts_with("ubuntu-") && !runner.contains("arm"),
+        "jobs.fixtures must run on an x86_64 ubuntu runner, where KVM is available; got \
+         {runner:?}"
+    );
+    let steps = steps_of(fixtures, "fixtures");
+    let setup = steps
+        .iter()
+        .position(|step| run_of(step).contains("ci-setup-linux.sh"))
+        .unwrap_or_else(|| {
+            panic!("jobs.fixtures must set the VM host up with the harness's ci-setup-linux.sh")
+        });
+    let build = steps
+        .iter()
+        .position(|step| {
+            chore_invocations(run_of(step))
+                .iter()
+                .any(|t| t == "fixtures")
+        })
+        .unwrap_or_else(|| panic!("jobs.fixtures must run `chore fixtures`"));
+    assert!(
+        setup < build,
+        "jobs.fixtures must set up the VM host before `chore fixtures` needs it"
+    );
     assert!(
         steps
             .iter()
-            .filter_map(|step| field(step, "run").and_then(Yaml::as_str))
-            .all(|script| !script.contains("qemu-system-")),
-        "a standard GitHub ARM runner must not depend on unavailable nested VM acceleration"
+            .any(|step| is_artifact_step(step, "upload-artifact", "fixtures")),
+        "jobs.fixtures must upload the images as the `fixtures` artifact"
+    );
+
+    // jobs.unit
+    let unit = job(&document, "unit", &path);
+    assert_unconditional(unit, "unit", "ci.yml");
+    assert!(
+        runs_chore(steps_of(unit, "unit"), "test:unit"),
+        "jobs.unit must run `chore test:unit`"
+    );
+
+    // jobs.ci-ok
+    let ci_ok = job(&document, "ci-ok", &path);
+    assert_eq!(
+        field(ci_ok, "if").and_then(Yaml::as_str),
+        Some("always()"),
+        "jobs.ci-ok must run `if: always()`, or a failed job skips it and a skipped \
+         required check can read as passing"
+    );
+    let mut others: Vec<String> = field(&document, "jobs")
+        .map(keys_of)
+        .unwrap_or_default()
+        .into_iter()
+        .filter(|name| name != "ci-ok")
+        .collect();
+    let mut needed = needs_of(ci_ok);
+    others.sort();
+    needed.sort();
+    assert_eq!(
+        needed, others,
+        "jobs.ci-ok must need exactly every other job in ci.yml: a job it does not wait \
+         on can fail under a green required check"
+    );
+
+    // chores.yml
+    let chores_path = manifest_dir().join("chores.yml");
+    let tasks = parse_chores(&read_or_panic(&chores_path));
+    let task = |name: &str| {
+        tasks
+            .get(name)
+            .unwrap_or_else(|| panic!("chores.yml has no `{name}` task"))
+    };
+    let test_task = task("test");
+    assert!(
+        !carries_any(&test_task.keys, &NON_GATING_TASK_KEYS),
+        "chores.yml `test` must never be skipped as up to date or allowed to fail"
+    );
+    let commands: Vec<&str> = test_task
+        .cmds
+        .iter()
+        .filter_map(|cmd| match cmd {
+            ChoreCmd::Shell { keys, command } if !carries_any(keys, &NON_GATING_CMD_KEYS) => {
+                Some(command.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    let subtasks: Vec<&str> = test_task
+        .cmds
+        .iter()
+        .filter_map(|cmd| match cmd {
+            ChoreCmd::Task { keys, name } if !carries_any(keys, &NON_GATING_CMD_KEYS) => {
+                Some(name.as_str())
+            }
+            _ => None,
+        })
+        .collect();
+    for subtask in ["test:unit", "test:scripts"] {
+        assert!(
+            subtasks.contains(&subtask),
+            "chores.yml `test` must run `task: {subtask}`; it runs {subtasks:?}"
+        );
+    }
+    // Spelled in two pieces so this file does not name the fixture
+    // directory: scripts/test-targets.sh would otherwise count it as a
+    // test that needs fixtures and leave it out of `chore test:unit`.
+    let fixtures_check = ["test-", "disks/build-fixtures.sh --check"].concat();
+    for check in ["scripts/tools.sh --check", fixtures_check.as_str()] {
+        assert!(
+            commands.iter().any(|c| c.trim() == check),
+            "chores.yml `test` must run `{check}` first, so a missing tool or fixture fails \
+             once, naming the task that provides it; it runs {commands:?}"
+        );
+    }
+    assert!(
+        commands.iter().any(|c| {
+            let as_cargo = c.replace(TEST_WRAPPER, "cargo test");
+            as_cargo.contains("cargo test")
+                && as_cargo.contains("--release")
+                && !as_cargo.contains("test-targets.sh")
+        }),
+        "chores.yml `test` must run the whole suite in the release profile; it runs \
+         {commands:?}"
+    );
+    assert!(
+        task("lint").cmds.iter().any(|cmd| matches!(
+            cmd,
+            ChoreCmd::Shell { keys, command }
+                if !carries_any(keys, &NON_GATING_CMD_KEYS)
+                    && command.trim() == "cargo clippy --locked --all-targets -- -D warnings"
+        )),
+        "chores.yml `lint` must run `cargo clippy --locked --all-targets -- -D warnings`"
     );
 }
 
-/// A tag release runs on real Linux too, so it must not regain an implicit
-/// `/dev/kvm` dependency after the pull-request gate has proved the native
-/// fixture path. This is a shipping gate, not a slower second VM oracle.
+/// THE SHIPPING GATE runs the same chore tasks as the pull-request gate,
+/// in one job: `ubuntu-latest` is x86_64 with KVM, so it builds the
+/// fixtures itself through the harness VM -- `ci-setup-linux.sh`, then
+/// `chore fixtures` -- and then runs `chore test`, unconditionally.
+///
+/// None of the scripts the harness replaced may come back: the native
+/// sudo generator, the in-repo VM builder and e2fsck runner, and the
+/// in-repo VM wrapper are deleted, and a step naming one fails on a tag,
+/// after the version is committed to. And nothing ships -- neither the
+/// packaged binary nor the crates.io upload -- unless `test` passed.
 #[test]
-fn the_release_gate_generates_fixtures_natively_without_kvm() {
-    let path = manifest_dir()
-        .join(".github")
-        .join("workflows")
-        .join("release.yml");
-    let workflow = read_or_panic(&path);
-    let documents = Yaml::load_from_str(&workflow)
-        .unwrap_or_else(|e| panic!("{} is not valid YAML: {e}", path.display()));
-    let document = documents
-        .first()
-        .unwrap_or_else(|| panic!("{} is empty", path.display()));
-    let test_job = field(document, "jobs")
-        .and_then(|jobs| field(jobs, "test"))
-        .unwrap_or_else(|| panic!("{} has no jobs.test", path.display()));
-    let steps = field(test_job, "steps")
-        .and_then(Yaml::as_sequence)
-        .unwrap_or_else(|| panic!("jobs.test has no steps"));
+fn the_release_gate_builds_fixtures_in_the_harness_vm_and_runs_chore_test() {
+    let path = workflow_path("release.yml");
+    let text = read_or_panic(&path);
+    let document = load_document(&text, &path);
+    let test = job(&document, "test", &path);
+    assert_unconditional(test, "test", "release.yml");
+    let steps = steps_of(test, "test");
 
+    let setup = steps
+        .iter()
+        .position(|step| run_of(step).contains("ci-setup-linux.sh"))
+        .unwrap_or_else(|| {
+            panic!("release jobs.test must set the VM host up with the harness's ci-setup-linux.sh")
+        });
+    let build = steps
+        .iter()
+        .position(|step| {
+            chore_invocations(run_of(step))
+                .iter()
+                .any(|t| t == "fixtures")
+        })
+        .unwrap_or_else(|| panic!("release jobs.test must run `chore fixtures`"));
     assert!(
-        !carries_a_non_gating_key(&keys_of(test_job)),
-        "release jobs.test must not be conditional or allowed to fail"
+        setup < build,
+        "release jobs.test must set up the VM host before `chore fixtures` needs it"
     );
     assert!(
-        steps.iter().any(|step| {
-            field(step, "run")
-                .and_then(Yaml::as_str)
-                .is_some_and(|run| {
-                    run.contains("sudo bash test-disks/build-ext4-feature-images-native-linux.sh")
-                })
-                && !carries_a_non_gating_key(&keys_of(step))
-        }),
-        "release jobs.test must generate fixtures natively in an unconditional step"
+        runs_chore(steps, "test"),
+        "release jobs.test must run `chore test`"
     );
-    assert!(
-        steps
-            .iter()
-            .filter_map(|step| field(step, "run").and_then(Yaml::as_str))
-            .all(|run| !run.contains("build-ext4-feature-images.sh")),
-        "release jobs.test must not depend on a QEMU VM without guaranteed KVM"
-    );
+
+    let jobs = field(&document, "jobs")
+        .and_then(Yaml::as_mapping)
+        .unwrap_or_else(|| panic!("{} has no jobs", path.display()));
+    for (name, body) in jobs.iter() {
+        for step in field(body, "steps")
+            .and_then(Yaml::as_sequence)
+            .into_iter()
+            .flatten()
+        {
+            let run = run_of(step);
+            for deleted in [
+                "build-ext4-feature-images",
+                "_vm-builder",
+                "vm-e2fsck",
+                "scripts/vm.sh",
+            ] {
+                assert!(
+                    !run.contains(deleted),
+                    "release.yml jobs.{} runs `{deleted}`, which is deleted: {run:?}",
+                    name.as_str().unwrap_or("?")
+                );
+            }
+        }
+    }
+
+    for shipping in ["package-cli", "publish"] {
+        assert!(
+            needs_of(job(&document, shipping, &path))
+                .iter()
+                .any(|n| n == "test"),
+            "release jobs.{shipping} must need jobs.test: nothing ships untested"
+        );
+    }
 }
 
 /// THE DISTINCTION THIS REPOSITORY NEEDS THAT A PORTED COPY WOULD MISS.
 ///
 /// A workflow carrying a checking debug run under a name other than
 /// `ci.yml` -- `release.yml`, in this repository's own case -- must not
-/// satisfy the guard. Simulated here with `release.yml`'s actual step
-/// shape: a plain `cargo test --locked --all-targets` with no
-/// `EXPECT_OVERFLOW_CHECKS`, because that workflow was never asked to
-/// carry the handshake and does not need to -- it already runs in
-/// debug, unconditionally, so nothing there was ever blind. The
-/// scenario worth pinning is the near miss: even a hypothetical debug
-/// run in `release.yml` that DID set the handshake would not make
-/// `ci.yml`'s own absence of one acceptable, because `release.yml`
-/// triggers too late to gate a merge.
+/// satisfy the guard. `release.yml` does carry one: its `chore test`
+/// runs `task: test:unit`, handshake and all, unconditionally. That is
+/// exactly the near miss worth pinning, because it does not make
+/// `ci.yml`'s own absence of one acceptable: `release.yml` triggers on a
+/// version tag, too late to gate a merge.
 #[test]
 fn a_checking_debug_run_that_is_not_in_ci_yml_does_not_satisfy_this_guard() {
     let release_yml_shape = "\
@@ -737,6 +1249,49 @@ jobs:
         "the parser itself would count this line -- the guard's correctness \
          depends on scanning ci.yml and ci.yml alone, not on the parser \
          refusing this shape"
+    );
+
+    // And release.yml's actual shape: the same run, one `chore test` away,
+    // in a workflow that triggers on a tag. The resolver finds the run --
+    // so the chore indirection is not what refuses it -- and the gating
+    // walk refuses it for the trigger alone.
+    let release_yml_via_chore = "\
+on:
+  push:
+    tags: ['v*.*.*']
+jobs:
+  test:
+    steps:
+      - run: chore test
+";
+    let chores = "\
+tasks:
+  test:
+    cmds:
+      - task: test:unit
+      - scripts/test.sh --locked --release
+  test:unit:
+    cmds:
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked --lib'
+";
+    let tasks = parse_chores(chores);
+    assert_eq!(
+        chore_checking_debug_runs(&tasks, "test", &mut Vec::new()).len(),
+        1,
+        "the resolver itself would find the run behind `chore test`"
+    );
+    assert!(
+        gating_checking_debug_runs_via_chore(release_yml_via_chore, chores).is_empty(),
+        "a workflow that runs on a tag gates no merge, however its task resolves"
+    );
+    assert_eq!(
+        gating_checking_debug_runs_via_chore(
+            &release_yml_via_chore.replace("  push:\n    tags: ['v*.*.*']\n", "  pull_request:\n"),
+            chores
+        )
+        .len(),
+        1,
+        "control: the same steps on pull_request do gate"
     );
 }
 
@@ -1163,10 +1718,302 @@ jobs:
                 .join("workflows")
                 .join("ci.yml"),
         );
+        let chores = super::read_or_panic(&super::manifest_dir().join("chores.yml"));
         assert!(
-            !gating(&workflow).is_empty(),
+            !super::gating_checking_debug_runs_via_chore(&workflow, &chores).is_empty(),
             "the real ci.yml must parse into at least one gating step, or the guard is \
              passing on a fixture and failing on the file it exists to read"
+        );
+    }
+}
+
+/// Following `chore <task>` into chores.yml: what resolves, and what a
+/// task or a command item carries that stops it gating. Every test is
+/// [`WORKFLOW`] and [`CHORES`] with one thing changed.
+mod chore {
+    use super::gating_checking_debug_runs_via_chore as gating;
+
+    const WORKFLOW: &str = "\
+on:
+  pull_request:
+    branches: [main]
+jobs:
+  unit:
+    steps:
+      - name: chore test:unit
+        run: chore test:unit
+";
+
+    const CHORES: &str = "\
+version: '3'
+tasks:
+  test:unit:
+    cmds:
+      - 'EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib'
+  test:
+    cmds:
+      - task: test:unit
+      - cargo test --locked --release
+";
+
+    const UNIT_CMDS: &str =
+        "    cmds:\n      - 'EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib'\n";
+
+    #[test]
+    fn a_chore_step_resolving_to_a_checking_debug_run_gates() {
+        assert_eq!(
+            gating(WORKFLOW, CHORES),
+            vec!["chore test:unit: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib".to_string()],
+            "the control must be counted, or every test below passes for the wrong reason"
+        );
+    }
+
+    #[test]
+    fn a_chore_step_reaching_the_run_through_a_nested_task_gates() {
+        let workflow = WORKFLOW.replace("run: chore test:unit", "run: chore test");
+        assert_ne!(workflow, WORKFLOW, "the mutation must actually apply");
+        assert_eq!(
+            gating(&workflow, CHORES),
+            vec![
+                "chore test -> test:unit: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib"
+                    .to_string()
+            ],
+            "`task: test:unit` runs the task, so its run is the step's run"
+        );
+    }
+
+    #[test]
+    fn a_chore_step_with_arguments_after_the_task_still_resolves() {
+        for line in [
+            "chore test:unit --force",
+            "chore test:unit -- --nocapture",
+            "CARGO_TERM_COLOR=always chore test:unit",
+            "set -eu; chore test:unit --force",
+            "~/.local/bin/chore test:unit  # the unit tier",
+        ] {
+            let workflow = WORKFLOW.replace("run: chore test:unit", &format!("run: {line}"));
+            assert_ne!(workflow, WORKFLOW, "the mutation must actually apply");
+            assert_eq!(
+                gating(&workflow, CHORES).len(),
+                1,
+                "`{line}` runs test:unit"
+            );
+        }
+    }
+
+    /// chore may SKIP a task that carries any of these as up to date, and
+    /// an up-to-date skip is a green step. Presence, not value.
+    #[test]
+    fn a_task_chore_may_skip_as_up_to_date_does_not_gate() {
+        for key in [
+            "sources: [src/lib.rs]",
+            "generates: [target/done]",
+            "status: ['true']",
+            "sources: []",
+        ] {
+            let chores = CHORES.replace(UNIT_CMDS, &format!("    {key}\n{UNIT_CMDS}"));
+            assert_ne!(chores, CHORES, "the mutation must actually apply");
+            assert!(
+                gating(WORKFLOW, &chores).is_empty(),
+                "a task carrying `{key}` may be skipped as up to date, so its run cannot be \
+                 what makes the gate see an overflow"
+            );
+        }
+    }
+
+    /// The same, on a task ON THE PATH rather than the one holding the run.
+    #[test]
+    fn a_skippable_task_on_the_path_does_not_gate() {
+        let workflow = WORKFLOW.replace("run: chore test:unit", "run: chore test");
+        let chores = CHORES.replace(
+            "  test:\n    cmds:\n",
+            "  test:\n    sources: [Cargo.toml]\n    cmds:\n",
+        );
+        assert_ne!(chores, CHORES, "the mutation must actually apply");
+        assert_eq!(gating(&workflow, CHORES).len(), 1, "control");
+        assert!(
+            gating(&workflow, &chores).is_empty(),
+            "if `test` is skipped, the `test:unit` it would have run is skipped too"
+        );
+    }
+
+    #[test]
+    fn a_cmd_carrying_ignore_error_does_not_gate() {
+        let chores = CHORES.replace(
+            "      - 'EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib'\n",
+            "      - cmd: 'EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib'\n        ignore_error: true\n",
+        );
+        assert_ne!(chores, CHORES, "the mutation must actually apply");
+        assert!(
+            gating(WORKFLOW, &chores).is_empty(),
+            "a command whose failure chore ignores is a run whose result nothing reads"
+        );
+
+        // The control: the same mapping spelling, without the key, gates.
+        let control = chores.replace("        ignore_error: true\n", "");
+        assert_eq!(
+            gating(WORKFLOW, &control).len(),
+            1,
+            "a `cmd:` mapping is a command"
+        );
+
+        // And on the `task:` item that reaches it.
+        let workflow = WORKFLOW.replace("run: chore test:unit", "run: chore test");
+        let chores = CHORES.replace(
+            "      - task: test:unit\n",
+            "      - task: test:unit\n        ignore_error: false\n",
+        );
+        assert_ne!(chores, CHORES, "the mutation must actually apply");
+        assert!(
+            gating(&workflow, &chores).is_empty(),
+            "`ignore_error: false` too: the key's presence, not its value"
+        );
+    }
+
+    #[test]
+    fn a_chore_step_carrying_if_still_does_not_gate() {
+        let workflow = WORKFLOW.replace(
+            "        run: chore test:unit\n",
+            "        run: chore test:unit\n        if: false\n",
+        );
+        assert_ne!(workflow, WORKFLOW, "the mutation must actually apply");
+        assert!(
+            gating(&workflow, CHORES).is_empty(),
+            "resolving the task happens only for a step that gates"
+        );
+    }
+
+    #[test]
+    fn a_chore_line_that_is_a_comment_or_inverted_does_not_resolve() {
+        for run in [
+            "run: |\n          # chore test:unit\n          echo nothing",
+            "run: '! chore test:unit'",
+            "run: echo chore test:unit",
+        ] {
+            let workflow = WORKFLOW.replace("run: chore test:unit", run);
+            assert_ne!(workflow, WORKFLOW, "the mutation must actually apply");
+            assert!(
+                gating(&workflow, CHORES).is_empty(),
+                "`{run}` does not run test:unit and require it to pass"
+            );
+        }
+    }
+
+    #[test]
+    #[should_panic(
+        expected = "`chore test:unti` (from a workflow step) names no task in chores.yml"
+    )]
+    fn a_chore_step_naming_a_task_that_does_not_exist_panics() {
+        gating(
+            &WORKFLOW.replace("chore test:unit", "chore test:unti"),
+            CHORES,
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "`chore test:unti` (from test) names no task in chores.yml")]
+    fn a_task_item_naming_a_task_that_does_not_exist_panics() {
+        gating(
+            &WORKFLOW.replace("run: chore test:unit", "run: chore test"),
+            &CHORES.replace("- task: test:unit", "- task: test:unti"),
+        );
+    }
+
+    /// A cycle is chore's error to report; the guard must just not hang.
+    #[test]
+    fn a_task_cycle_terminates() {
+        let chores = format!("{CHORES}  a:\n    cmds:\n      - task: b\n      - task: test:unit\n  b:\n    cmds:\n      - task: a\n");
+        let workflow = WORKFLOW.replace("run: chore test:unit", "run: chore a");
+        assert_eq!(gating(&workflow, &chores).len(), 1);
+    }
+
+    /// `scripts/test.sh` is read as `cargo test`, which is only true while
+    /// it ends by handing cargo every argument it was given.
+    #[test]
+    fn scripts_test_sh_is_still_cargo_test_with_its_arguments() {
+        let script = super::read_or_panic(&super::manifest_dir().join(super::TEST_WRAPPER));
+        let last = script
+            .lines()
+            .map(str::trim)
+            .rfind(|line| !line.is_empty() && !line.starts_with('#'));
+        assert_eq!(
+            last,
+            Some("cargo test \"$@\""),
+            "{} no longer ends in `cargo test \"$@\"`, so checking_debug_runs must stop \
+             reading it as `cargo test`",
+            super::TEST_WRAPPER
+        );
+        let chores = CHORES.replace(
+            "cargo test --locked --lib",
+            "scripts/test.sh --locked --lib",
+        );
+        assert_eq!(
+            gating(WORKFLOW, &chores).len(),
+            1,
+            "the wrapper in debug gates"
+        );
+        for release in ["--release --lib", "-r --lib"] {
+            let chores = CHORES.replace(
+                "cargo test --locked --lib",
+                &format!("scripts/test.sh --locked {release}"),
+            );
+            assert!(
+                gating(WORKFLOW, &chores).is_empty(),
+                "the wrapper with `{release}` is release"
+            );
+        }
+    }
+
+    fn real(path: &[&str]) -> String {
+        let mut full = super::manifest_dir();
+        full.extend(path);
+        super::read_or_panic(&full)
+    }
+
+    /// THE GUARD BITES ON THE REAL FILES, mutated in memory.
+    ///
+    /// Note what it takes: dropping the `unit` job's `chore test:unit` is
+    /// NOT enough on its own, because the `test` job's `chore test` runs
+    /// `task: test:unit` as well -- in debug, with the handshake -- so the
+    /// PR gate still sees an overflow, on both architectures. Only both
+    /// gone, or the handshake gone from the task, or the task made
+    /// skippable, leaves nothing.
+    #[test]
+    fn the_real_files_stop_gating_when_the_run_is_removed() {
+        let workflow = real(&[".github", "workflows", "ci.yml"]);
+        let chores = real(&["chores.yml"]);
+        assert!(!gating(&workflow, &chores).is_empty(), "control");
+
+        let no_unit_step = workflow.replace("run: chore test:unit\n", "run: 'true'\n");
+        assert_ne!(no_unit_step, workflow, "the mutation must actually apply");
+        assert!(
+            gating(&no_unit_step, &chores)
+                .iter()
+                .all(|run| run.starts_with("chore test -> test:unit: ")),
+            "without the unit job's step, only `chore test` reaches the run"
+        );
+        let neither = no_unit_step.replace("run: chore test\n", "run: 'true'\n");
+        assert_ne!(neither, no_unit_step, "the mutation must actually apply");
+        assert!(
+            gating(&neither, &chores).is_empty(),
+            "no step reaches test:unit"
+        );
+
+        let no_handshake = chores.replace("EXPECT_OVERFLOW_CHECKS=1 ", "");
+        assert_ne!(no_handshake, chores, "the mutation must actually apply");
+        assert!(
+            gating(&workflow, &no_handshake).is_empty(),
+            "test:unit without EXPECT_OVERFLOW_CHECKS=1 asks the build nothing"
+        );
+
+        let skippable = chores.replace(
+            "  test:unit:\n",
+            "  test:unit:\n    sources: ['src/**/*.rs']\n",
+        );
+        assert_ne!(skippable, chores, "the mutation must actually apply");
+        assert!(
+            gating(&workflow, &skippable).is_empty(),
+            "a test:unit chore may skip as up to date gates nothing"
         );
     }
 }

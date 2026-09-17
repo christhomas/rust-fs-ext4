@@ -26,6 +26,46 @@
   walk, stat and read in device calls at no cache, the default and four
   times it, and `docs/read-path-cost.md` records the figures.
 
+### Changed
+
+- **The test contract is chore tasks, and the first consumer of
+  [fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness).**
+  `chore tools` installs the host oracle tools (e2fsprogs), `chore fixtures`
+  builds the kernel-made `test-disks/*.img` in the harness VM,
+  `chore test:unit` runs what needs neither, `chore test:oracle` runs the
+  e2fsprogs oracles, and `chore test` runs everything exactly as CI does
+  (`unit`, `fixtures`, `test` on x86_64 and aarch64, and the `ci-ok` gate).
+  `chore siblings` checks out `../rust-fs-core` and the harness at their
+  pinned refs.
+- **No test skips.** Every test that returned early when a fixture or an
+  e2fsprogs tool was missing now fails naming `chore fixtures` or
+  `chore tools` (`fs_ext4_test_support::fixture`, `oracle_tool`,
+  `assert_e2fsck_clean`).
+- The `validate-mkfs-bin` CI job (and release.yml's `validate-fsck`) is now
+  `tests/mkfs_bin_fsck_oracle.rs`, so it runs locally too.
+- `tests/lwext4_cross_validate.rs` is one `#[ignore]`d test that fails when
+  run, rather than two that printed SKIP and passed; the comparison is still
+  unwritten (#99).
+
+### Added
+
+- `tests/oracle_debugfs.rs`: the driver writes (Rust API and C ABI), and
+  `debugfs` reads every byte back (`dump` + compare) and the metadata
+  (`stat`, `ex`, `icheck`, `ncheck`, `logdump`), with `e2fsck -fn` for
+  consistency; files placed by `mke2fs -d` read identically through the
+  driver; and a flipped data byte is shown to pass e2fsck and fail the
+  debugfs comparison.
+
+### Removed
+
+- `scripts/vm.sh`, `scripts/vm-slot.sh`, `scripts/vm-e2fsck.sh` and
+  `tests/vagrant/debian/` (the harness replaces them), their shell tests in
+  `tests/scripts/`, and the fixture builders
+  `test-disks/build-ext4-feature-images.sh` (the Alpine VM),
+  `build-ext4-feature-images-native-linux.sh` (sudo on the host),
+  `vm-architecture.sh`, `build-test-disks.sh` and `gen-test-disks.sh`.
+  `test-disks/_vm-builder.sh` is now `test-disks/guest-build-images.sh`.
+
 ### Fixed
 
 - **A hole can be punched in a file whose extent tree is deeper than the

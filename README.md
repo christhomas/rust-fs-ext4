@@ -244,9 +244,14 @@ credited in the License section.
   - Orphan recovery's cut-after-every-write sweeps, on a real orphan
     through both the journaled and the unjournaled commit, are unit
     tests in `src/fs.rs` beside the helpers that plant one.
+- **Oracles:** the driver writes and e2fsprogs reads it back on the host —
+  `e2fsck -fn` for consistency, `debugfs` for content and metadata
+  (`tests/oracle_debugfs.rs`: dump + compare, `stat`, `ex`, `icheck`,
+  `ncheck`, `logdump`, and a negative case proving a corrupted data byte is
+  caught). `chore test:oracle` runs them all.
 - **Cross-validators:** `tests/lwext4_cross_validate.rs` (BSD-2-Clause
-  reference, opt-in via env flag — built as a library, never linked
-  by default); a FreeBSD-VM cross-validator (`tests/vagrant/freebsd/`,
+  reference; not implemented yet, so its test is `#[ignore]`d and fails
+  when run); a FreeBSD-VM cross-validator (`tests/vagrant/freebsd/`,
   `tests/qemu/`) is in flight.
 - **Structural verifier:** `crate::verify::verify` reconciles
   the on-disk bitmap against every block claimed by the inode
@@ -513,41 +518,43 @@ let attrs = fs.stat("/hello.txt")?;
 
 ### Testing
 
+The test contract is a set of chore tasks, and CI runs exactly these:
+
 ```sh
-./scripts/test.sh --release
+chore siblings      # ../rust-fs-core and ../fs-linux-test-harness at their pinned refs
+chore tools         # install + verify the host oracle tools (e2fsprogs; macOS: prints the formula)
+chore fixtures      # build test-disks/*.img (kernel-made, in the harness VM)
+chore test:unit     # the tests that need no tool and no fixture
+chore test:oracle   # the driver writes, e2fsprogs reads back (e2fsck -fn, debugfs)
+chore test          # everything, as CI runs it
 ```
 
-The runner gives every invocation its own scratch directory and cleans it on
-exit. GitHub Actions uses its `RUNNER_TEMP` when available; macOS and ordinary
-hosts use the temporary root supplied by the operating environment. On
-Raspberry Pi it uses
+**No test skips.** A test that needs an oracle tool or a fixture fails,
+naming `chore tools` or `chore fixtures`, when it is missing — a skipped
+test reads exactly like a passing one.
+
+Tests run on the host. The oracle tools (`e2fsck`, `debugfs`, `mke2fs`,
+`dumpe2fs`, `tune2fs`) are ordinary host programs on Linux, and Homebrew's
+keg-only `e2fsprogs` on macOS. The fixtures under `test-disks/` are
+gitignored and need the real kernel's ext4 driver to populate (loop
+mounts, xattrs, ACLs, inline data, htree directories), so `chore fixtures`
+builds them in a Debian VM through
+[fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
+(Vagrant + QEMU, KVM on Linux, HVF on macOS; `chore vm:host:check` says what
+the host is missing). The recipes are `test-disks/guest-build-images.sh`;
+there is no Rust toolchain in the VM.
+
+`chore test` runs the suite through `./scripts/test.sh`, which gives every
+invocation its own scratch directory and cleans it on exit. GitHub Actions
+uses its `RUNNER_TEMP` when available; macOS and ordinary hosts use the
+temporary root supplied by the operating environment. On Raspberry Pi it uses
 `./tmp` so fixture-copy churn stays on the checkout's storage (for example,
 an NVMe volume) instead of the SD card backing system temporary directory. Set
 `FS_EXT4_TEST_TMP_BASE` to choose another managed base, or
 `FS_EXT4_TEST_TMPDIR` to supply an exact caller-managed directory. Direct
 `cargo test` also follows the same location policy and isolates every process
 beneath the selected root, but has no wrapper lifecycle to clean its scratch
-directory afterward. Use the wrapper for normal development and CI runs.
-
-Integration tests use ext4 image fixtures under `test-disks/`.
-Fixtures are gitignored — regenerate them with:
-
-```sh
-bash test-disks/build-ext4-feature-images.sh
-```
-
-The local generator runs standard formatter tools inside a short-lived
-Alpine Linux VM booted under QEMU, so the same script works on macOS and
-Linux without Docker. It selects an x86_64 guest on Intel/AMD hosts and an
-aarch64 guest on Apple Silicon/ARM Linux hosts. Native guests require KVM on
-Linux or HVF on macOS; the generator fails rather than silently falling back
-to slow emulation. Set `EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64` together
-with `EXT4_VM_ALLOW_TCG=1` only for a deliberate cross-architecture diagnostic.
-First run downloads the Alpine virt ISO + kernel (~75 MB, cached
-under `test-disks/.vm-cache/`); cached VM assets are separated by
-architecture. CI needs no nested VM: both x86_64 and ARM64 jobs are already
-real Linux, so they use `build-ext4-feature-images-native-linux.sh` and run the
-full fixture and Rust gate directly on their native kernels.
+directory afterward.
 
 ### Git hooks
 

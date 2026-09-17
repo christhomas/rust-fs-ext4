@@ -10,10 +10,7 @@ permissions:
 
 env:
   CARGO_TERM_COLOR: always
-  # Pinned tag of the sibling am-fs-core repo used to satisfy the path dep
-  # during local build/verify. Bump in lockstep with the am-fs-core version
-  # constraint in Cargo.toml when releasing a new fs-ext4 minor.
-  FS_CORE_REF: v0.2.10
+  CHORE_VERSION: "0.11.0"
 
 jobs:
   test:
@@ -21,16 +18,6 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v5
-
-      - name: clone am-fs-core sibling
-        shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
-
-      - uses: dtolnay/rust-toolchain@stable
-        with:
-          toolchain: 1.95.0
-          components: clippy
-      - uses: Swatinem/rust-cache@v2
 
       - name: verify tag matches Cargo.toml version
         run: |
@@ -41,68 +28,32 @@ jobs:
             exit 1
           fi
 
-      # The release host is already real Linux. Generate and mount disposable
-      # fixtures directly instead of depending on nested KVM or slow TCG.
-      - name: install native ext4 fixture tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq acl attr e2fsprogs fdisk util-linux
-      - name: generate test disks
-        run: sudo bash test-disks/build-ext4-feature-images-native-linux.sh
-
-      - run: cargo test --locked --all-targets
-      - run: cargo clippy --locked --all-targets -- -D warnings
-
-  # Strict functional gate: build the mkfs_ext4 CLI, format an image, and
-  # run the kernel's own fsck.ext4 (from e2fsprogs) against it. This is the
-  # canonical "does Linux think this is a valid ext4 volume?" oracle —
-  # stricter than the crate's own read-path round-trip because it exercises
-  # every assertion in e2fsck's superblock + group-descriptor + inode-table
-  # validation, including metadata-csum. Publish is gated on this passing so
-  # a regression in the mkfs path can never ship to crates.io. Mirrors the
-  # validate-mkfs-bin job in ci.yml.
-  validate-fsck:
-    name: validate mkfs_ext4 (fsck.ext4 strict)
-    runs-on: ubuntu-latest
-    steps:
-      - uses: actions/checkout@v5
-
-      - name: clone am-fs-core sibling
-        shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
-
+      # The same gate as a pull request's CI, through the same chore
+      # tasks: the siblings at their pinned refs (rust-fs-core is the
+      # path dependency), the oracle tools, the kernel-made fixtures in
+      # the fs-linux-test-harness VM (ubuntu-latest is x86_64 with KVM),
+      # lint, and the whole suite -- which includes the e2fsck checks of
+      # the mkfs_ext4 binary (tests/mkfs_bin_fsck_oracle.rs) that used to
+      # be a job of their own here.
+      - name: install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
       - uses: dtolnay/rust-toolchain@stable
         with:
           toolchain: 1.95.0
+          components: clippy, rustfmt
       - uses: Swatinem/rust-cache@v2
-
-      - name: install e2fsprogs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq e2fsprogs
-
-      - name: build mkfs_ext4
-        run: cargo build --locked --release --bin mkfs_ext4
-
-      # 32 MiB is the v1 single-block-group cap. Keep it as the smoke
-      # test target and add a larger one once multi-group lands.
-      - name: format 32 MiB image and validate with fsck.ext4
-        run: |
-          truncate -s 32M /tmp/out.img
-          ./target/release/mkfs_ext4 -L CITEST -U deadbeef-cafe-1234-5678-0123456789ab /tmp/out.img
-          # -f forces a check even if FS thinks it's clean; -n declines
-          # any repair offer (so this is read-only and exits non-zero
-          # if anything is wrong rather than silently auto-fixing).
-          fsck.ext4 -fnv /tmp/out.img
-
-      - name: verify volume label and UUID round-tripped
-        run: |
-          # tune2fs prints the on-disk superblock metadata; grep confirms
-          # the CLI args propagated to the bytes fsck just validated.
-          tune2fs -l /tmp/out.img > /tmp/sb.txt
-          cat /tmp/sb.txt
-          grep -q "Filesystem volume name:.*CITEST" /tmp/sb.txt
-          grep -qi "Filesystem UUID:.*deadbeef-cafe-1234-5678-0123456789ab" /tmp/sb.txt
+      - name: chore tools
+        run: chore tools
+      - name: KVM, QEMU and Vagrant
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: chore fixtures
+        run: chore fixtures
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        run: chore test
 
   # Build the CLI as a downloadable binary, so it can be installed with a
   # package manager rather than `cargo install`.
@@ -121,7 +72,7 @@ jobs:
   # it for two targets that GitHub already provides natively.
   package-cli:
     name: package mkfs.ext4 (${{ matrix.label }})
-    needs: [test, validate-fsck]
+    needs: [test]
     permissions:
       # `gh release` writes assets onto the tag's release.
       contents: write
@@ -138,9 +89,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The path dependency, at the ref chores.yml pins (read from there
+      # rather than restated; chore itself has no build for every runner
+      # this job uses).
       - name: clone am-fs-core sibling
         shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^  $1: *//p" chores.yml | tr -d '\r'; }
+          git clone --depth 1 --branch "$(pin FS_CORE_REF)" "$(pin FS_CORE_URL)" ../rust-fs-core
 
       - uses: dtolnay/rust-toolchain@stable
         with:
@@ -184,8 +141,8 @@ jobs:
       # A tarball whose binary will not run is worse than no tarball,
       # and the failure would otherwise surface as a user's bug report
       # rather than a red build. `--help` exercises argument parsing and
-      # exits 0; formatting a real image is what validate-fsck already
-      # covers.
+      # exits 0; formatting a real image and checking it with fsck.ext4
+      # is what the test job's tests/mkfs_bin_fsck_oracle.rs covers.
       - name: smoke-test the packaged binary
         shell: bash
         run: |
@@ -214,7 +171,7 @@ jobs:
 
   publish:
     name: publish to crates.io
-    needs: [test, validate-fsck]
+    needs: [test]
     runs-on: ubuntu-latest
     environment: release
     permissions:
@@ -223,9 +180,15 @@ jobs:
     steps:
       - uses: actions/checkout@v5
 
+      # The path dependency, at the ref chores.yml pins (read from there
+      # rather than restated; chore itself has no build for every runner
+      # this job uses).
       - name: clone am-fs-core sibling
         shell: bash
-        run: git clone --depth 1 --branch "$FS_CORE_REF" https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+        run: |
+          set -euo pipefail
+          pin() { sed -n "s/^  $1: *//p" chores.yml | tr -d '\r'; }
+          git clone --depth 1 --branch "$(pin FS_CORE_REF)" "$(pin FS_CORE_URL)" ../rust-fs-core
 
       - uses: dtolnay/rust-toolchain@stable
         with:

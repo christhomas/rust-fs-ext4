@@ -4,19 +4,20 @@ Images under `test-disks/` exercise specific ext4 features. Each image has
 a sibling `.meta.txt` that documents its structure, so the fixtures are
 self-describing — no external key needed.
 
-Regenerate them with `bash test-disks/build-ext4-feature-images.sh`. The
-short-lived Alpine Linux oracle follows the local host architecture by
-default: x86_64 on Intel/AMD and aarch64 on Apple Silicon/ARM Linux. Use
-KVM on Linux or HVF on macOS; the script fails clearly when native hardware
-acceleration is unavailable. `EXT4_VM_ARCH=x86_64` or `EXT4_VM_ARCH=aarch64`
-with `EXT4_VM_ALLOW_TCG=1` is the explicit, slow cross-architecture fallback.
-VM downloads live under `.vm-cache/` in architecture-specific paths, so one
-host cannot reuse another architecture's kernel, initramfs, ISO, or APKs.
+Build them with `chore fixtures`. They need the real kernel's ext4 driver to
+populate (each image is formatted, loop-mounted and written through the
+kernel), so the recipes in `test-disks/guest-build-images.sh` run as root in
+the [fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
+VM, and `test-disks/build-fixtures.sh` moves the finished images into
+`test-disks/`. The same path runs everywhere: KVM on Linux, HVF on macOS, and
+the `fixtures` CI job, which hands the images to the test jobs on both
+architectures as an artifact. `test-disks/build-fixtures.sh htree xattr`
+rebuilds only some; `test-disks/build-fixtures.sh --check` lists what is
+missing.
 
-GitHub's x86_64 and ARM64 jobs are themselves real Linux environments. They
-run `sudo bash test-disks/build-ext4-feature-images-native-linux.sh` so fixture
-generation uses the native kernel and external `e2fsprogs` tools without
-depending on nested virtualisation.
+Every mkfs pins its UUID and directory hash seed, so each build has the same
+layout and checksum seeds; kernel-stamped times still differ between builds.
+A test never skips on a missing image: it fails naming `chore fixtures`.
 
 | Image | Exercises |
 |---|---|

@@ -1,0 +1,24 @@
+# fs-linux-test-harness consumer config (see ../fs-linux-test-harness/README.md).
+#
+# The VM is used for what the host cannot do: building the fixtures in
+# test-disks/, which need the real kernel's ext4 driver to populate them
+# (loop mounts, xattrs, ACLs, inline data, htree directories). Oracle
+# tools that only read an image (e2fsck, debugfs, mke2fs -d) run on the
+# host, installed by `chore tools`.
+
+[project]
+name = "rust-fs-ext4"
+
+[setup]
+# Runs as root INSIDE the VM; installs the tooling the fixture builder uses.
+script = "scripts/vm-setup.sh"
+
+[share]
+dir = ".vm-share"
+
+[vm]
+memory = "2G"
+cpus = 2
+disk = "16G"
+ssh_port = 50124
+deadline_minutes = 120

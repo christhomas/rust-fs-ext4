@@ -20,11 +20,173 @@ chore_min_version: 0.6.0
 # differs from rust-blk-probe, whose single binary lets its `artifact` name
 # a file: this crate produces libfs_ext4.a AND the headers beside it, so
 # there is no single path to name.
+#
+# THE TEST CONTRACT (the template the other filesystem repos copy; the
+# harness README's "Consumer test contract" is the general form):
+#
+#   chore siblings     check out ../rust-fs-core and ../fs-linux-test-harness
+#                      at their pinned refs
+#   chore tools        install and verify the HOST oracle tools (e2fsprogs)
+#   chore fixtures     build test-disks/*.img — kernel-made, so in the
+#                      harness VM (vm:*)
+#   chore test:unit    tests that need no tool and no fixture
+#   chore test:oracle  the driver writes, e2fsprogs reads back (e2fsck -fn
+#                      for consistency, debugfs for content and metadata)
+#   chore test         everything, exactly as CI runs it
+#
+# Tests run on the host. The VM is for what the host cannot do (populate
+# images through the kernel's ext4 driver), and there is no Rust toolchain
+# in it. NOTHING SKIPS: a missing tool or fixture fails the test that
+# needed it, naming the task that provides it.
 vars:
   TRIPLE: aarch64-apple-darwin
   LIBNAME: fs_ext4
 
+  # The sibling pins. One place, read by `chore siblings` and — through
+  # that task — by CI. URL as well as ref: the family is not all in one
+  # org, and a URL rebuilt from a repo name points at a repository that
+  # does not exist for exactly the ones that are not.
+  FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
+  FS_CORE_REF: v0.2.10
+  LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
+  # A COMMIT, NOT A TAG, and only for now: the family pins siblings by
+  # tag, and fs-linux-test-harness has no release yet. Replace this with
+  # its tag (v0.1.0) once one is cut.
+  LINUX_HARNESS_REF: dadb522a3e6faefce778ab2aa8adb062933dab2d
+
+# The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
+# harness is a sibling that `chore siblings` itself checks out: without
+# it this file must still load far enough to run that task. Every task
+# here that needs the VM says so when the harness is absent.
+#
+# No `dir:` — see the harness's vm.chores.yml: its tasks must run from
+# this repository's root, where fs-linux-test-harness.toml is.
+includes:
+  vm:
+    taskfile: ../fs-linux-test-harness/vm.chores.yml
+    optional: true
+
+# The reaper: any chore invocation stops a VM nothing else brought down
+# (a killed `chore fixtures`, a script run by hand). Fails soft, and does
+# nothing before the harness is checked out.
+lifecycle:
+  after_all:
+    - '[ ! -x ../fs-linux-test-harness/scripts/vm.sh ] || ../fs-linux-test-harness/scripts/vm.sh reap'
+
+
 tasks:
+  siblings:
+    desc: Check out the sibling repos this crate builds and tests against, at their pinned refs
+    # init + fetch-by-ref rather than clone: LINUX_HARNESS_REF is a bare
+    # commit, which `git clone --branch` cannot name. REFUSES TO MOVE A
+    # DIRTY SIBLING — a checkout is destructive to uncommitted work.
+    cmds:
+      - |
+        set -eu
+        printf '%s\t%s\t%s\n' \
+          rust-fs-core          '{{.FS_CORE_URL}}'       '{{.FS_CORE_REF}}' \
+          fs-linux-test-harness '{{.LINUX_HARNESS_URL}}' '{{.LINUX_HARNESS_REF}}' \
+        | while IFS="$(printf '\t')" read -r name url ref; do
+            dir="../$name"
+            if [ ! -d "$dir/.git" ]; then
+              echo "siblings: cloning $name at $ref"
+              git init --quiet "$dir"
+              git -C "$dir" remote add origin "$url"
+              git -C "$dir" fetch --quiet --depth 1 origin "$ref"
+              git -C "$dir" checkout --quiet FETCH_HEAD
+              continue
+            fi
+            if [ -n "$(git -C "$dir" status --porcelain)" ]; then
+              echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
+              exit 1
+            fi
+            git -C "$dir" fetch --quiet origin "$ref"
+            if [ "$(git -C "$dir" rev-parse HEAD)" = "$(git -C "$dir" rev-parse FETCH_HEAD)" ]; then
+              echo "siblings: $name already at $ref"
+              continue
+            fi
+            echo "siblings: moving $name to $ref"
+            git -C "$dir" checkout --quiet FETCH_HEAD
+          done
+
+  tools:
+    desc: Install and verify the host oracle tools (e2fsprogs); on macOS, print the Homebrew formula
+    cmds: ['scripts/tools.sh']
+
+  fixtures:
+    desc: Build every test-disks/*.img fixture (kernel-made, in the fs-linux-test-harness VM)
+    # Up to date while the recipe is unchanged and every image exists;
+    # --force rebuilds. The VM comes down when the build ends, however
+    # it ends (build-fixtures.sh sources the harness's vm-session.sh).
+    #
+    # THIS LIST AND IMAGES IN build-fixtures.sh MUST AGREE.
+    sources:
+      - test-disks/build-fixtures.sh
+      - test-disks/guest-build-images.sh
+      - scripts/vm-setup.sh
+    generates:
+      - test-disks/ext4-basic.img
+      - test-disks/ext4-htree.img
+      - test-disks/ext4-csum-seed.img
+      - test-disks/ext4-no-csum.img
+      - test-disks/ext4-deep-extents.img
+      - test-disks/ext4-inline.img
+      - test-disks/ext4-xattr.img
+      - test-disks/ext4-acl.img
+      - test-disks/ext4-largedir.img
+      - test-disks/ext4-manyfiles.img
+      - test-disks/ext4-whole-disk.img
+    # A hung boot must not hold the VM and the machine-wide slot for ever.
+    timeout: 60m
+    on_timeout:
+      - cmd: '../fs-linux-test-harness/scripts/vm.sh down || ../fs-linux-test-harness/scripts/vm.sh destroy'
+    cmds: ['test-disks/build-fixtures.sh']
+
+  test:unit:
+    desc: 'Tests that need no tool and no fixture: the library, the binaries, and every tests/*.rs that reaches neither'
+    # In the DEBUG profile, which is the point: overflow-checks are on
+    # here and off in release, and EXPECT_OVERFLOW_CHECKS=1 arms
+    # overflow_checks::the_build_the_gate_asked_to_check_does_check in
+    # src/lib.rs to prove it. tests/ci_profile.rs checks that the CI
+    # workflow still runs this task (the `unit` job).
+    #
+    # Which targets: scripts/test-targets.sh, derived from the tests
+    # rather than listed here. CI runs this job with no fixtures present,
+    # which is what proves the split.
+    cmds:
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+
+  test:oracle:
+    desc: 'The driver writes, e2fsprogs reads back: every test that runs e2fsck, debugfs or mkfs on the host'
+    cmds:
+      - scripts/tools.sh --check
+      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh oracle)'
+
+  test:
+    desc: 'Everything, exactly as CI runs it: unit (debug), then the whole suite (release), then the script tests'
+    # Checks for the tools and the fixtures FIRST and fails naming the
+    # task that provides them, rather than letting several hundred tests
+    # each fail on the same missing image.
+    cmds:
+      - task: test:unit
+      - scripts/tools.sh --check
+      - test-disks/build-fixtures.sh --check
+      - scripts/test.sh --locked --release
+      - task: test:scripts
+
+  test:scripts:
+    desc: The shell tests (tests/scripts/*.sh), every one by glob
+    # By glob, so a test added later needs no edit here -- a guard that
+    # has to be registered somewhere else is a guard that gets silently
+    # skipped.
+    cmds:
+      - |
+        set -eu
+        for t in tests/scripts/*.sh; do
+          echo "== $t"
+          bash "$t"
+        done
+
   staticlib:
     desc: Build the static library and its headers into this crate's dist/
     # NO `out` ARGUMENT, deliberately. A library does not write into its
@@ -90,9 +252,6 @@ tasks:
     desc: Debug build
     cmds: ['cargo build']
 
-  test:
-    desc: Test suite
-    cmds: ['cargo test']
 
   clean:
     desc: Remove this crate's cargo output
