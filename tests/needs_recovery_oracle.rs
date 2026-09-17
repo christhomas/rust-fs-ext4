@@ -190,10 +190,12 @@ fn a_journaled_superblock_block_keeps_the_flag() {
         return;
     };
     let block0 = read_at(&image, 0, BS as usize);
-    let writes = vec![(0, block0), (TARGETS[0], pattern(0))];
-    // Everything up to and including the superblock block's final write:
-    // descriptor, two data, commit, flag, dirty journal, block 0.
-    commit(&image, &writes, 4 + 2 + 1);
+    // Block 0 twice, the way a transaction touching the superblock in two
+    // places can carry it: step 3 applies both, so both keep the flag.
+    let writes = vec![(0, block0.clone()), (TARGETS[0], pattern(0)), (0, block0)];
+    // Everything up to and including the second superblock write: descriptor,
+    // three data, commit, flag, dirty journal, block 0, the target, block 0.
+    commit(&image, &writes, 5 + 2 + 3);
     assert!(
         flag_set(&image),
         "step 3 wrote a superblock without needs_recovery over a live journal"

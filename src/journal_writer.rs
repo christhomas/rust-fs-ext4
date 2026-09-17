@@ -245,15 +245,17 @@ impl JournalWriter {
         }
 
         // The superblock block, if journaled, keeps `needs_recovery` set
-        // until step 4 clears it (#228).
+        // until step 4 clears it (#228) -- in every write to it, since a
+        // transaction may carry more than one and step 3 applies them all
+        // in order.
+        let sb_block = self.sb_block();
         let patched;
-        let tx = if let Some(i) = tx.writes.iter().position(|w| w.fs_block == self.sb_block()) {
+        let tx = if tx.writes.iter().any(|w| w.fs_block == sb_block) {
             let mut copy = tx.clone();
             let off = self.sb_offset_in_block();
-            crate::journal_apply::set_needs_recovery_in(
-                &mut copy.writes[i].bytes[off..off + 1024],
-                true,
-            );
+            for w in copy.writes.iter_mut().filter(|w| w.fs_block == sb_block) {
+                crate::journal_apply::set_needs_recovery_in(&mut w.bytes[off..off + 1024], true);
+            }
             patched = copy;
             &patched
         } else {
