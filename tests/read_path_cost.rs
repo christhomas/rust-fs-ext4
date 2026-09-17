@@ -40,7 +40,7 @@ struct Counted(Arc<CountingDevice>, std::sync::atomic::AtomicU64);
 
 impl fs_ext4::block_io::BlockDevice for Counted {
     fn read_at(&self, offset: u64, buf: &mut [u8]) -> fs_ext4::Result<()> {
-        if offset % BLOCK != 0 || buf.len() as u64 != BLOCK {
+        if !offset.is_multiple_of(BLOCK) || buf.len() as u64 != BLOCK {
             self.1.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
         }
         self.0
