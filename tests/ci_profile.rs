@@ -91,7 +91,10 @@ fn checking_debug_runs(script: &str) -> Vec<String> {
             if !command.contains("cargo test") {
                 return None;
             }
-            if command.contains("--release") || command.contains("--profile") {
+            if command.contains("--release")
+                || command.contains("--profile")
+                || selects_release_by_short_flag(command)
+            {
                 return None;
             }
             if !command.contains("EXPECT_OVERFLOW_CHECKS=1") {
@@ -100,6 +103,68 @@ fn checking_debug_runs(script: &str) -> Vec<String> {
             Some(command.to_string())
         })
         .collect()
+}
+
+/// Whether `command` runs `cargo test` with the release profile selected
+/// by its short flag (#158).
+///
+/// `cargo test -r` is `cargo test --release`, and the string check above
+/// does not see it. Nor is it one spelling: clap merges short flags, so
+/// `-qr` and `-rq` carry it as well, anywhere before `--`. A cluster ends
+/// at a short option that takes a value -- `-p`, `-j`, `-F` or `-Z` --
+/// whose value is the rest of the word or, when the word ends there, the
+/// next one: `-j4 -r` is release, `-pr` names a package `r`. Everything
+/// after `--` belongs to the test harness, where `-r` is not cargo's.
+fn selects_release_by_short_flag(command: &str) -> bool {
+    const LONG_OPTIONS_TAKING_A_VALUE: [&str; 15] = [
+        "--package",
+        "--exclude",
+        "--features",
+        "--target",
+        "--target-dir",
+        "--manifest-path",
+        "--profile",
+        "--test",
+        "--bin",
+        "--example",
+        "--bench",
+        "--jobs",
+        "--message-format",
+        "--color",
+        "--config",
+    ];
+    let words: Vec<&str> = command.split_whitespace().collect();
+    let Some(at) = words.windows(2).position(|w| w == ["cargo", "test"]) else {
+        return false;
+    };
+    let mut next_is_a_value = false;
+    for argument in &words[at + 2..] {
+        if std::mem::take(&mut next_is_a_value) {
+            continue;
+        }
+        if *argument == "--" {
+            return false;
+        }
+        if argument.starts_with("--") {
+            next_is_a_value =
+                !argument.contains('=') && LONG_OPTIONS_TAKING_A_VALUE.contains(argument);
+            continue;
+        }
+        let Some(cluster) = argument.strip_prefix('-') else {
+            continue;
+        };
+        for (at, flag) in cluster.char_indices() {
+            match flag {
+                'r' => return true,
+                'p' | 'j' | 'F' | 'Z' => {
+                    next_is_a_value = at + 1 == cluster.len();
+                    break;
+                }
+                _ => {}
+            }
+        }
+    }
+    false
 }
 
 /// A workflow, structured just far enough to answer one question:
@@ -991,6 +1056,40 @@ mod parser {
 
     /// The trap this repository's own `ci.yml` contains: the debug
     /// command quoted verbatim in the comment explaining the step.
+    /// `-r` IS `--release`, IN EVERY SPELLING CLAP ACCEPTS (#158). Each of
+    /// these compiles with overflow checks off and counted as the debug
+    /// run; the controls beside them are not release and still count.
+    #[test]
+    fn the_short_release_flag_does_not_count_in_any_spelling() {
+        for line in [
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -r --all-targets",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -qr --all-targets",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -rq --all-targets",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -j4 -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -j 4 -r --lib",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features x -r",
+        ] {
+            assert_eq!(
+                checking_debug_runs(line),
+                Vec::<String>::new(),
+                "{line} builds the release profile"
+            );
+        }
+        for line in [
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --all-targets -- -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -F r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -pr --lib",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -j r --lib",
+        ] {
+            assert_eq!(
+                checking_debug_runs(line).len(),
+                1,
+                "{line}: the r is a value or the harness's, and the run is debug"
+            );
+        }
+    }
+
     #[test]
     fn a_debug_run_quoted_in_a_comment_does_not_count() {
         let yaml = "\
