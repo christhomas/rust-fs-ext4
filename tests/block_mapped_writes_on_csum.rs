@@ -12,7 +12,9 @@
 //!   restamps.
 //! - `apply_unlink` freed a file's blocks only when it had extents, so a
 //!   block-mapped file's data and indirect blocks stayed allocated with
-//!   nothing pointing at them.
+//!   nothing pointing at them. Renaming over one leaked the same way, and
+//!   `apply_rmdir` or renaming over a block-mapped directory was refused
+//!   as a corrupt extent tree.
 //!
 //! `e2fsck -fn` judges each step. Skips without e2fsprogs.
 
@@ -94,6 +96,27 @@ fn block_mapped_files_write_and_unlink_cleanly() {
         fs.apply_unlink("/big").unwrap();
         drop(fs);
         e2fsck_clean(&path, &format!("{tag}: unlinked"));
+
+        // Directories are block-mapped too, and a rename can reap either.
+        let fs = mount(&path);
+        fs.apply_mkdir("/d", 0o755).unwrap();
+        fs.apply_mkdir("/e", 0o755).unwrap();
+        fs.apply_mkdir("/gone", 0o755).unwrap();
+        fs.apply_create("/f", 0o644).unwrap();
+        fs.apply_create("/g", 0o644).unwrap();
+        fs.apply_replace_file_content("/g", &[1u8; 30_000]).unwrap();
+        drop(fs);
+        e2fsck_clean(&path, &format!("{tag}: populated"));
+
+        let fs = mount(&path);
+        fs.apply_rmdir("/gone")
+            .expect("rmdir a block-mapped directory");
+        fs.apply_rename("/f", "/g", true)
+            .expect("rename over a block-mapped file");
+        fs.apply_rename("/d", "/e", true)
+            .expect("rename over a block-mapped directory");
+        drop(fs);
+        e2fsck_clean(&path, &format!("{tag}: reaped by rmdir and rename"));
         let _ = std::fs::remove_file(&path);
     }
 }
