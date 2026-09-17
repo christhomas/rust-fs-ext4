@@ -245,6 +245,26 @@ pub struct Filesystem {
     /// style images. Locked per-op so mutating capi calls serialize on
     /// the JBD2 sequence cursor.
     pub journal: Option<std::sync::Mutex<crate::journal_writer::JournalWriter>>,
+    /// Whether this mount has cleared `EXT4_VALID_FS` on disk, and so
+    /// owes the superblock its state back when it is dropped (#85).
+    marked_not_clean: std::sync::atomic::AtomicBool,
+}
+
+/// A mount that cleared `EXT4_VALID_FS` puts the state it found back when
+/// it is dropped, which is this crate's unmount (`fs_ext4_umount` drops the
+/// handle). A volume that was not clean when mounted stays not clean. Best
+/// effort: a drop cannot report an error, and a device that refuses the
+/// write leaves the volume marked not clean, which errs the safe way.
+impl Drop for Filesystem {
+    fn drop(&mut self) {
+        if self
+            .marked_not_clean
+            .load(std::sync::atomic::Ordering::SeqCst)
+            && self.dev.is_writable()
+        {
+            let _ = self.write_superblock_state(self.sb.state);
+        }
+    }
 }
 
 /// Encapsulates the common setup for creating a new inode in a directory:
@@ -331,6 +351,7 @@ impl Filesystem {
             csum,
             flavor,
             journal: None,
+            marked_not_clean: std::sync::atomic::AtomicBool::new(false),
         };
 
         // Replay a dirty journal: onto the device if it is writable (below,
@@ -404,7 +425,7 @@ impl Filesystem {
         // structures behind the unmaintained bit. Refusing it would
         // leave a volume that reads its own stale metadata, which is a
         // worse answer than the one it prevents.
-        if fs.refuse_write().is_ok() {
+        if fs.write_refusal().is_ok() {
             if let Some(jw) = crate::journal_writer::JournalWriter::open(&fs)? {
                 fs.journal = Some(std::sync::Mutex::new(jw));
             }
@@ -466,6 +487,14 @@ impl Filesystem {
     /// nobody for the file and left counters describing a filesystem
     /// that no longer exists.
     pub(crate) fn refuse_write(&self) -> Result<()> {
+        self.write_refusal()?;
+        self.mark_not_clean_once()
+    }
+
+    /// [`Self::refuse_write`]'s verdict alone, without marking the volume
+    /// not clean: for the mount path, which asks whether it could write
+    /// before it knows whether it will.
+    fn write_refusal(&self) -> Result<()> {
         if !self.dev.is_writable() {
             return Err(Error::ReadOnly);
         }
@@ -486,6 +515,44 @@ impl Filesystem {
             return Err(Error::UnsupportedIncompat(write_breaking));
         }
         Ok(())
+    }
+
+    /// Clear `EXT4_VALID_FS` in the on-disk superblock before this mount's
+    /// first write, as the kernel does when it mounts read-write (#85).
+    ///
+    /// The bit is what `fsck -p` at boot, and `e2fsck`'s "clean", read as
+    /// "cleanly unmounted". This driver never touched it, so a volume a
+    /// crash interrupted mid-write still claimed to have been put away
+    /// properly and the boot-time check skipped it. Cleared here, it stays
+    /// cleared until [`Drop`] puts the mount-time state back; a crash in
+    /// between leaves it clear, which is the point.
+    ///
+    /// Done on the first write rather than at mount so a read-write mount
+    /// that never writes leaves the volume byte-for-byte as it found it.
+    fn mark_not_clean_once(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if self.marked_not_clean.load(Ordering::SeqCst) {
+            return Ok(());
+        }
+        self.write_superblock_state(self.sb.state & !crate::superblock::EXT4_VALID_FS)?;
+        self.marked_not_clean.store(true, Ordering::SeqCst);
+        Ok(())
+    }
+
+    /// Write `state` into the on-disk superblock's `s_state` (0x3A),
+    /// directly rather than through a transaction -- the kernel's own
+    /// mount and unmount writes are direct -- keeping its checksum right.
+    fn write_superblock_state(&self, state: u16) -> Result<()> {
+        let at = crate::superblock::SUPERBLOCK_OFFSET;
+        let mut sb = vec![0u8; 1024];
+        self.dev.read_at(at, &mut sb)?;
+        sb[0x3A..0x3C].copy_from_slice(&state.to_le_bytes());
+        if self.csum.enabled {
+            let csum = crate::checksum::linux_crc32c(!0, &sb[..0x3FC]);
+            sb[0x3FC..0x400].copy_from_slice(&csum.to_le_bytes());
+        }
+        self.dev.write_at(at, &sb)?;
+        self.dev.flush()
     }
 
     pub fn replay_journal_if_dirty(&self) -> Result<usize> {
@@ -670,12 +737,14 @@ impl Filesystem {
         // carries a feature it does not maintain -- simply keeps its
         // orphans. Failing the mount over it would refuse a volume that
         // reads perfectly well.
-        if self.refuse_write().is_err() {
+        if self.write_refusal().is_err() {
             return Ok(0);
         }
         if self.sb.last_orphan == 0 {
             return Ok(0);
         }
+        // There is work, and it writes.
+        self.mark_not_clean_once()?;
         let chain = self.orphan_chain_to_recover()?;
 
         let bs = self.sb.block_size();
@@ -6476,6 +6545,79 @@ mod tests {
                 String::from_utf8_lossy(&out.stderr)
             );
         }
+    }
+
+    /// `s_state` straight off the device, as another handle -- or `e2fsck`
+    /// -- would read it.
+    fn on_disk_state(dev: &std::sync::Arc<MemDev>) -> u16 {
+        let bytes = dev.bytes.lock().unwrap();
+        u16::from_le_bytes([bytes[1024 + 0x3A], bytes[1024 + 0x3B]])
+    }
+
+    /// A read-write mount that writes marks the volume not clean while it
+    /// is mounted, and a drop puts it back (#85). The superblock checksum
+    /// stays right through both writes: each remount verifies it.
+    #[test]
+    fn a_writing_mount_marks_the_volume_not_clean_until_it_is_dropped() {
+        use crate::superblock::EXT4_VALID_FS;
+        let dev = formatted();
+        assert_ne!(
+            on_disk_state(&dev) & EXT4_VALID_FS,
+            0,
+            "fixture: formatted clean"
+        );
+
+        let fs = mount(&dev);
+        assert_ne!(
+            on_disk_state(&dev) & EXT4_VALID_FS,
+            0,
+            "mounting alone must not touch the superblock"
+        );
+        fs.apply_create("/a.txt", 0o644).expect("create");
+        assert_eq!(
+            on_disk_state(&dev) & EXT4_VALID_FS,
+            0,
+            "a volume being written must not read as cleanly unmounted"
+        );
+        drop(mount(&dev)); // the superblock checksum still verifies
+        drop(fs);
+        assert_ne!(
+            on_disk_state(&dev) & EXT4_VALID_FS,
+            0,
+            "the unmount must mark the volume clean again"
+        );
+        drop(mount(&dev));
+    }
+
+    /// A read-write mount that never writes leaves the superblock exactly
+    /// as it found it.
+    #[test]
+    fn a_mount_that_does_not_write_leaves_the_superblock_alone() {
+        let dev = formatted();
+        let before = dev.bytes.lock().unwrap()[1024..2048].to_vec();
+        let fs = mount(&dev);
+        fs.read_inode_verified(2).expect("read the root");
+        drop(fs);
+        assert!(dev.bytes.lock().unwrap()[1024..2048] == before[..]);
+    }
+
+    /// A volume that was already not clean -- a crash before this mount --
+    /// is not declared clean by this mount's unmount. The kernel restores
+    /// the state it mounted with, and so does this.
+    #[test]
+    fn an_unclean_volume_stays_unclean_after_a_writing_mount() {
+        use crate::superblock::EXT4_VALID_FS;
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            fs.write_superblock_state(fs.sb.state & !EXT4_VALID_FS)
+                .expect("mark not clean, as a crash would leave it");
+        }
+        let fs = mount(&dev);
+        assert!(!fs.sb.is_clean(), "fixture: mounted not clean");
+        fs.apply_create("/a.txt", 0o644).expect("create");
+        drop(fs);
+        assert_eq!(on_disk_state(&dev) & EXT4_VALID_FS, 0);
     }
 
     #[test]
