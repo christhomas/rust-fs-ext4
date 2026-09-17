@@ -3270,6 +3270,12 @@ impl Filesystem {
         if target_inode.has_extents() {
             let runs = self.extent_tree_runs(&target_inode.block)?;
             freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
+        } else {
+            // A BLOCK-MAPPED FILE HAS BLOCKS TOO. Only extents were freed,
+            // so every ext2/ext3-style file left its data and indirect
+            // blocks allocated with nothing pointing at them.
+            freed_sectors +=
+                self.buffer_free_block_map(&mut buf, &target_inode)? * sectors_per_block;
         }
 
         // The xattr block goes with the inode, or loses one reference if
@@ -3909,6 +3915,45 @@ impl Filesystem {
     /// and never builds a `BlockBuffer` for it. A crash after the old runs
     /// are freed and before the inode is rewritten leaves the inode
     /// mapping blocks the bitmap already calls free (#179).
+    /// Whether a block-mapped inode's `i_block` holds block pointers.
+    ///
+    /// Not every inode's does: a fast symlink keeps its target there and a
+    /// device node its numbers, with no data blocks at all. `i_blocks`
+    /// tells them apart, less the external xattr block it also counts.
+    fn holds_block_map(inode: &Inode, block_size: u32) -> bool {
+        let xattr_sectors = if inode.file_acl != 0 {
+            u64::from(block_size) / 512
+        } else {
+            0
+        };
+        inode.flags & crate::inode::InodeFlags::INLINE_DATA.bits() == 0
+            && inode.blocks > xattr_sectors
+    }
+
+    /// Free every data and indirect block a block-mapped inode holds,
+    /// staged in `buf`. Returns the blocks freed. Does nothing for an inode
+    /// whose `i_block` holds no pointers ([`Self::holds_block_map`]).
+    fn buffer_free_block_map(&self, buf: &mut BlockBuffer, inode: &Inode) -> Result<u64> {
+        let bs = self.sb.block_size();
+        if !Self::holds_block_map(inode, bs) {
+            return Ok(0);
+        }
+        let freed = crate::indirect_mut::collect_for_free(
+            &inode.block,
+            bs,
+            inode.size.div_ceil(u64::from(bs)) as u32,
+            self.dev.as_ref(),
+        )?;
+        let mut count = 0;
+        for run in &freed.data_runs {
+            count += self.buffer_free_block_run_and_bgd(buf, run.start, run.len as u64)?;
+        }
+        for &iblk in &freed.indirect_blocks {
+            count += self.buffer_free_block_run_and_bgd(buf, iblk, 1)?;
+        }
+        Ok(count)
+    }
+
     fn apply_replace_file_content_indirect(
         &self,
         ino: u32,
@@ -3923,6 +3968,10 @@ impl Filesystem {
         // Phase 1: free existing data + indirect-tree blocks. `collect_for_free`
         // walks the tree and returns coalesced data runs + individual indirect
         // blocks, so cross-group fragmented files are accounted for correctly.
+        // THROUGH THE BUFFER, as the extent path goes. The unbuffered
+        // helpers wrote the block bitmap without restamping its checksum,
+        // and outside the journal.
+        let mut buf = BlockBuffer::new(bs);
         let mut freed_fs_blocks: u64 = 0;
         if inode.size > 0 {
             let block_count = inode.size.div_ceil(bs as u64) as u32;
@@ -3933,10 +3982,11 @@ impl Filesystem {
                 self.dev.as_ref(),
             )?;
             for run in &freed.data_runs {
-                freed_fs_blocks += self.free_block_run_and_bgd(run.start, run.len as u64)?;
+                freed_fs_blocks +=
+                    self.buffer_free_block_run_and_bgd(&mut buf, run.start, run.len as u64)?;
             }
             for &iblk in &freed.indirect_blocks {
-                freed_fs_blocks += self.free_block_run_and_bgd(iblk, 1)?;
+                freed_fs_blocks += self.buffer_free_block_run_and_bgd(&mut buf, iblk, 1)?;
             }
         }
         // Reset i_block to all zeros — no extent magic for legacy inodes.
@@ -3944,11 +3994,12 @@ impl Filesystem {
         Self::patch_inode_block_area(&mut raw, &zero_iblock)?;
 
         if data.is_empty() {
-            self.finalize_inode_after_write(ino, &mut raw, &inode, 0, 0)?;
+            self.finalize_inode_raw_after_write(ino, &mut raw, &inode, 0, 0)?;
             if freed_fs_blocks > 0 {
-                self.patch_sb_counters(freed_fs_blocks as i64, 0)?;
+                self.buffer_patch_sb_counters(&mut buf, freed_fs_blocks as i64, 0)?;
             }
-            self.dev.flush()?;
+            self.buffer_write_inode(&mut buf, ino, &raw)?;
+            self.commit_block_buffer(buf)?;
             return Ok(0);
         }
 
@@ -3989,15 +4040,16 @@ impl Filesystem {
 
         // Phase 4: bitmap + BGD + SB counters cover the whole run in one
         // mark-used + one BGD-credit + one SB-update.
-        self.set_block_run_used(plan.first_block, total_run as u64)?;
-        self.patch_bgd_counters(
+        self.buffer_mark_block_run_used(&mut buf, plan.first_block, total_run as u64)?;
+        self.buffer_patch_bgd_counters(
+            &mut buf,
             plan.bgd.group_idx as usize,
             plan.bgd.free_blocks_delta,
             plan.bgd.free_inodes_delta,
             plan.bgd.used_dirs_delta,
         )?;
         let net_block_delta = freed_fs_blocks as i64 - total_run as i64;
-        self.patch_sb_counters(net_block_delta, 0)?;
+        self.buffer_patch_sb_counters(&mut buf, net_block_delta, 0)?;
 
         // Phase 5: write the data payload into the data-portion of the run.
         for i in 0..needed_data_blocks as u64 {
@@ -4005,12 +4057,12 @@ impl Filesystem {
             let chunk_end = ((i as usize + 1) * bs as usize).min(data.len());
             let mut block = vec![0u8; bs as usize];
             block[..chunk_end - off_in_data].copy_from_slice(&data[off_in_data..chunk_end]);
-            self.dev.write_at((first_data + i) * bs as u64, &block)?;
+            buf.put(first_data + i, block);
         }
 
         // Phase 6: write the indirect-tree blocks.
-        for (blk, buf) in &i_plan.block_writes {
-            self.dev.write_at(blk * bs as u64, buf)?;
+        for (blk, bytes) in &i_plan.block_writes {
+            buf.put(*blk, bytes.clone());
         }
 
         // Phase 7: patch i_block region with the new tree root.
@@ -4021,8 +4073,9 @@ impl Filesystem {
         // same way for ext4 so the rule is consistent across flavors.
         let new_size = data.len() as u64;
         let new_sectors = (needed_data_blocks as u64 + n_indirect as u64) * sectors_per_block;
-        self.finalize_inode_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
-        self.dev.flush()?;
+        self.finalize_inode_raw_after_write(ino, &mut raw, &inode, new_size, new_sectors)?;
+        self.buffer_write_inode(&mut buf, ino, &raw)?;
+        self.commit_block_buffer(buf)?;
         Ok(new_size)
     }
 
@@ -4458,21 +4511,6 @@ impl Filesystem {
         Ok(new_size)
     }
 
-    /// Patch size + blocks counter on the inode image, recompute the csum
-    /// if enabled, and write it back. Shared tail for apply_replace_file_content and
-    /// any future writer that produces a new `raw` image.
-    fn finalize_inode_after_write(
-        &self,
-        ino: u32,
-        raw: &mut [u8],
-        orig: &Inode,
-        new_size: u64,
-        new_sectors: u64,
-    ) -> Result<()> {
-        self.finalize_inode_raw_after_write(ino, raw, orig, new_size, new_sectors)?;
-        self.write_inode_raw(ino, raw)
-    }
-
     /// Buffer-friendly variant of `finalize_inode_after_write`: patches
     /// size, blocks, ctime, mtime, and checksum on `raw` IN PLACE without
     /// writing to disk. Caller stages the result via `buffer_write_inode`
@@ -4497,31 +4535,6 @@ impl Filesystem {
                 }
             }
         }
-        Ok(())
-    }
-
-    fn set_block_run_used(&self, start: u64, len: u64) -> Result<()> {
-        let bpg = self.sb.blocks_per_group as u64;
-        let first_data = self.sb.first_data_block as u64;
-        let gi = ((start - first_data) / bpg) as usize;
-        if gi >= self.groups.len() {
-            return Err(Error::InvalidBlock(start));
-        }
-        let group_start = first_data + gi as u64 * bpg;
-        let bit_start = (start - group_start) as u32;
-        let bitmap_block = self.groups[gi].block_bitmap;
-        let bs = self.sb.block_size() as u64;
-        let mut buf = vec![0u8; bs as usize];
-        self.dev.read_at(bitmap_block * bs, &mut buf)?;
-        for i in 0..len {
-            let bit = bit_start as u64 + i;
-            let byte = (bit / 8) as usize;
-            let mask = 1u8 << (bit % 8);
-            if byte < buf.len() {
-                buf[byte] |= mask;
-            }
-        }
-        self.dev.write_at(bitmap_block * bs, &buf)?;
         Ok(())
     }
 
@@ -4687,59 +4700,6 @@ impl Filesystem {
         self.buffer_patch_sb_counters(&mut buf, free_blocks_delta, free_inodes_delta)?;
         self.commit_block_buffer(buf)?;
         Ok(())
-    }
-
-    /// Zero the bitmap bits covering the physical block run
-    /// `[start, start+len)`. Assumes the run lies entirely within one block
-    /// group (true for allocator-produced runs; fragmentation across groups
-    /// is a future concern).
-    fn free_block_run(&self, start: u64, len: u64) -> Result<()> {
-        let bpg = self.sb.blocks_per_group as u64;
-        let first_data = self.sb.first_data_block as u64;
-        // Block group index of the first block in the run.
-        let gi = ((start - first_data) / bpg) as usize;
-        if gi >= self.groups.len() {
-            return Err(Error::InvalidBlock(start));
-        }
-        let group_start = first_data + gi as u64 * bpg;
-        let bit_start = (start - group_start) as u32;
-        let bg = &self.groups[gi];
-        let bitmap_block = bg.block_bitmap;
-
-        let bs = self.sb.block_size() as u64;
-        let mut buf = vec![0u8; bs as usize];
-        self.dev.read_at(bitmap_block * bs, &mut buf)?;
-        for i in 0..len {
-            let bit = bit_start as u64 + i;
-            let byte = (bit / 8) as usize;
-            let mask = 1u8 << (bit % 8);
-            if byte < buf.len() {
-                buf[byte] &= !mask;
-            }
-        }
-        self.dev.write_at(bitmap_block * bs, &buf)?;
-        Ok(())
-    }
-
-    /// Free a physical-block run AND patch the containing group's
-    /// `bg_free_blocks_count`. Returns `len` so the caller can accumulate a
-    /// running total to feed `patch_sb_counters` once per high-level op.
-    ///
-    /// Per-call BGD updates correctly handle runs that span groups (each
-    /// call lands in exactly one group per [`free_block_run`]'s contract).
-    /// SB updates are deliberately deferred so freeing a 1000-extent file
-    /// produces 1 SB write instead of 1000.
-    fn free_block_run_and_bgd(&self, start: u64, len: u64) -> Result<u64> {
-        // One group at a time, as `free_block_run`'s contract requires; the
-        // run itself may cross a boundary (#118).
-        let chunks = self.group_chunks(start, len)?;
-        let first_data = self.sb.first_data_block as u64;
-        let bpg = self.sb.blocks_per_group as u64;
-        for (gi, bit_start, chunk) in chunks {
-            self.free_block_run(first_data + gi as u64 * bpg + bit_start, chunk)?;
-            self.patch_bgd_counters(gi, chunk as i32, 0, 0)?;
-        }
-        Ok(len)
     }
 
     // -----------------------------------------------------------------------
@@ -5222,13 +5182,8 @@ impl Filesystem {
                 let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
                 let blocks = dst_old_inode.size.div_ceil(bs as u64);
                 for logical in 0..blocks {
-                    let Some(phys) = crate::extent::map_logical(
-                        &dst_old_inode.block,
-                        self.dev.as_ref(),
-                        bs,
-                        logical,
-                    )?
-                    else {
+                    // Either mapping, as rmdir's emptiness check.
+                    let Some(phys) = self.map_inode_logical(&dst_old_inode, logical)? else {
                         continue;
                     };
                     let block = self.read_block(phys)?;
@@ -5348,6 +5303,11 @@ impl Filesystem {
                 if dst_old_inode.has_extents() {
                     let runs = self.extent_tree_runs(&dst_old_inode.block)?;
                     freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
+                } else {
+                    // A block-mapped file or directory being replaced: its
+                    // blocks were left allocated.
+                    freed_sectors +=
+                        self.buffer_free_block_map(&mut buf, &dst_old_inode)? * sectors_per_block;
                 }
                 if dst_old_inode.file_acl != 0 {
                     freed_sectors += self
@@ -6257,9 +6217,9 @@ impl Filesystem {
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
         let blocks = target_inode.size.div_ceil(bs as u64);
         for logical in 0..blocks {
-            let Some(phys) =
-                crate::extent::map_logical(&target_inode.block, self.dev.as_ref(), bs, logical)?
-            else {
+            // Either mapping: a block-mapped directory's i_block is not an
+            // extent header.
+            let Some(phys) = self.map_inode_logical(&target_inode, logical)? else {
                 continue;
             };
             let block = self.read_block(phys)?;
@@ -6281,8 +6241,14 @@ impl Filesystem {
 
         // Free target's data blocks. Each freed run credits its own group's
         // BGD; SB credit accumulates and lands once below.
-        let runs = self.extent_tree_runs(&target_inode.block)?;
-        let mut freed_blocks = self.buffer_free_runs(&mut buf, &runs)?;
+        let mut freed_blocks = if target_inode.has_extents() {
+            let runs = self.extent_tree_runs(&target_inode.block)?;
+            self.buffer_free_runs(&mut buf, &runs)?
+        } else {
+            // A block-mapped directory: read as an extent header, it was
+            // refused as a corrupt tree on a valid volume.
+            self.buffer_free_block_map(&mut buf, &target_inode)?
+        };
 
         if target_inode.file_acl != 0 {
             freed_blocks += self.buffer_release_xattr_block(&mut buf, target_inode.file_acl)?;
@@ -6503,42 +6469,6 @@ mod tests {
         );
         drop(fs);
 
-        // The same across the next boundary, through the direct-to-disk
-        // helper rather than the buffered one.
-        let boundary = 3 * 4096u64;
-        {
-            let fs = mount();
-            let mut buf = BlockBuffer::new(fs.sb.block_size());
-            fs.buffer_mark_block_run_used(&mut buf, boundary - 4, 4)
-                .unwrap();
-            fs.buffer_mark_block_run_used(&mut buf, boundary, 4)
-                .unwrap();
-            fs.commit_block_buffer(buf).unwrap();
-        }
-        let (free2, free3) = {
-            let fs = mount();
-            (
-                fs.groups[2].free_blocks_count,
-                fs.groups[3].free_blocks_count,
-            )
-        };
-        {
-            let fs = mount();
-            assert_eq!(fs.free_block_run_and_bgd(boundary - 4, 8).unwrap(), 8);
-        }
-        let fs = mount();
-        assert_eq!(
-            (
-                fs.groups[2].free_blocks_count - free2,
-                fs.groups[3].free_blocks_count - free3
-            ),
-            (4, 4),
-            "direct path: (group 2 credited, group 3 credited)"
-        );
-        assert!(
-            (0..4).all(|b| !bit_set(&fs, 3, b)),
-            "direct path: group 3's blocks still allocated"
-        );
         let _ = std::fs::remove_dir_all(&dir);
     }
     use crate::inode::{

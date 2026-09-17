@@ -104,6 +104,12 @@
   rmdir, rename-over and orphan release never released it at all. An edit
   now gives the inode its own copy, and every release drops one reference,
   freeing the block only at the last (#245).
+- Unlinking a block-mapped (ext2/ext3-style) file frees its blocks.
+  `apply_unlink` freed blocks only for extent-mapped files, so every data
+  and indirect block of a block-mapped file stayed allocated. Rewriting one
+  with `apply_replace_file_content` now goes through the journaled buffer
+  too. It wrote the block bitmap directly and without restamping its
+  checksum, which e2fsck reported on a volume with `metadata_csum` (#249).
 
 ## [0.5.1] — 2026-09-06
 
