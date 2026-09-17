@@ -138,13 +138,36 @@ fn selects_release_by_short_flag(command: &str) -> bool {
 /// surround them: `true&&cargo test -r` is a `cargo test` run, and in
 /// `cargo test --lib&&rm -rf build` the `-rf` is `rm`'s. An `&` or `|`
 /// straight after `>` or `<` is part of a redirection (`2>&1`, `>|`).
+/// Inside quotes, or after a backslash, nothing is an operator or a word
+/// break: `--features 'a;b' -r` is one command. The quotes stay in the
+/// word, which only has to be told apart from an option.
 fn shell_words(command: &str) -> Vec<&str> {
     let bytes = command.as_bytes();
     let mut words = Vec::new();
     let mut word_start = None;
+    let mut quote = None;
     let mut at = 0;
     while at < bytes.len() {
         let byte = bytes[at];
+        if let Some(open) = quote {
+            if byte == open {
+                quote = None;
+            } else if byte == b'\\' && open == b'"' {
+                at += 1;
+            }
+            at += 1;
+            continue;
+        }
+        if matches!(byte, b'\'' | b'"' | b'\\') {
+            word_start.get_or_insert(at);
+            if byte == b'\\' {
+                at += 1;
+            } else {
+                quote = Some(byte);
+            }
+            at += 1;
+            continue;
+        }
         let operator_len = match byte {
             b';' => 1,
             b'&' | b'|' if at > 0 && matches!(bytes[at - 1], b'>' | b'<') => 0,
@@ -1129,6 +1152,9 @@ mod parser {
             "EXPECT_OVERFLOW_CHECKS=1 cargo +1.95.0 test --locked -r --lib",
             "true&&EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -r --lib",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib 2>&1 -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features 'a;b' -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features \"a&&b\" -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features a\\;b -r",
         ] {
             assert_eq!(
                 checking_debug_runs(line),
