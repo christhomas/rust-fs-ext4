@@ -466,6 +466,15 @@ cmd_release() {
     return 0
 }
 
+# Exit 0 when this repository holds the slot, 1 otherwise -- a free slot,
+# someone else's, or a record not yet complete. For `vm.sh`, which must
+# not re-acquire a slot it holds (that waits on itself) and must enrol a
+# running machine whose slot it does not (#107).
+cmd_holds() {
+    read_holder >/dev/null 2>&1 || return 1
+    [ "$(holder_field 1)" = "$VAGRANT_DIR" ]
+}
+
 cmd_status() {
     if ! read_holder >/dev/null 2>&1; then
         echo "the oracle slot is free"
@@ -499,8 +508,9 @@ case "${1:-}" in
     acquire) cmd_acquire ;;
     release) shift; cmd_release "${1:-}" ;;
     status)  cmd_status ;;
+    holds)   cmd_holds ;;
     *)
-        echo "usage: vm-slot.sh {acquire|release [--force]|status}" >&2
+        echo "usage: vm-slot.sh {acquire|release [--force]|status|holds}" >&2
         exit 2
         ;;
 esac
