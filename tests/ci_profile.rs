@@ -116,7 +116,7 @@ fn checking_debug_runs(script: &str) -> Vec<String> {
 /// next one: `-j4 -r` is release, `-pr` names a package `r`. Everything
 /// after `--` belongs to the test harness, where `-r` is not cargo's.
 fn selects_release_by_short_flag(command: &str) -> bool {
-    let words: Vec<&str> = command.split_whitespace().collect();
+    let words = shell_words(command);
     let mut at = 0;
     while at < words.len() {
         // `cargo` by name or by path, then any `+toolchain`, then `test`.
@@ -131,6 +131,44 @@ fn selects_release_by_short_flag(command: &str) -> bool {
         at += 1;
     }
     false
+}
+
+/// `command` split into words, with the shell's control operators -- `&&`,
+/// `||`, `;`, `|` and `&` -- as words of their own whether or not spaces
+/// surround them: `true&&cargo test -r` is a `cargo test` run, and in
+/// `cargo test --lib&&rm -rf build` the `-rf` is `rm`'s. An `&` or `|`
+/// straight after `>` or `<` is part of a redirection (`2>&1`, `>|`).
+fn shell_words(command: &str) -> Vec<&str> {
+    let bytes = command.as_bytes();
+    let mut words = Vec::new();
+    let mut word_start = None;
+    let mut at = 0;
+    while at < bytes.len() {
+        let byte = bytes[at];
+        let operator_len = match byte {
+            b';' => 1,
+            b'&' | b'|' if at > 0 && matches!(bytes[at - 1], b'>' | b'<') => 0,
+            b'&' | b'|' if bytes.get(at + 1) == Some(&byte) => 2,
+            b'&' | b'|' => 1,
+            _ => 0,
+        };
+        if operator_len == 0 && !byte.is_ascii_whitespace() {
+            word_start.get_or_insert(at);
+            at += 1;
+            continue;
+        }
+        if let Some(start) = word_start.take() {
+            words.push(&command[start..at]);
+        }
+        if operator_len > 0 {
+            words.push(&command[at..at + operator_len]);
+        }
+        at += operator_len.max(1);
+    }
+    if let Some(start) = word_start {
+        words.push(&command[start..]);
+    }
+    words
 }
 
 /// Whether `cargo test`'s `arguments`, up to the end of its own command,
@@ -157,16 +195,11 @@ fn release_in(arguments: &[&str]) -> bool {
         "--config",
     ];
     let mut next_is_a_value = false;
-    for raw in arguments {
-        if matches!(*raw, "&&" | "||" | ";" | "|" | "&") {
+    for &argument in arguments {
+        if matches!(argument, "&&" | "||" | ";" | "|" | "&") {
             return false;
         }
-        let ends_command = raw.ends_with(';') || raw.ends_with('&') || raw.ends_with('|');
-        let argument = raw.trim_end_matches([';', '&', '|']);
         if std::mem::take(&mut next_is_a_value) {
-            if ends_command {
-                return false;
-            }
             continue;
         }
         if argument == "--" {
@@ -186,9 +219,6 @@ fn release_in(arguments: &[&str]) -> bool {
                     _ => {}
                 }
             }
-        }
-        if ends_command {
-            return false;
         }
     }
     false
@@ -1097,6 +1127,8 @@ mod parser {
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --features x -r",
             "EXPECT_OVERFLOW_CHECKS=1 /usr/bin/cargo test --locked -r --lib",
             "EXPECT_OVERFLOW_CHECKS=1 cargo +1.95.0 test --locked -r --lib",
+            "true&&EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -r --lib",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib 2>&1 -r",
         ] {
             assert_eq!(
                 checking_debug_runs(line),
@@ -1112,6 +1144,9 @@ mod parser {
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked -j r --lib",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib && rm -rf build",
             "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib; echo -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib&&rm -rf build",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib;echo -r",
+            "EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib|tee -r",
         ] {
             assert_eq!(
                 checking_debug_runs(line).len(),
