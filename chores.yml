@@ -158,19 +158,27 @@ tasks:
 
   test:oracle:
     desc: 'The driver writes, e2fsprogs reads back: every test that runs e2fsck, debugfs or mkfs on the host'
+    # --show-output prints what each passing oracle test checked (the
+    # [oracle] lines: every tool invocation and its verdict), so a green
+    # run carries its evidence rather than just a count.
     cmds:
       - scripts/tools.sh --check
-      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh oracle)'
+      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:
-    desc: 'Everything, exactly as CI runs it: unit (debug), then the whole suite (release), then the script tests'
+    desc: 'Everything, exactly as CI runs it: unit (debug), the oracles, the whole suite (release), the script tests'
     # Checks for the tools and the fixtures FIRST and fails naming the
     # task that provides them, rather than letting several hundred tests
     # each fail on the same missing image.
+    #
+    # test:oracle runs before the whole suite, which runs those tests
+    # again: the price (under a minute) of its output being in every
+    # log, and of `test` staying plainly "everything".
     cmds:
       - task: test:unit
       - scripts/tools.sh --check
       - test-disks/build-fixtures.sh --check
+      - task: test:oracle
       - scripts/test.sh --locked --release
       - task: test:scripts
 

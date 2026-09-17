@@ -1105,7 +1105,7 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
             _ => None,
         })
         .collect();
-    for subtask in ["test:unit", "test:scripts"] {
+    for subtask in ["test:unit", "test:oracle", "test:scripts"] {
         assert!(
             subtasks.contains(&subtask),
             "chores.yml `test` must run `task: {subtask}`; it runs {subtasks:?}"
