@@ -238,7 +238,9 @@ credited in the License section.
     (0..=40 budget).
   - `fallocate_crash_safety.rs` — KEEP_SIZE / PUNCH_HOLE /
     ZERO_RANGE.
-  - `orphan_recovery_crash_safety.rs` — orphan replay budget sweep.
+  - Orphan recovery's cut-after-every-write sweeps, on a real orphan
+    through both the journaled and the unjournaled commit, are unit
+    tests in `src/fs.rs` beside the helpers that plant one.
 - **Cross-validators:** `tests/lwext4_cross_validate.rs` (BSD-2-Clause
   reference, opt-in via env flag — built as a library, never linked
   by default); a FreeBSD-VM cross-validator (`tests/vagrant/freebsd/`,
