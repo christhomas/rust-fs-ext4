@@ -5340,14 +5340,208 @@ impl Filesystem {
         target_ino: u32,
         file_type: crate::dir::DirEntryType,
     ) -> Result<()> {
-        let bs = self.sb.block_size();
-        let bs_u64 = bs as u64;
         let has_ft = self.sb.feature_incompat & features::Incompat::FILETYPE.bits() != 0;
 
         // An indexed directory reaches here when the leaf its index picks
-        // is full. A block appended below would be one the index never
-        // routes to, so the index goes first.
+        // is full. Split that leaf where the index has room for another
+        // entry, as the kernel's `ext4_dx_add_entry` does (#195); only
+        // where it does not is the index dropped, so the block appended
+        // below is one a linear scan finds.
+        if self.split_htree_leaf_and_add_entry(parent_ino, name, target_ino, file_type, has_ft)? {
+            return Ok(());
+        }
         self.drop_htree_index(parent_ino)?;
+
+        let (parent_inode, _) = self.read_inode_verified(parent_ino)?;
+        let block = self.seeded_dir_block(
+            &parent_inode,
+            parent_ino,
+            name,
+            target_ino,
+            file_type,
+            has_ft,
+        )?;
+        self.append_dir_block(parent_ino, block)
+    }
+
+    /// Split the full htree leaf that `name` routes to, add the entry to the
+    /// half its hash belongs in, and route the new half from the parent index
+    /// block: the kernel's `do_split` and `dx_insert_block` (#195).
+    ///
+    /// `Ok(false)` when this is not a split it makes, and the caller drops the
+    /// index instead, as the kernel's `dx_fallback` does: the directory is not
+    /// indexed, or is casefolded or encrypted (hashed some way this crate does
+    /// not), the index has more than one interior level, the parent index
+    /// block is full, every name in the leaf has one hash, or the new entry
+    /// does not fit the half it belongs in.
+    ///
+    /// The new leaf is appended unjournaled, like every directory extension
+    /// here, before the index routes to it; the rewritten leaf and the parent
+    /// are then committed together. A crash between the two leaves the moved
+    /// names in both leaves, which lookups still resolve.
+    fn split_htree_leaf_and_add_entry(
+        &self,
+        dir_ino: u32,
+        name: &[u8],
+        target_ino: u32,
+        file_type: crate::dir::DirEntryType,
+        has_ft: bool,
+    ) -> Result<bool> {
+        let (dir, _) = self.read_inode_verified(dir_ino)?;
+        if dir.flags & crate::inode::InodeFlags::INDEX.bits() == 0
+            || dir.flags & (EXT4_CASEFOLD_FL | EXT4_ENCRYPT_FL) != 0
+        {
+            return Ok(false);
+        }
+        let bs = self.sb.block_size() as usize;
+        let physical = |logical: u32| {
+            self.map_inode_logical(&dir, u64::from(logical))?
+                .ok_or(Error::CorruptDirEntry("htree block is not mapped"))
+        };
+
+        let root_phys = physical(0)?;
+        let root = self.read_block(root_phys)?;
+        self.check_dx_block(dir_ino, &dir, &root, true)?;
+        let info = crate::htree::parse_root_info(&root)?;
+        if info.indirect_levels > 1 {
+            return Ok(false);
+        }
+        let version = crate::hash::effective_version(info.hash_version, self.sb.unsigned_hash());
+        let hash = crate::hash::name_hash(name, version, &self.sb.hash_seed).major;
+
+        let (_, root_entries) = crate::htree::parse_root_entries(&root)?;
+        let routed = crate::htree::find_entry_for_hash(&root_entries, hash).block;
+        let (parent_phys, parent, count_offset, leaf_logical) = if info.indirect_levels == 0 {
+            (root_phys, root, 32, routed)
+        } else {
+            let node_phys = physical(routed)?;
+            let node = self.read_block(node_phys)?;
+            self.check_dx_block(dir_ino, &dir, &node, false)?;
+            let (_, entries) = crate::htree::parse_node_entries(&node)?;
+            let leaf = crate::htree::find_entry_for_hash(&entries, hash).block;
+            (node_phys, node, 8, leaf)
+        };
+        if leaf_logical == 0 {
+            return Err(Error::CorruptDirEntry(
+                "htree routes a name to its own root",
+            ));
+        }
+
+        let leaf_phys = physical(leaf_logical)?;
+        let leaf = self.read_block(leaf_phys)?;
+        let reserved_tail = if self.csum.enabled && crate::dir::has_csum_tail(&leaf) {
+            if !self
+                .csum
+                .verify_dir_entry_tail(dir_ino, dir.generation, &leaf)
+            {
+                return Err(Error::BadChecksum {
+                    what: "directory block",
+                });
+            }
+            12
+        } else {
+            0
+        };
+        let Ok(split) = crate::htree_mut::plan_leaf_split(
+            &leaf,
+            version,
+            &self.sb.hash_seed,
+            has_ft,
+            bs,
+            reserved_tail,
+        ) else {
+            return Ok(false);
+        };
+
+        let new_logical = u32::try_from(dir.size / bs as u64)
+            .map_err(|_| Error::Corrupt("directory too large to index another block"))?;
+        let parent = match if count_offset == 32 {
+            crate::htree_mut::plan_insert_dx_entry_root(
+                &parent,
+                32,
+                split.split_out_hash,
+                new_logical,
+            )
+        } else {
+            crate::htree_mut::plan_insert_dx_entry_node(&parent, split.split_out_hash, new_logical)
+        } {
+            Ok(bytes) => bytes,
+            // A full parent, or a bound the parent already routes.
+            Err(Error::CorruptExtentTree(_)) => return Ok(false),
+            Err(e) => return Err(e),
+        };
+
+        let (mut left, mut right) = (split.left_bytes, split.right_bytes);
+        let into = if hash >= split.split_out_hash {
+            &mut right
+        } else {
+            &mut left
+        };
+        match crate::dir::add_entry_to_block(
+            into,
+            target_ino,
+            name,
+            file_type,
+            has_ft,
+            reserved_tail,
+        ) {
+            Ok(()) => {}
+            Err(Error::OutOfBounds) => return Ok(false),
+            Err(e) => return Err(e),
+        }
+        let mut parent = parent;
+        if reserved_tail == 12 {
+            self.csum
+                .patch_dir_entry_tail(dir_ino, dir.generation, &mut left);
+            self.csum
+                .patch_dir_entry_tail(dir_ino, dir.generation, &mut right);
+        }
+        self.csum
+            .patch_dx_tail(dir_ino, dir.generation, &mut parent, count_offset);
+
+        self.append_dir_block(dir_ino, right)?;
+        let mut buf = BlockBuffer::new(self.sb.block_size());
+        buf.put(leaf_phys, left);
+        buf.put(parent_phys, parent);
+        self.commit_block_buffer(buf)?;
+        Ok(true)
+    }
+
+    /// A fresh directory block holding one entry, with its checksum tail.
+    fn seeded_dir_block(
+        &self,
+        parent_inode: &Inode,
+        parent_ino: u32,
+        name: &[u8],
+        target_ino: u32,
+        file_type: crate::dir::DirEntryType,
+        has_ft: bool,
+    ) -> Result<Vec<u8>> {
+        let bs = self.sb.block_size() as usize;
+        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
+        let mut block = vec![0u8; bs];
+        block[4..6].copy_from_slice(&((bs - reserved_tail) as u16).to_le_bytes());
+        crate::dir::add_entry_to_block(
+            &mut block,
+            target_ino,
+            name,
+            file_type,
+            has_ft,
+            reserved_tail,
+        )?;
+        if self.csum.enabled {
+            self.csum
+                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
+        }
+        Ok(block)
+    }
+
+    /// Grow `parent_ino`'s directory by one block holding `block`, at logical
+    /// block `size / block_size`: allocate it, map it, write it, grow the
+    /// inode. Not journaled. Leaves any htree index alone.
+    fn append_dir_block(&self, parent_ino: u32, block: Vec<u8>) -> Result<()> {
+        let bs = self.sb.block_size();
+        let bs_u64 = bs as u64;
 
         // Re-read parent so we operate on the freshest on-disk bytes.
         let (parent_inode, mut parent_raw) = self.read_inode_verified(parent_ino)?;
@@ -5400,10 +5594,7 @@ impl Filesystem {
                 parent_ino,
                 &parent_inode,
                 &mut parent_raw,
-                name,
-                target_ino,
-                file_type,
-                has_ft,
+                block,
                 new_phys,
                 new_extent,
                 plan,
@@ -5414,10 +5605,7 @@ impl Filesystem {
                 parent_ino,
                 &parent_inode,
                 &mut parent_raw,
-                name,
-                target_ino,
-                file_type,
-                has_ft,
+                block,
                 new_phys,
                 new_extent,
                 plan,
@@ -5498,27 +5686,6 @@ impl Filesystem {
         }
         self.write_inode_raw(parent_ino, &parent_raw)?;
 
-        // 5. Seed the new data block with a "whole-block unused" placeholder
-        //    that add_entry_to_block can split into (new entry + remainder).
-        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
-        let usable = (bs as usize) - reserved_tail;
-        let mut block = vec![0u8; bs as usize];
-        block[0..4].copy_from_slice(&0u32.to_le_bytes());
-        block[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
-
-        crate::dir::add_entry_to_block(
-            &mut block,
-            target_ino,
-            name,
-            file_type,
-            has_ft,
-            reserved_tail,
-        )?;
-
-        if self.csum.enabled && reserved_tail == 12 {
-            self.csum
-                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
-        }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
         // 6. Commit block allocator side-effects. On the promotion path the
@@ -5648,10 +5815,7 @@ impl Filesystem {
         parent_ino: u32,
         parent_inode: &Inode,
         parent_raw: &mut [u8],
-        name: &[u8],
-        target_ino: u32,
-        file_type: crate::dir::DirEntryType,
-        has_ft: bool,
+        block: Vec<u8>,
         new_phys: u64,
         new_extent: crate::extent::Extent,
         data_plan: crate::alloc::BlockAllocationPlan,
@@ -5757,24 +5921,6 @@ impl Filesystem {
         }
         self.write_inode_raw(parent_ino, parent_raw)?;
 
-        // Seed + write the new data block with the directory entry.
-        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
-        let usable = (bs as usize) - reserved_tail;
-        let mut block = vec![0u8; bs as usize];
-        block[0..4].copy_from_slice(&0u32.to_le_bytes());
-        block[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
-        crate::dir::add_entry_to_block(
-            &mut block,
-            target_ino,
-            name,
-            file_type,
-            has_ft,
-            reserved_tail,
-        )?;
-        if self.csum.enabled && reserved_tail == 12 {
-            self.csum
-                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
-        }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
         // All writes succeeded — now commit the allocation accounting. Route
@@ -5802,10 +5948,7 @@ impl Filesystem {
         parent_ino: u32,
         parent_inode: &Inode,
         parent_raw: &mut [u8],
-        name: &[u8],
-        target_ino: u32,
-        file_type: crate::dir::DirEntryType,
-        has_ft: bool,
+        block: Vec<u8>,
         new_phys: u64,
         new_extent: crate::extent::Extent,
         plan: crate::alloc::BlockAllocationPlan,
@@ -5823,10 +5966,7 @@ impl Filesystem {
                 parent_ino,
                 parent_inode,
                 parent_raw,
-                name,
-                target_ino,
-                file_type,
-                has_ft,
+                block,
                 new_phys,
                 new_extent,
                 plan,
@@ -5869,10 +6009,7 @@ impl Filesystem {
                     parent_ino,
                     parent_inode,
                     parent_raw,
-                    name,
-                    target_ino,
-                    file_type,
-                    has_ft,
+                    block,
                     new_phys,
                     new_extent,
                     plan,
@@ -5913,26 +6050,6 @@ impl Filesystem {
         }
         self.write_inode_raw(parent_ino, parent_raw)?;
 
-        // Seed + write the new data block (same recipe as the depth-0 path).
-        let reserved_tail = if self.csum.enabled { 12 } else { 0 };
-        let usable = (bs as usize) - reserved_tail;
-        let mut block = vec![0u8; bs as usize];
-        block[0..4].copy_from_slice(&0u32.to_le_bytes());
-        block[4..6].copy_from_slice(&(usable as u16).to_le_bytes());
-
-        crate::dir::add_entry_to_block(
-            &mut block,
-            target_ino,
-            name,
-            file_type,
-            has_ft,
-            reserved_tail,
-        )?;
-
-        if self.csum.enabled && reserved_tail == 12 {
-            self.csum
-                .patch_dir_entry_tail(parent_ino, parent_inode.generation, &mut block);
-        }
         self.dev.write_at(new_phys * bs_u64, &block)?;
 
         // Commit data-block allocation.

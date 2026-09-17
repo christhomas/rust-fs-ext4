@@ -149,14 +149,98 @@ fn writes_into_an_indexed_directory_with_metadata_csum() {
     exercise("csum", "metadata_csum");
 }
 
-/// When the leaf a name hashes to is full, the index is dropped and the
-/// directory carries on as a linear one, as the kernel's `dx_fallback` does.
+/// A full leaf splits, and the directory stays indexed (#195).
+///
+/// `e2fsck -D` packs the leaves full, so the first create into any of them
+/// splits it: half its names move to a new block, the name goes into its
+/// half, and the root gains the entry routing the new block. 1500 creates
+/// into a 600-name directory split many times without filling the 1 KiB
+/// root. Every name must then be in the leaf the index routes it to -- a
+/// lookup here falls back to a linear scan, so finding it is not enough --
+/// and e2fsck, which checks the whole index, must be clean.
+fn split_leaves(tag: &str, features: &str) {
+    let Some(image) = indexed_volume(tag, features, 600) else {
+        return;
+    };
+    {
+        let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
+        let root_count = |fs: &Filesystem| {
+            let ino = resolve(fs, "/bigdir").unwrap();
+            let (inode, _) = fs.read_inode_verified(ino).unwrap();
+            let root = fs
+                .read_block(fs.map_inode_logical(&inode, 0).unwrap().unwrap())
+                .unwrap();
+            assert_eq!(root[30], 0, "[{tag}] fixture: expected a one-level index");
+            u16::from_le_bytes([root[34], root[35]])
+        };
+        let before = root_count(&fs);
+        let mut names: Vec<String> = (0..600).map(|i| format!("existing_file_{i:05}")).collect();
+        for i in 0..1500 {
+            let name = format!("a_longer_name_to_fill_leaves_{i:05}");
+            fs.apply_create(&format!("/bigdir/{name}"), 0o644)
+                .expect("create");
+            names.push(name);
+        }
+        assert!(is_indexed(&fs, "/bigdir"), "[{tag}] the index was dropped");
+        let after = root_count(&fs);
+        assert!(
+            after > before,
+            "[{tag}] no leaf split: root count {before} -> {after}"
+        );
+
+        let ino = resolve(&fs, "/bigdir").unwrap();
+        let (inode, _) = fs.read_inode_verified(ino).unwrap();
+        let block = |logical: u64| {
+            fs.read_block(fs.map_inode_logical(&inode, logical).unwrap().unwrap())
+                .unwrap()
+        };
+        let root = block(0);
+        for name in &names {
+            let leaf = fs_ext4::htree::lookup_leaf_with(
+                name.as_bytes(),
+                &root,
+                &fs.sb.hash_seed,
+                fs.sb.unsigned_hash(),
+                |logical| Ok(block(u64::from(logical))),
+            )
+            .unwrap()
+            .unwrap();
+            let held = fs_ext4::dir::parse_block(&block(u64::from(leaf)), true)
+                .unwrap()
+                .iter()
+                .any(|e| e.name == name.as_bytes());
+            assert!(
+                held,
+                "[{tag}] {name} is not in leaf {leaf}, where the index routes it"
+            );
+        }
+    }
+    if let Err(report) = e2fsck_clean(&image) {
+        panic!("[{tag}] e2fsck after leaf splits:\n{report}");
+    }
+    let _ = std::fs::remove_file(&image);
+}
+
+#[test]
+fn a_full_leaf_splits_without_metadata_csum() {
+    split_leaves("split_nocsum", "^metadata_csum,^has_journal");
+}
+
+#[test]
+fn a_full_leaf_splits_with_metadata_csum() {
+    split_leaves("split_csum", "metadata_csum");
+}
+
+/// When the index block routing a full leaf has no room for another entry,
+/// the index is dropped and the directory carries on as a linear one, as the
+/// kernel's `dx_fallback` does. Splitting an interior node is not done here.
 /// A block appended to a still-indexed directory is one no lookup through
 /// the index would reach.
 ///
-/// 6000 names at 1 KiB blocks need a second index level, so the drop also
-/// converts interior nodes. With metadata_csum each converted block needs a
-/// dirent tail, and e2fsck checks every one.
+/// 6000 names at 1 KiB blocks need a second index level, and `e2fsck -D`
+/// packs its nodes full, so the drop also converts interior nodes. With
+/// metadata_csum each converted block needs a dirent tail, and e2fsck checks
+/// every one.
 fn fill_a_leaf(tag: &str, features: &str) {
     let Some(image) = indexed_volume(tag, features, 6000) else {
         return;
@@ -180,7 +264,7 @@ fn fill_a_leaf(tag: &str, features: &str) {
         }
         assert!(
             !is_indexed(&fs, "/bigdir"),
-            "[{tag}] 3000 creates never filled a leaf; the fallback went untested"
+            "[{tag}] 3000 creates never filled an index node; the fallback went untested"
         );
         // A few more after the drop, through the linear path.
         for i in 0..20 {

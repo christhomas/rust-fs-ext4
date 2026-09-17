@@ -58,6 +58,14 @@
 - The group descriptor table is located after the superblock's block
   rather than after `s_first_data_block`. They differ on a 1 KiB bigalloc
   volume, whose groups start at block 0.
+- A create into a full htree leaf splits the leaf and routes the new half
+  from the index, as the kernel does. The directory's whole index was
+  dropped instead, leaving every other implementation a linear scan until
+  `e2fsck -D`. The index is still dropped when the block routing the leaf
+  is full, since interior nodes are not split.
+- The dx entry planner (`htree_mut::plan_insert_dx_entry_*`) lays the entry
+  array out where the kernel does, starting at the count/limit pair. It was
+  one hash/block pair out of step.
 
 ## [0.5.1] — 2026-09-06
 
