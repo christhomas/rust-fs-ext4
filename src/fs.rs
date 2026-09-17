@@ -1237,6 +1237,7 @@ impl Filesystem {
     pub fn apply_truncate_shrink(&self, ino: u32, new_size: u64) -> Result<()> {
         self.refuse_write()?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
+        Self::refuse_truncate_of(&inode)?;
         if new_size > inode.size {
             return Err(Error::InvalidArgument(
                 "truncate: new_size > old_size (grow not supported)",
@@ -1297,9 +1298,26 @@ impl Filesystem {
     /// Caller (capi dispatch) guarantees `new_size >= inode.size`. If
     /// `new_size == inode.size` this is a no-op that still bumps the
     /// timestamps — matches `truncate(2)` semantics.
+    /// Truncation is for regular files. A directory's size is its blocks, a
+    /// symlink's is its target's length, and a device node has none; setting
+    /// any of them to a size the caller chose leaves an inode e2fsck rejects.
+    /// The kernel answers EISDIR for a directory and EINVAL for the rest.
+    fn refuse_truncate_of(inode: &Inode) -> Result<()> {
+        if inode.is_dir() {
+            return Err(Error::IsADirectory);
+        }
+        if !inode.is_file() {
+            return Err(Error::InvalidArgument(
+                "truncate: only a regular file has a size to change",
+            ));
+        }
+        Ok(())
+    }
+
     pub fn apply_truncate_grow(&self, ino: u32, new_size: u64) -> Result<()> {
         self.refuse_write()?;
         let (inode, mut raw) = self.read_inode_verified(ino)?;
+        Self::refuse_truncate_of(&inode)?;
         if new_size < inode.size {
             return Err(Error::InvalidArgument(
                 "apply_truncate_grow: new_size < old_size (use apply_truncate_shrink)",
