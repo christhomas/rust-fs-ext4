@@ -686,206 +686,181 @@ mod tests {
         assert_ne!(p1, p2, "prefix changes hash");
     }
 
-    /// Verify our superblock-checksum routine against a real ext4-basic.img
-    /// (which has metadata_csum enabled).
-    #[test]
-    fn verifies_real_superblock() {
-        use crate::block_io::FileDevice;
+    /// Tests that read a fixture from `test-disks/` (`chore fixtures`).
+    mod needs_host {
+        use super::*;
 
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let sb = Superblock::read(&dev).expect("parse sb");
-        let csum = Checksummer::from_superblock(&sb);
-        if !csum.enabled {
-            eprintln!("skip: metadata_csum not enabled in ext4-basic.img");
-            return;
-        }
-        assert!(
-            csum.verify_superblock(&sb.raw),
-            "superblock checksum mismatch on {path}"
-        );
-    }
+        /// Verify our superblock-checksum routine against a real ext4-basic.img
+        /// (which has metadata_csum enabled).
+        #[test]
+        fn verifies_real_superblock() {
+            use crate::block_io::FileDevice;
 
-    /// Verify our BGD checksum against a real image — every group must pass.
-    #[test]
-    fn verifies_real_bgd() {
-        use crate::block_io::{BlockDevice, FileDevice};
-
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let sb = Superblock::read(&dev).expect("parse sb");
-        let csum = Checksummer::from_superblock(&sb);
-        if !csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
-        }
-        // Read raw BGT and verify each descriptor.
-        let block_size = sb.block_size() as u64;
-        let bgt_off = (sb.first_data_block as u64 + 1) * block_size;
-        let group_count = sb.block_group_count();
-        let total = group_count as usize * sb.desc_size as usize;
-        let mut buf = vec![0u8; total];
-        dev.read_at(bgt_off, &mut buf).expect("read bgt");
-        for i in 0..group_count as usize {
-            let off = i * sb.desc_size as usize;
-            let raw = &buf[off..off + sb.desc_size as usize];
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let sb = Superblock::read(&dev).expect("parse sb");
+            let csum = Checksummer::from_superblock(&sb);
             assert!(
-                csum.verify_bgd(i as u32, raw, sb.desc_size),
-                "BGD {i} checksum mismatch on {path}"
+                csum.enabled,
+                "ext4-basic.img is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            assert!(
+                csum.verify_superblock(&sb.raw),
+                "superblock checksum mismatch on {path}"
             );
         }
-    }
 
-    /// Verify our inode checksum against a real image — root inode (2) must pass.
-    #[test]
-    fn verifies_real_inode() {
-        use crate::block_io::FileDevice;
-        use crate::fs::Filesystem;
-        use std::sync::Arc;
+        /// Verify our BGD checksum against a real image — every group must pass.
+        #[test]
+        fn verifies_real_bgd() {
+            use crate::block_io::{BlockDevice, FileDevice};
 
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let sb = Superblock::read(&dev).expect("parse sb");
+            let csum = Checksummer::from_superblock(&sb);
+            assert!(
+                csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            // Read raw BGT and verify each descriptor.
+            let block_size = sb.block_size() as u64;
+            let bgt_off = (sb.first_data_block as u64 + 1) * block_size;
+            let group_count = sb.block_group_count();
+            let total = group_count as usize * sb.desc_size as usize;
+            let mut buf = vec![0u8; total];
+            dev.read_at(bgt_off, &mut buf).expect("read bgt");
+            for i in 0..group_count as usize {
+                let off = i * sb.desc_size as usize;
+                let raw = &buf[off..off + sb.desc_size as usize];
+                assert!(
+                    csum.verify_bgd(i as u32, raw, sb.desc_size),
+                    "BGD {i} checksum mismatch on {path}"
+                );
             }
-        };
-        let dev_dyn: Arc<dyn crate::block_io::BlockDevice> = Arc::new(dev);
-        let fs = Filesystem::mount(dev_dyn).expect("mount");
-        if !fs.csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
         }
-        // Inode 2 = root dir.
-        let (inode, raw) = fs.read_inode_verified(2).expect("read root inode");
-        assert!(inode.is_dir());
-        assert!(fs.csum.verify_inode(2, inode.generation, &raw));
-    }
 
-    /// Verify dir-block tail csum against a real image. Root dir on
-    /// ext4-basic.img is a single-block linear directory with a tail.
-    #[test]
-    fn verifies_real_dir_tail() {
-        use crate::block_io::{BlockDevice, FileDevice};
-        use crate::dir;
-        use crate::extent;
-        use crate::fs::Filesystem;
-        use std::sync::Arc;
+        /// Verify our inode checksum against a real image — root inode (2) must pass.
+        #[test]
+        fn verifies_real_inode() {
+            use crate::block_io::FileDevice;
+            use crate::fs::Filesystem;
+            use std::sync::Arc;
 
-        let path = "test-disks/ext4-basic.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev_dyn: Arc<dyn crate::block_io::BlockDevice> = Arc::new(dev);
+            let fs = Filesystem::mount(dev_dyn).expect("mount");
+            assert!(
+                fs.csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            // Inode 2 = root dir.
+            let (inode, raw) = fs.read_inode_verified(2).expect("read root inode");
+            assert!(inode.is_dir());
+            assert!(fs.csum.verify_inode(2, inode.generation, &raw));
+        }
+
+        /// Verify dir-block tail csum against a real image. Root dir on
+        /// ext4-basic.img is a single-block linear directory with a tail.
+        #[test]
+        fn verifies_real_dir_tail() {
+            use crate::block_io::{BlockDevice, FileDevice};
+            use crate::dir;
+            use crate::extent;
+            use crate::fs::Filesystem;
+            use std::sync::Arc;
+
+            let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-basic.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
+            let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
+            assert!(
+                fs.csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            let (root_inode, _raw) = fs.read_inode_verified(2).expect("root inode");
+            let bs = fs.sb.block_size();
+            let phys = extent::map_logical(&root_inode.block, dev_dyn.as_ref(), bs, 0)
+                .expect("map_logical")
+                .expect("dir block 0 mapped");
+            let mut block = vec![0u8; bs as usize];
+            dev_dyn.read_at(phys * bs as u64, &mut block).unwrap();
+            assert!(
+                dir::has_csum_tail(&block),
+                "expected tail on root dir block"
+            );
+            assert!(
+                fs.csum
+                    .verify_dir_entry_tail(2, root_inode.generation, &block),
+                "dir tail csum mismatch on {path} root dir"
+            );
+        }
+
+        /// Verify extent-block tail csum against ext4-deep-extents.img: any file
+        /// with depth > 0 has off-inode extent index/leaf blocks. We pick the
+        /// largest regular file and traverse one internal-node block.
+        #[test]
+        fn verifies_real_extent_tail() {
+            use crate::block_io::{BlockDevice, FileDevice};
+            use crate::extent::{self, ExtentHeader, ExtentIdx, EXT4_EXT_NODE_SIZE};
+            use crate::fs::Filesystem;
+            use std::sync::Arc;
+
+            let path =
+                fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-deep-extents.img");
+            let dev = FileDevice::open(&path).unwrap_or_else(|e| panic!("open {path}: {e}"));
+            let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
+            let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
+            assert!(
+                fs.csum.enabled,
+                "{path} is built with metadata_csum (test-disks/guest-build-images.sh)"
+            );
+            // Walk first ~50 inodes looking for one with depth>0.
+            let bs = fs.sb.block_size();
+            let mut found = None;
+            for ino in 11..200u32 {
+                let (inode, _raw) = match fs.read_inode_verified(ino) {
+                    Ok(x) => x,
+                    Err(_) => continue,
+                };
+                if !inode.is_file() || !inode.has_extents() {
+                    continue;
+                }
+                let header = match ExtentHeader::parse(&inode.block) {
+                    Ok(h) => h,
+                    Err(_) => continue,
+                };
+                if header.depth > 0 && header.entries >= 1 {
+                    let idx =
+                        ExtentIdx::parse(&inode.block[EXT4_EXT_NODE_SIZE..2 * EXT4_EXT_NODE_SIZE])
+                            .expect("parse first idx");
+                    found = Some((ino, inode.generation, idx.leaf_block));
+                    break;
+                }
             }
-        };
-        let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
-        let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
-        if !fs.csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
-        }
-        let (root_inode, _raw) = fs.read_inode_verified(2).expect("root inode");
-        let bs = fs.sb.block_size();
-        let phys = extent::map_logical(&root_inode.block, dev_dyn.as_ref(), bs, 0)
-            .expect("map_logical")
-            .expect("dir block 0 mapped");
-        let mut block = vec![0u8; bs as usize];
-        dev_dyn.read_at(phys * bs as u64, &mut block).unwrap();
-        assert!(
-            dir::has_csum_tail(&block),
-            "expected tail on root dir block"
-        );
-        assert!(
-            fs.csum
-                .verify_dir_entry_tail(2, root_inode.generation, &block),
-            "dir tail csum mismatch on {path} root dir"
-        );
-    }
+            let (ino, gen, child_block) = found.unwrap_or_else(|| {
+                panic!(
+                    "no depth>0 inode in the first 200 of {path}: its sparse.bin is built \
+                 with a multi-level extent tree (test-disks/guest-build-images.sh)"
+                )
+            });
+            let mut buf = vec![0u8; bs as usize];
+            dev_dyn.read_at(child_block * bs as u64, &mut buf).unwrap();
+            assert!(
+                fs.csum.verify_extent_tail(ino, gen, &buf),
+                "extent block csum mismatch (ino={ino} child_block={child_block} on {path})"
+            );
 
-    /// Verify extent-block tail csum against ext4-deep-extents.img: any file
-    /// with depth > 0 has off-inode extent index/leaf blocks. We pick the
-    /// largest regular file and traverse one internal-node block.
-    #[test]
-    fn verifies_real_extent_tail() {
-        use crate::block_io::{BlockDevice, FileDevice};
-        use crate::extent::{self, ExtentHeader, ExtentIdx, EXT4_EXT_NODE_SIZE};
-        use crate::fs::Filesystem;
-        use std::sync::Arc;
-
-        let path = "test-disks/ext4-deep-extents.img";
-        let dev = match FileDevice::open(path) {
-            Ok(d) => d,
-            Err(_) => {
-                eprintln!("skip: {path} not present");
-                return;
-            }
-        };
-        let dev_dyn: Arc<dyn BlockDevice> = Arc::new(dev);
-        let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
-        if !fs.csum.enabled {
-            eprintln!("skip: metadata_csum not enabled");
-            return;
-        }
-        // Walk first ~50 inodes looking for one with depth>0.
-        let bs = fs.sb.block_size();
-        let mut found = None;
-        for ino in 11..200u32 {
-            let (inode, _raw) = match fs.read_inode_verified(ino) {
-                Ok(x) => x,
-                Err(_) => continue,
+            // Also exercise the verified traversal API end-to-end.
+            let (inode, _) = fs.read_inode_verified(ino).unwrap();
+            let ctx = extent::ExtentVerifyCtx {
+                ino,
+                generation: gen,
+                csum: &fs.csum,
             };
-            if !inode.is_file() || !inode.has_extents() {
-                continue;
-            }
-            let header = match ExtentHeader::parse(&inode.block) {
-                Ok(h) => h,
-                Err(_) => continue,
-            };
-            if header.depth > 0 && header.entries >= 1 {
-                let idx =
-                    ExtentIdx::parse(&inode.block[EXT4_EXT_NODE_SIZE..2 * EXT4_EXT_NODE_SIZE])
-                        .expect("parse first idx");
-                found = Some((ino, inode.generation, idx.leaf_block));
-                break;
-            }
+            let _ = extent::lookup_verified(&inode.block, dev_dyn.as_ref(), bs, 0, Some(&ctx))
+                .expect("lookup_verified must accept valid extent blocks");
         }
-        let (ino, gen, child_block) = match found {
-            Some(x) => x,
-            None => {
-                eprintln!("skip: no depth>0 inode in first 200 of {path}");
-                return;
-            }
-        };
-        let mut buf = vec![0u8; bs as usize];
-        dev_dyn.read_at(child_block * bs as u64, &mut buf).unwrap();
-        assert!(
-            fs.csum.verify_extent_tail(ino, gen, &buf),
-            "extent block csum mismatch (ino={ino} child_block={child_block} on {path})"
-        );
-
-        // Also exercise the verified traversal API end-to-end.
-        let (inode, _) = fs.read_inode_verified(ino).unwrap();
-        let ctx = extent::ExtentVerifyCtx {
-            ino,
-            generation: gen,
-            csum: &fs.csum,
-        };
-        let _ = extent::lookup_verified(&inode.block, dev_dyn.as_ref(), bs, 0, Some(&ctx))
-            .expect("lookup_verified must accept valid extent blocks");
     }
 }

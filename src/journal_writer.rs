@@ -390,9 +390,6 @@ impl JournalWriter {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::block_io::FileDevice;
-    use std::fs;
-    use std::sync::Arc;
 
     #[test]
     fn a_journal_must_fit_its_inode_and_the_device() {
@@ -406,60 +403,61 @@ mod tests {
         assert!(journal_len_fits(u32::MAX, u64::MAX, 4096, 64 << 20).is_err());
     }
 
-    fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
-        use std::sync::atomic::{AtomicU32, Ordering};
-        static COUNTER: AtomicU32 = AtomicU32::new(0);
-        let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-        let src = format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name);
-        if !std::path::Path::new(&src).exists() {
-            return None;
+    /// Tests that copy a fixture from `test-disks/` (`chore fixtures`).
+    mod needs_host {
+        use super::*;
+        use crate::block_io::FileDevice;
+        use std::fs;
+        use std::sync::Arc;
+
+        fn copy_to_tmp(name: &str, tag: &str) -> String {
+            use std::sync::atomic::{AtomicU32, Ordering};
+            static COUNTER: AtomicU32 = AtomicU32::new(0);
+            let n = COUNTER.fetch_add(1, Ordering::Relaxed);
+            let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
+            let dst =
+                fs_ext4_test_support::temp_path!("fs_ext4_jw_{}_{tag}_{n}.img", std::process::id());
+            fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} to {dst}: {e}"));
+            dst
         }
-        let dst =
-            fs_ext4_test_support::temp_path!("fs_ext4_jw_{}_{tag}_{n}.img", std::process::id());
-        fs::copy(&src, &dst).ok()?;
-        Some(dst)
-    }
 
-    #[test]
-    fn open_returns_none_when_no_journal() {
-        // ext4-no-csum.img is built without a journal in some configs; if it
-        // happens to have one, this test is a no-op (we just exercise the
-        // open path). The point of the test is that open() itself doesn't
-        // panic on an unjournaled image.
-        let Some(path) = copy_to_tmp("ext4-no-csum.img", "no_journal") else {
-            return;
-        };
-        let dev = FileDevice::open(&path).expect("open ro");
-        let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        // Just exercise — either Some or None is fine; we're checking
-        // structural correctness of the open path.
-        let _ = JournalWriter::open(&fs).expect("open journal_writer");
-        fs::remove_file(path).ok();
-    }
+        #[test]
+        fn open_returns_none_when_no_journal() {
+            // ext4-no-csum.img is built without a journal in some configs; if it
+            // happens to have one, this test is a no-op (we just exercise the
+            // open path). The point of the test is that open() itself doesn't
+            // panic on an unjournaled image.
+            let path = copy_to_tmp("ext4-no-csum.img", "no_journal");
+            let dev = FileDevice::open(&path).expect("open ro");
+            let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
+            // Just exercise — either Some or None is fine; we're checking
+            // structural correctness of the open path.
+            let _ = JournalWriter::open(&fs).expect("open journal_writer");
+            fs::remove_file(path).ok();
+        }
 
-    #[test]
-    fn empty_transaction_is_no_op() {
-        let Some(path) = copy_to_tmp("ext4-basic.img", "empty_tx") else {
-            return;
-        };
-        let dev = FileDevice::open_rw(&path).expect("open rw");
-        let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        let Some(mut jw) = JournalWriter::open(&fs).expect("open writer") else {
-            return; // image has no journal — skip
-        };
-        let initial_seq = jw.jsb.sequence;
-        let tx = jw.begin();
-        // commit() short-circuits on tx.commit() returning a single commit
-        // block — actually tx.commit() always returns at least the commit
-        // block, so an empty tx still goes through the protocol but writes
-        // only one block. Verify it advances sequence by 1.
-        jw.commit(fs.dev.as_ref(), &tx).expect("commit");
-        assert_eq!(
-            jw.jsb.sequence,
-            initial_seq.wrapping_add(1),
-            "sequence should advance even for a no-write commit"
-        );
-        assert_eq!(jw.jsb.start, 0, "should be clean after commit");
-        fs::remove_file(path).ok();
+        #[test]
+        fn empty_transaction_is_no_op() {
+            let path = copy_to_tmp("ext4-basic.img", "empty_tx");
+            let dev = FileDevice::open_rw(&path).expect("open rw");
+            let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
+            let mut jw = JournalWriter::open(&fs).expect("open writer").expect(
+                "ext4-basic.img is built with has_journal (test-disks/guest-build-images.sh)",
+            );
+            let initial_seq = jw.jsb.sequence;
+            let tx = jw.begin();
+            // commit() short-circuits on tx.commit() returning a single commit
+            // block — actually tx.commit() always returns at least the commit
+            // block, so an empty tx still goes through the protocol but writes
+            // only one block. Verify it advances sequence by 1.
+            jw.commit(fs.dev.as_ref(), &tx).expect("commit");
+            assert_eq!(
+                jw.jsb.sequence,
+                initial_seq.wrapping_add(1),
+                "sequence should advance even for a no-write commit"
+            );
+            assert_eq!(jw.jsb.start, 0, "should be clean after commit");
+            fs::remove_file(path).ok();
+        }
     }
 }

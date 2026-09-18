@@ -1,5 +1,51 @@
 name: CI
 
+# EVERY JOB RUNS CHORE TASKS, so a green local `chore test` is the same
+# evidence as a green run here (see the test contract at the top of
+# chores.yml):
+#
+#   unit         `chore test:unit` on a runner with NO fixtures: the tests
+#                that need no tool, no fixture and no VM, in the debug
+#                profile that traps an arithmetic overflow. That the job
+#                passes with test-disks/ empty is what proves the split.
+#   fixtures     `chore fixtures`: the kernel-made images, built in the
+#                fs-linux-test-harness VM under KVM on x86_64, and handed
+#                to the other jobs as an artifact (they are disk images,
+#                the same for every architecture).
+#   test         x86_64, where GitHub gives us KVM: `chore lint` and
+#                `chore test` — the whole gate, with EVERY e2fsprogs call
+#                and every kernel mount happening inside the harness VM.
+#                Nothing installs e2fsprogs on the runner, and the log
+#                shows `[oracle vm]` / `[kernel vm]` for each one.
+#   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
+#                it is what DiskJockey ships on) but GitHub's arm64
+#                runners have NO KVM, so no VM can run: this job runs the
+#                tiers that need none — lint, the unit tier, and the
+#                fixture-reading tests. The tool and kernel oracles are
+#                architecture-independent (they read the same images) and
+#                are covered by `test`; so are the script tests, which
+#                check the tree rather than the machine.
+#   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
+#                the guest. That is how a macOS host runs a Linux suite,
+#                and this job is what keeps that path working.
+#   ci-ok        the one required check: green only when every job above
+#                ran and succeeded (failed, cancelled OR skipped fails it).
+#
+# THE OUTPUT BUDGET IS IN THE TASKS, so it is in this workflow too. Each
+# tier writes its full output to tmp/logs/<tier>.log and prints a verdict;
+# a tier that prints more than its measured budget FAILS (exit 65), which
+# is how a job that starts emitting thousands of lines turns red here
+# rather than being noticed by whoever scrolls it next. See the budget
+# table at the top of chores.yml, and the harness README's "Output: quiet
+# by default, --verbose on request". Nothing extra is needed in this file:
+# every job already runs chore tasks, which is the whole point of them.
+#
+# The logs themselves are NOT uploaded as artefacts yet, though the
+# harness contract asks for it: tests/ci_profile.rs refuses any step-level
+# `if:` in these jobs, and an upload worth having is `if: always()`. A
+# failure still prints the tail of its log into this log. #264 tracks
+# narrowing that guard so the whole file can be kept.
+
 on:
   push:
     branches: [main]
@@ -7,180 +53,230 @@ on:
   pull_request:
     branches: [main]
 
+concurrency:
+  group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  CHORE_VERSION: "0.11.0"
+
 jobs:
-  test:
-    name: test-${{ matrix.arch }}
-    runs-on: ${{ matrix.os }}
-    strategy:
-      matrix:
-        include:
-          - arch: x86_64
-            os: ubuntu-24.04
-          - arch: aarch64
-            os: ubuntu-24.04-arm
+  unit:
+    name: unit (no tools, no fixtures)
+    runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      # Anonymous HTTPS clone — rust-fs-core is public.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        # Pinned (CHORE_VERSION) and checked against the release's
+        # checksums: the siblings, the tools and the tests all come
+        # through it.
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        # rust-fs-core (the path dependency) and fs-linux-test-harness, at
+        # the refs pinned in chores.yml.
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
         with:
           components: rustfmt, clippy
-      - name: Install native ext4 fixture tools
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq acl attr e2fsprogs fdisk util-linux
-      - name: Cache cargo registry
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-${{ matrix.arch }}-cargo-${{ hashFiles('**/Cargo.lock') }}
-      - name: Generate test disks
-        run: sudo bash test-disks/build-ext4-feature-images-native-linux.sh
-      - run: cargo fmt --check
-      - run: cargo clippy --locked --all-targets -- -D warnings
-      - run: cargo test --locked --release
-
-      # AND ONCE WITHOUT `--release` -- THE PR GATE COULD NOT SEE AN
-      # OVERFLOW OTHERWISE.
-      #
-      # overflow-checks defaults on in [profile.dev] and off in
-      # [profile.release]; Cargo.toml's [profile.release] carries lto,
-      # codegen-units, opt-level and panic only, no override. So the run
-      # above wraps a bad addition silently and reports success. This
-      # repository already has a debug run -- release.yml:59, `cargo test
-      # --locked --all-targets` -- but that workflow triggers on a
-      # version TAG, not a pull request, so a wrapping defect merges
-      # green here and only surfaces days later, detached from the
-      # change and the reviewer who could have caught it, when someone
-      # else cuts the next release. See rust-fs-ext4#109.
-      #
-      # `--lib --bins`: the library's unit tests, and the unit tests of
-      # the `mkfs_ext4` binary, which is a separate target `--lib` never
-      # built -- so its tests ran only in the release run above, where an
-      # overflow wraps silently (#170). Not `--all-targets`: the
-      # integration targets need the test-disks images and are the reason
-      # this job is long, and running them in debug too is a separate
-      # decision with a cost to argue. `EXPECT_OVERFLOW_CHECKS=1`
-      # tells `overflow_checks::the_build_the_gate_asked_to_check_does_check`
-      # in src/lib.rs that this is the run that must trap an overflow --
-      # asking the build directly rather than inferring it from which
-      # spellings of "disabled" happen to be absent from Cargo.toml. Do
-      # not remove this as a duplicate of the line above it, and do not
-      # drop the variable from it: tests/ci_profile.rs asserts that
-      # ci.yml -- this workflow specifically, not release.yml -- still
-      # runs a `cargo test` without `--release` that sets it, and says
-      # why release.yml having one is not enough.
-      - run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib --bins
-
-      # The shell that manages the oracle VM is not covered by `cargo
-      # test`, and its defects are the expensive kind: a slot that frees
-      # a lock being taken lets two 4 GB machines boot at once. Run every
-      # script here by glob, so a test added later needs no workflow
-      # change to be seen -- a guard that has to be registered somewhere
-      # else is a guard that gets silently skipped.
-      - name: VM slot and teardown semantics
+          key: ${{ runner.os }}-unit-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: No fixtures are present
         run: |
           set -euo pipefail
-          for t in tests/scripts/*.sh; do
-            echo "::group::$t"
-            bash "$t"
-            echo "::endgroup::"
-          done
+          if ls test-disks/*.img >/dev/null 2>&1; then
+            echo "::error::test-disks/ has images; this job must prove the unit tier needs none"
+            exit 1
+          fi
+      - name: chore test:unit
+        run: chore test:unit
 
-      # This whole job runs natively on both standard Linux architectures.
-      # Cross-target `cargo check` caught type errors, but it could not run
-      # clippy with aarch64's unsigned c_char, boot the matching Linux oracle,
-      # or exercise any filesystem I/O on the architecture DiskJockey ships.
-
-  # Validate the mkfs_ext4 CLI binary's output by running the kernel's own
-  # fsck.ext4 (from e2fsprogs) against an image we generated. This is the
-  # canonical "does Linux think this is a valid ext4 volume?" check — much
-  # stricter than our own crate's read-path round-trip because it exercises
-  # every assertion in e2fsck's superblock + group-descriptor + inode-table
-  # validation, including the metadata-csum verification.
-  #
-  # Runs on every PR + push so a regression in the mkfs path is caught
-  # before the binary ships to a tag. There's no Windows equivalent for
-  # ext4 because Windows chkdsk doesn't speak ext4.
-  validate-mkfs-bin:
-    name: validate mkfs_ext4 (fsck.ext4 strict)
-    runs-on: ubuntu-latest
+  fixtures:
+    name: fixtures (harness VM, x86_64 KVM)
+    runs-on: ubuntu-24.04
+    timeout-minutes: 60
     steps:
       - uses: actions/checkout@v4
-      # The crate has a path dep on am-fs-core (../rust-fs-core).
-      # Clone the sibling repo alongside so cargo can resolve it.
-      - name: Clone sibling rust-fs-core
-        run: git clone --depth 1 --branch v0.2.10 https://github.com/antimatter-studios/rust-fs-core.git ../rust-fs-core
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore fixtures
+        run: chore fixtures
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+      - uses: actions/upload-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks/*.img
+          if-no-files-found: error
+          retention-days: 7
+
+  test:
+    name: test (x86_64, oracles in the VM)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
       - name: Install Rust
         uses: dtolnay/rust-toolchain@stable
-      - name: Install e2fsprogs
-        run: |
-          sudo apt-get update -qq
-          sudo apt-get install -y -qq e2fsprogs
-      - name: Cache cargo registry
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
         uses: actions/cache@v4
         with:
           path: |
             ~/.cargo/registry
             ~/.cargo/git
             target
-          key: ${{ runner.os }}-cargo-mkfs-${{ hashFiles('**/Cargo.lock') }}
-      - name: Build mkfs_ext4
-        run: cargo build --locked --release --bin mkfs_ext4
-      # 32 MiB at the default 4 KiB block size is one block group.
-      - name: Format 32 MiB image and validate with fsck.ext4
+          key: ${{ runner.os }}-x86_64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - name: chore tools
+        run: chore tools
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # THE EVIDENCE, NOT THE CLAIM. e2fsprogs cannot be removed from an
+      # Ubuntu runner — it is essential — so instead every one of its
+      # programs is replaced with a stub that fails loudly. Nothing this
+      # job runs may use them: the tools belong to the guest, and a test
+      # that reached for one here would turn the run red with a message
+      # saying so, rather than quietly passing on the wrong version.
+      - name: Make the runner's own e2fsprogs unusable
         run: |
-          truncate -s 32M /tmp/out.img
-          ./target/release/mkfs_ext4 -L CITEST -U deadbeef-cafe-1234-5678-0123456789ab /tmp/out.img
-          # -f forces a check even if FS thinks it's clean; -n declines
-          # any repair offer (so this is read-only and exits non-zero
-          # if anything is wrong rather than silently auto-fixing).
-          fsck.ext4 -fnv /tmp/out.img
-      # Every real-world volume this formatter writes is multi-group, and for
-      # a long time none of that code had faced fsck: the backup superblock +
-      # GDT loop, the s_block_group_nr patch and its checksum recompute, the
-      # short-final-group bitmap padding and the cross-group free-block
-      # accumulation were checked only by this crate's own reader, which
-      # trusts the counters it is shown and cannot see a wrong checksum.
-      #
-      # 320 MiB / 4 KiB = three groups with a half-length tail; 640 MiB = five
-      # whole groups, the smallest count that reaches past "groups 0 and 1"
-      # into the sparse-super powers-of-3/5/7 rule (backups in 0, 1 and 3).
-      # Both images are sparse, so the runner pays for the ~2 MiB of metadata
-      # per group and nothing else.
-      - name: Format multi-group images and validate with fsck.ext4
+          set -eu
+          for tool in debugfs dumpe2fs e2fsck fsck.ext4 mke2fs mkfs.ext4 tune2fs resize2fs; do
+            path="$(command -v "$tool" 2>/dev/null || true)"
+            [ -n "$path" ] || continue
+            sudo mv "$path" "$path.host-copy"
+            printf '#!/bin/sh\necho "::error::%s ran on the runner; the oracle tools belong in the VM" >&2\nexit 97\n' \
+              "$tool" | sudo tee "$path" >/dev/null
+            sudo chmod +x "$path"
+            echo "poisoned $path"
+          done
+      - name: chore lint
+        run: chore lint
+      - name: chore test
+        run: chore test
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+
+  test-arm64:
+    name: test (aarch64, no KVM on this runner)
+    needs: fixtures
+    runs-on: ubuntu-24.04-arm
+    timeout-minutes: 60
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: Install Rust
+        uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt, clippy
+      - name: Cache cargo
+        uses: actions/cache@v4
+        with:
+          path: |
+            ~/.cargo/registry
+            ~/.cargo/git
+            target
+          key: ${{ runner.os }}-aarch64-cargo-${{ hashFiles('**/Cargo.lock') }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      - name: chore lint
+        run: chore lint
+      - name: chore test:unit
+        run: chore test:unit
+      # Everything that reads a fixture but needs no VM. The oracle and
+      # kernel tiers cannot run here — GitHub's arm64 runners have no
+      # /dev/kvm — and they are not architecture-specific: they read the
+      # same bytes the x86_64 job's guest reads.
+      - name: chore test:images
+        run: chore test:images
+
+  suite-in-vm:
+    name: suite in the guest (the macOS path)
+    needs: fixtures
+    runs-on: ubuntu-24.04
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install chore
+        run: scripts/ci-install-chore.sh
+      - name: chore siblings
+        run: chore siblings
+      - name: KVM, QEMU and Vagrant
+        id: vm-host
+        run: ../fs-linux-test-harness/scripts/ci-setup-linux.sh
+      - name: Cache the Vagrant box
+        uses: actions/cache@v4
+        with:
+          path: ~/.vagrant.d/boxes
+          key: ${{ steps.vm-host.outputs.box-cache-key }}
+      - uses: actions/download-artifact@v4
+        with:
+          name: fixtures
+          path: test-disks
+      # No Rust on the runner: the toolchain that matters is the one the
+      # guest installs from rust-toolchain.toml. That is the point of the
+      # job — on a Mac there is no usable host toolchain for these tests
+      # either.
+      - name: chore test:vm
+        run: chore test:vm
+      - name: chore vm:status (the VM is down again)
+        run: '! chore vm:status'
+
+  ci-ok:
+    name: ci-ok
+    if: always()
+    needs: [unit, fixtures, test, test-arm64, suite-in-vm]
+    runs-on: ubuntu-latest
+    steps:
+      - name: Every job ran and succeeded
+        env:
+          NEEDS: ${{ toJSON(needs) }}
         run: |
-          truncate -s 320M /tmp/mg3.img
-          truncate -s 640M /tmp/mg5.img
-          ./target/release/mkfs_ext4 -L CIMULTI3 /tmp/mg3.img
-          ./target/release/mkfs_ext4 -L CIMULTI5 /tmp/mg5.img
-          fsck.ext4 -fnv /tmp/mg3.img
-          fsck.ext4 -fnv /tmp/mg5.img
-          # Open each one through a BACKUP superblock too. The primary is
-          # what the checks above read; -b points fsck at a backup instead,
-          # so its s_block_group_nr and its recomputed checksum have to be
-          # right or the open fails outright. Block 32768 is group 1 and
-          # block 98304 is group 3, at 4 KiB blocks.
-          fsck.ext4 -fn -b 32768 -B 4096 /tmp/mg3.img
-          fsck.ext4 -fn -b 32768 -B 4096 /tmp/mg5.img
-          fsck.ext4 -fn -b 98304 -B 4096 /tmp/mg5.img
-          # The group table is where a short final group shows up: group 2 of
-          # mg3.img must end at the last block of the device (81919), not at
-          # a full group boundary.
-          dumpe2fs /tmp/mg3.img | grep -E '^Group [0-9]+:'
-          dumpe2fs /tmp/mg3.img | grep -q 'Group 2: (Blocks 65536-81919)'
-      - name: Verify volume label and UUID round-tripped
-        run: |
-          # tune2fs prints the on-disk superblock metadata; grep confirms
-          # the CLI args propagated to the bytes fsck just validated.
-          tune2fs -l /tmp/out.img > /tmp/sb.txt
-          cat /tmp/sb.txt
-          grep -q "Filesystem volume name:.*CITEST" /tmp/sb.txt
-          grep -qi "Filesystem UUID:.*deadbeef-cafe-1234-5678-0123456789ab" /tmp/sb.txt
+          set -euo pipefail
+          echo "$NEEDS" | jq -r 'to_entries[] | "\(.key): \(.value.result)"'
+          bad="$(echo "$NEEDS" | jq -r '[to_entries[] | select(.value.result != "success") | .key] | join(", ")')"
+          if [ -n "$bad" ]; then
+            echo "::error::not green: $bad (failed, cancelled or skipped)"
+            exit 1
+          fi
+          echo "all required jobs succeeded"

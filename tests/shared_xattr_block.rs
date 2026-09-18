@@ -16,39 +16,37 @@
 //! pointed at the same block, with its `i_blocks` raised by the block and
 //! the block's count set to 2, all checksums restamped. `e2fsck -fn` must
 //! accept that before anything is done to it, and after each operation on
-//! `/a`, and `/b` must still read its attribute. Skips without e2fsprogs.
+//! `/a`, and `/b` must still read its attribute. Fails without e2fsprogs
+//! (they run in the harness VM).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
 const NAME: &str = "user.shared";
 
-fn mkfs(tag: &str) -> Option<String> {
-    let mkfs = ["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())?;
+fn mkfs(tag: &str) -> String {
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_shared_xattr_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-I", "256"])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 fn e2fsck_clean(path: &str, what: &str) {
-    let out = Command::new("e2fsck").args(["-fn", path]).output().unwrap();
+    let out = fs_ext4_test_support::oracle("e2fsck")
+        .args(["-fn", path])
+        .output();
     assert!(
         out.status.success(),
         "[{what}] e2fsck -fn rejected the volume:\n{}",
@@ -80,8 +78,8 @@ fn attribute(fs: &Filesystem, path: &str) -> Option<Vec<u8>> {
 
 /// `/a` and `/b` sharing one external xattr block that holds `NAME`.
 /// `share` false leaves `/b` without it, and the block `/a`'s alone.
-fn volume(tag: &str, share: bool) -> Option<String> {
-    let path = mkfs(tag)?;
+fn volume(tag: &str, share: bool) -> String {
+    let path = mkfs(tag);
     let value = vec![b'v'; 600];
     let fs = mount(&path);
     fs.apply_create("/a", 0o644).unwrap();
@@ -116,7 +114,7 @@ fn volume(tag: &str, share: bool) -> Option<String> {
     if share {
         assert_eq!(attribute(&mount(&path), "/b").as_deref(), Some(&value[..]));
     }
-    Some(path)
+    path
 }
 
 fn b_keeps_its_attribute(path: &str, what: &str) {
@@ -130,9 +128,7 @@ fn b_keeps_its_attribute(path: &str, what: &str) {
 
 #[test]
 fn setting_an_attribute_on_one_inode_leaves_the_other_alone() {
-    let Some(path) = volume("set", true) else {
-        return;
-    };
+    let path = volume("set", true);
     mount(&path)
         .apply_setxattr("/a", NAME, &[b'w'; 700])
         .expect("setxattr");
@@ -142,9 +138,7 @@ fn setting_an_attribute_on_one_inode_leaves_the_other_alone() {
 
 #[test]
 fn removing_an_attribute_from_one_inode_leaves_the_other_alone() {
-    let Some(path) = volume("remove", true) else {
-        return;
-    };
+    let path = volume("remove", true);
     mount(&path)
         .apply_removexattr("/a", NAME)
         .expect("removexattr");
@@ -154,18 +148,14 @@ fn removing_an_attribute_from_one_inode_leaves_the_other_alone() {
 
 #[test]
 fn unlinking_one_inode_leaves_the_other_its_attribute() {
-    let Some(path) = volume("unlink_shared", true) else {
-        return;
-    };
+    let path = volume("unlink_shared", true);
     mount(&path).apply_unlink("/a").expect("unlink");
     b_keeps_its_attribute(&path, "unlink_shared");
 }
 
 #[test]
 fn unlinking_the_only_inode_frees_its_block() {
-    let Some(path) = volume("unlink_alone", false) else {
-        return;
-    };
+    let path = volume("unlink_alone", false);
     mount(&path).apply_unlink("/a").expect("unlink");
     e2fsck_clean(&path, "unlink_alone");
 }

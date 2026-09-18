@@ -8,20 +8,13 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst = fs_ext4_test_support::temp_path!("fs_ext4_pz_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
@@ -31,9 +24,7 @@ fn resolve(fs: &Filesystem, path: &str) -> u32 {
 
 #[test]
 fn punch_hole_frees_fully_covered_extent() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "punch_full") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "punch_full");
 
     // Set up: empty the file, then preallocate 4 blocks via fallocate
     // KEEP_SIZE so we have a known single-extent layout.
@@ -84,9 +75,7 @@ fn punch_hole_frees_fully_covered_extent() {
 
 #[test]
 fn punch_hole_in_middle_splits_extent() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "punch_mid") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "punch_mid");
 
     // Preallocate 8 blocks (32 KiB) so we have room for a middle punch.
     {
@@ -126,9 +115,7 @@ fn punch_hole_in_middle_splits_extent() {
 
 #[test]
 fn zero_range_combines_punch_and_uninit_alloc() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "zero") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "zero");
 
     // Preallocate 4 blocks, write known bytes (well, can't write —
     // just verify zero_range produces extents with the uninit flag and
@@ -166,9 +153,7 @@ fn zero_range_combines_punch_and_uninit_alloc() {
 
 #[test]
 fn punch_zero_len_is_noop() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "punch_noop") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "punch_noop");
     let dev = FileDevice::open_rw(&path).expect("rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let ino = resolve(&fs, "/test.txt");

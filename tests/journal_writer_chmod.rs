@@ -11,22 +11,15 @@ use fs_ext4::{bgd, Filesystem};
 use std::fs;
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_jw_chmod_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
@@ -46,9 +39,7 @@ fn build_inode_table_block(fs: &Filesystem, ino: u32, new_raw: &[u8]) -> (u64, V
 
 #[test]
 fn journaled_chmod_round_trips_through_writer() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "rt") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "rt");
 
     let new_mode_bits = 0o644u16;
     let original_mode_full;
@@ -56,11 +47,9 @@ fn journaled_chmod_round_trips_through_writer() {
     {
         let dev = FileDevice::open_rw(&path).expect("open rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        let Some(mut jw) = JournalWriter::open(&fs).expect("open writer") else {
-            // Image has no journal — skip; the journal_writer path is moot.
-            fs::remove_file(path).ok();
-            return;
-        };
+        let mut jw = JournalWriter::open(&fs)
+            .expect("open writer")
+            .expect("ext4-basic.img is built with has_journal");
 
         let ino = resolve(&fs, "/test.txt");
         let (inode, mut raw) = fs.read_inode_verified(ino).expect("read inode");
@@ -102,9 +91,9 @@ fn journaled_chmod_round_trips_through_writer() {
 
     // Journal must be back to clean (start = 0) after the protocol's
     // step 4. Re-open the writer and check the cached jsb.
-    let Some(jw) = JournalWriter::open(&fs).expect("reopen") else {
-        return;
-    };
+    let jw = JournalWriter::open(&fs)
+        .expect("reopen")
+        .expect("ext4-basic.img is built with has_journal");
     // Can't peek at jw.jsb directly (private); instead re-read jbd2 sb via
     // the public reader.
     let jsb = fs_ext4::jbd2::read_superblock(&fs)
@@ -122,15 +111,12 @@ fn journaled_chmod_round_trips_through_writer() {
 
 #[test]
 fn journaled_writer_advances_sequence_per_commit() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "seq") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "seq");
     let dev = FileDevice::open_rw(&path).expect("open rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-    let Some(mut jw) = JournalWriter::open(&fs).expect("open writer") else {
-        fs::remove_file(path).ok();
-        return;
-    };
+    let mut jw = JournalWriter::open(&fs)
+        .expect("open writer")
+        .expect("ext4-basic.img is built with has_journal");
 
     let initial_seq = fs_ext4::jbd2::read_superblock(&fs)
         .expect("jsb")
@@ -163,20 +149,15 @@ fn production_apply_chmod_advances_journal_sequence() {
     // through the journal writer (not the unjournaled fallback). If the
     // journal-wired path gets accidentally bypassed, jsb.sequence stops
     // advancing and this test fires.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "prod_seq") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "prod_seq");
 
     let seq_before;
     {
         let dev = FileDevice::open(&path).expect("open ro");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        let Some(jsb) = fs_ext4::jbd2::read_superblock(&fs).expect("jsb read") else {
-            // No journal in this image — production chmod uses the
-            // unjournaled fallback; this test isn't applicable.
-            fs::remove_file(path).ok();
-            return;
-        };
+        let jsb = fs_ext4::jbd2::read_superblock(&fs)
+            .expect("jsb read")
+            .expect("ext4-basic.img is built with has_journal");
         seq_before = jsb.sequence;
     }
 
@@ -209,19 +190,16 @@ fn replay_restores_chmod_when_checkpoint_skipped() {
     // remount, the existing replay path should pick up the journaled
     // inode-table block and apply it. This is the crash-safety property
     // the four-fence protocol exists to guarantee.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "replay") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "replay");
     let new_mode_bits = 0o600u16;
     let original_mode_full;
 
     {
         let dev = FileDevice::open_rw(&path).expect("open rw");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-        let Some(mut jw) = JournalWriter::open(&fs).expect("open writer") else {
-            fs::remove_file(path).ok();
-            return;
-        };
+        let mut jw = JournalWriter::open(&fs)
+            .expect("open writer")
+            .expect("ext4-basic.img is built with has_journal");
         let ino = resolve(&fs, "/test.txt");
         let (inode, mut raw) = fs.read_inode_verified(ino).expect("read inode");
         original_mode_full = inode.mode;

@@ -25,23 +25,16 @@ use std::fs;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, slot: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, slot: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst = fs_ext4_test_support::temp_path!(
         "fs_ext4_wrong_dotdot_{}_{slot}_{n}.img",
         std::process::id()
     );
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 /// Find the on-disk byte offset of a dirent matching `name` inside
@@ -139,10 +132,7 @@ fn fix_dir_csum_after_poke(image_path: &str, fs: &Filesystem, dir_ino: u32, phys
 /// actual_parent = root).
 #[test]
 fn audit_flags_wrong_dotdot_on_non_root_dir() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "wrongdotdot") else {
-        eprintln!("skip: ext4-basic.img not present");
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "wrongdotdot");
 
     let subdir_ino;
     {

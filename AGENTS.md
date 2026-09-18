@@ -21,19 +21,58 @@ It points at the existing docs rather than duplicating them:
 
 ## Running tests
 
+The tasks are the interface; CI runs exactly these (`chores.yml` has the
+contract at its top):
+
 ```sh
-./scripts/test.sh            # full suite (lib + integration). ~700 tests.
-./scripts/test.sh --test <name> # one integration binary, e.g. repro_wants_dir_symlinks
-cargo clippy --all-targets -- -D warnings   # what the pre-commit hook runs
+chore siblings        # ../rust-fs-core and ../fs-linux-test-harness at their pinned refs
+chore tools           # what the HOST needs: ripgrep, and the VM (Vagrant/QEMU/KVM)
+chore fixtures        # build test-disks/*.img in the fs-linux-test-harness VM
+chore test:unit       # no tools, no fixtures, no VM (debug; traps overflows)
+chore test:images     # reads a fixture, needs no VM
+chore test:oracle     # e2fsck / debugfs / mke2fs — run INSIDE the VM
+chore test:kernel     # the real kernel loop-mounts our images and reads them back
+chore test:vm         # the whole suite, compiled and run INSIDE the VM
+chore test            # everything, as CI runs it
+chore lint            # fmt + clippy -D warnings
+
+./scripts/test.sh --test <name>   # one integration binary, e.g. repro_wants_dir_symlinks
 ```
 
-Use `scripts/test.sh` for local runs: it selects a platform-aware, per-run
-scratch directory and cleans it afterward. In particular, Raspberry Pi runs
-use this worktree's `./tmp` (normally the NVMe checkout) rather than the SD
-card-backed system temporary directory. GitHub Actions uses `RUNNER_TEMP` when
-available; macOS and ordinary hosts use their environment-provided temporary root.
-Override the managed base with `FS_EXT4_TEST_TMP_BASE`, or provide a
-caller-managed exact directory with `FS_EXT4_TEST_TMPDIR`.
+**The oracle tools are never run on the host.** Not on a Mac, not on
+Linux, not even where they are installed. e2fsprogs on a workstation is
+whatever that machine has, and an oracle whose answer depends on the
+machine is not an oracle — so they live in one Debian guest
+(`scripts/vm-setup.sh` installs them) and `fs_ext4_test_support::oracle`
+is the only way in. `tests/test_contract.rs` fails the suite if a test
+spawns one itself, drives the VM itself, or mounts anything on the host.
+The VM boots once per run (the first oracle call), every later call rides
+one shared SSH connection (~0.1 s per tool invocation), and the chore
+reaper stops it when the invocation ends.
+
+**We run the Linux tests on Linux.** On a Linux host `chore test` runs
+them here; on macOS it runs `chore test:vm`, which builds and runs the
+same sources inside the guest (the harness mounts the repository there at
+the path the host knows it by). Nothing Linux-shaped runs natively on a
+Mac.
+
+**Nothing skips.** A test that needs a fixture gets it from
+`fs_ext4_test_support::fixture`, one that needs a tool from `oracle` /
+`assert_e2fsck_clean`, one that needs the kernel from the guest-kernel
+helpers; all of them fail, naming the task that provides it, when it is
+missing. Never add an early return for a missing image, tool or VM: a
+skipped test reads exactly like a passing one.
+`scripts/test-targets.sh` derives the tiers from those calls; a library
+test that needs a fixture or the VM goes in a `needs_host` module so
+`chore test:unit` can leave it to `chore test`.
+
+Use `scripts/test.sh` for local runs: it gives every run its own scratch
+directory and cleans it afterward. **That directory is inside the
+repository** (`./tmp`, gitignored) on every machine, because the guest
+sees this repository and nothing else of the host — an image under `/tmp`
+or `$RUNNER_TEMP` would not exist for the tool asked to read it.
+`FS_EXT4_TEST_TMPDIR` names an exact directory instead, and is refused if
+it is outside the repository.
 
 Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
 `cargo fmt --check` + `cargo clippy -D warnings` on every commit).
@@ -64,83 +103,56 @@ A bad-but-marked-clean checksum passes it. For checksum bugs, either recompute
 the specific checksum in-process (jsb example above) or cross-check with a real
 ext4 (below).
 
-## The oracle VM
-
-`e2fsck`, `mkfs.ext4` and the in-kernel ext4 driver are Linux-only, so
-on macOS they live in a Debian arm64 VM under QEMU with HVF — hardware
-accelerated, unlike the x86_64 Alpine guest it replaced, which meant
-full CPU emulation for every check on Apple Silicon.
-
-```sh
-./scripts/vm.sh up                       # boot; idempotent
-./scripts/vm-e2fsck.sh <image>...        # e2fsck -fn each image
-./scripts/vm.sh run <cmd>                # arbitrary command in the guest
-./scripts/vm.sh down                     # halt; next `up` is fast
-```
-
-The VM stays up between invocations on purpose: booting is the slow
-part, so an iterate-and-check loop should pay it once. A check costs
-about 6 seconds once the VM is warm.
-
-Two traps, both already paid for by the sibling drivers:
-
-1. **Never set `config.notify_forwarder.enable = false`.** The plugin's
-   `up` hook truncates the QEMU boot chain — the VM imports and then
-   never boots, printing no error at all.
-2. **`qe.virtiofs_guest_uid`/`gid` must match the box's `vagrant` user**
-   (1001 here, not the plugin's 1000 default), or the shared folder is
-   read-only to the guest and every fixture write fails with a bare
-   permission error.
-
-Ports are per-crate so several oracle VMs can run at once: xfs 50122,
-btrfs 50123, ext4 50124.
-
-## Cross-validation: the real-ext4 oracle (use this for checksum/layout bugs)
+## The oracles: e2fsprogs and the kernel, both in the harness VM
 
 The driver shares this crate's spec interpretation, so its own
 `verify::verify` / `fsck::audit` (structural: link counts, dirents, free-count
-drift) **cannot** catch metadata_csum / journal-checksum / `itable_unused` bugs.
-A **real Linux `e2fsck`** can. The repo's verification options:
+drift) **cannot** catch metadata_csum / journal-checksum / `itable_unused` bugs,
+and no reader of ours can prove the bytes it wrote are the bytes on disk.
+Independent tools can:
 
-- **Alpine QEMU VM** (`test-disks/build-ext4-feature-images.sh`, `_vm-builder.sh`,
-  cached under `.vm-cache/`) — real Linux `mke2fs` + `e2fsprogs`. **This is the
-  oracle.** It builds the fixtures and can `e2fsck` any image. No host
-  `e2fsprogs` needed; no Docker. The guest follows the host ISA by default
-  (x86_64 or aarch64) and requires KVM/HVF; slow TCG needs the explicit
-  `EXT4_VM_ALLOW_TCG=1` diagnostic override. CI is already Linux, so its x86_64
-  and ARM64 jobs run `_vm-builder.sh` directly through
-  `build-ext4-feature-images-native-linux.sh`, without nested virtualisation.
+- **`e2fsck -fn`** — consistency. `assert_e2fsck_clean(image, tag)` in the
+  test support crate. Exit `0` clean, `4` errors left uncorrected, `8`
+  operational error, `12` cannot proceed (e.g. a corrupt journal superblock).
+- **`debugfs`** — content and metadata: `dump` + compare, `stat`, `ex`,
+  `icheck`, `ncheck`, `logdump`. `tests/oracle_debugfs.rs` is the template,
+  including the negative case that proves why both are needed (a flipped
+  data byte passes e2fsck and fails the dump comparison).
+  Both are reached through `fs_ext4_test_support::oracle(tool)`, which runs
+  them in the guest and returns the tool's own `Output` — same exit status,
+  same streams, no host path to fall back to.
+- **The kernel itself**, through `guest_kernel_report` /
+  `guest_kernel_write` in the test support crate: our image is loop-mounted
+  in the guest and a script walks it, hashes every file and reads xattrs
+  and ACLs back in ONE guest call. `tests/kernel_readback.rs` (Rust API),
+  `tests/kernel_readback_capi.rs` (C ABI). This is what catches what
+  `e2fsck` cannot — an ACL blob with the wrong version, an extent the
+  kernel maps shorter than we wrote it — and it is the only place a
+  filesystem is mounted at all.
+- **The fixtures** are kernel-made the same way: `chore fixtures` runs
+  `test-disks/guest-build-images.sh` as root in the guest (loop mounts,
+  xattrs, ACLs, inline data, htree directories) through the
+  [fs-linux-test-harness](https://github.com/antimatter-studios/fs-linux-test-harness)
+  VM, whose tooling `scripts/vm-setup.sh` installs. For anything else in
+  the guest: `chore vm:run -- <command>`, `chore vm:exec -- <command>` (the
+  fast path, for a VM that is already up), `chore vm:put <file>` (lands in
+  `/share`), `chore vm:down`. One VM runs at a time across every repository
+  on the machine; `chore vm:slot:status` says who has it.
 - `scripts/cross-validate-lwext4.sh` + `tests/lwext4_cross_validate.rs` —
-  independent C impl, opt-in (`LWEXT4_DIR`); currently a **read-only skeleton**.
+  an independent C implementation; **not implemented yet** (#99), so its one
+  test is `#[ignore]`d and fails when run.
 - `tests/{qemu,vagrant}/freebsd/` — a real kernel, but FreeBSD's ext4 validates
   JBD2 differently from Linux; not pre-built.
 
-### Recipe: `e2fsck` a driver-mutated image in the Alpine VM
-
-`scripts/vm-e2fsck.sh <image>...` does this end-to-end. The mechanics + the
-traps that cost time:
+To check a driver-mutated image by hand, ask the guest — the tools are
+there, and it sees this repository at the same path the host does:
 
 ```sh
-# boot (server mode): SSH on localhost:2222, key .vm-cache/builder-key,
-# the dir in HOST_IMAGE_DIR is 9p-shared at /host inside the VM.
-HOST_IMAGE_DIR=/path/to/dir bash test-disks/build-ext4-feature-images.sh --server > boot.log 2>&1
-source test-disks/.vm-cache/server.env   # EXT4_BUILDER_PORT / _KEY / _PID
-ssh -i "$EXT4_BUILDER_KEY" -p "$EXT4_BUILDER_PORT" -o StrictHostKeyChecking=no \
-    -o UserKnownHostsFile=/dev/null -o ConnectTimeout=10 -o BatchMode=yes \
-    -o ServerAliveInterval=5 -o ServerAliveCountMax=2 root@localhost \
-    'e2fsck -fn /host/<image>' </dev/null
-kill "$EXT4_BUILDER_PID"                  # teardown
+chore vm:up                                   # boot and hold it
+chore vm:run -- e2fsck -fn "$PWD/tmp/x.img"
+chore vm:run -- debugfs -R "'stat /path'" "$PWD/tmp/x.img"
+chore vm:down
 ```
-
-Traps (all hit during the metadata_csum fix series):
-- **Do NOT pipe the boot script through `tail`/`head`** — qemu inherits its
-  stdout, so the pipe reader never sees EOF and hangs. Redirect to a file.
-- The shell here is **zsh**: `$SSH` as a string does **not** word-split — call
-  `ssh` directly with an args array, or it becomes one "command not found" arg.
-- Wrap each ssh in `timeout` + use `ServerAlive*`: `ConnectTimeout` bounds only
-  the TCP connect, not a post-connect stall.
-- e2fsck exit: `0` clean, `4` errors-left-uncorrected, `8` op error, `12`
-  "cannot proceed" (e.g. corrupt journal superblock).
 
 ## Build environment
 
@@ -155,7 +167,7 @@ Traps (all hit during the metadata_csum fix series):
 A real bug surfaced from the field (a Bookworm SD card whose journal the kernel
 rejected after a write). Reproduced with `tests/repro_wants_dir_symlinks.rs` on
 `ext4-csum-seed.img`, then fixed as a stack, each step proven red→green with
-the Alpine-VM `e2fsck` and the full baseline:
+a real `e2fsck` and the full baseline:
 
 1. **jbd2 superblock checksum** not recomputed in `journal_writer::write_jsb`.
 2. **`bg_itable_unused`** not maintained on inode alloc (`buffer_mark_inode_used`).

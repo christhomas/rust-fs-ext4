@@ -8,39 +8,28 @@
 //! rename all wrote the entry.
 //!
 //! Volumes come from `mkfs.ext4`, and `e2fsck -fn` must accept each one after
-//! the refused operation. Skips without e2fsprogs.
+//! the refused operation. The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
-/// An e2fsprogs tool by absolute path, as the other integration tests find
-/// them: it may be installed outside `PATH`.
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
-
-fn mkfs(tag: &str) -> Option<String> {
-    let mkfs = tool("mkfs.ext4")?;
+fn mkfs(tag: &str) -> String {
+    let mkfs = "mkfs.ext4";
     let path = fs_ext4_test_support::temp_path!("fs_ext4_nul_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-b", "4096"])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 #[test]
@@ -58,15 +47,9 @@ fn a_name_holding_a_nul_byte_is_refused() {
         ("link", |fs| fs.apply_link("/f", "/a\0b")),
         ("rename", |fs| fs.apply_rename("/f", "/a\0b", false)),
     ];
-    let Some(e2fsck) = tool("e2fsck") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let e2fsck = "e2fsck";
     for (tag, op) in ops {
-        let Some(path) = mkfs(tag) else {
-            eprintln!("skip: e2fsprogs not installed");
-            return;
-        };
+        let path = mkfs(tag);
         let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&path).unwrap())).unwrap();
         fs.apply_create("/f", 0o644).unwrap();
         let got = op(&fs);
@@ -80,7 +63,9 @@ fn a_name_holding_a_nul_byte_is_refused() {
             ),
             "[{tag}] a name holding a NUL byte was not refused as one: {got:?}"
         );
-        let out = Command::new(&e2fsck).args(["-fn", &path]).output().unwrap();
+        let out = fs_ext4_test_support::oracle(e2fsck)
+            .args(["-fn", &path])
+            .output();
         assert!(
             out.status.success(),
             "[{tag}] e2fsck -fn rejected the volume:\n{}",

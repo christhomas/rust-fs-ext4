@@ -6425,156 +6425,6 @@ impl Filesystem {
 mod tests {
     use super::*;
 
-    /// A run reaching past `blocks_count` into the short final group's
-    /// padding is refused; one ending at the last block is not.
-    #[test]
-    fn a_run_into_the_final_groups_padding_is_refused() {
-        let dir = fs_ext4_test_support::temp_dir()
-            .join(format!("ext4-short-group-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let img = dir.join("s.img");
-        // 16284 blocks at 4096 per group: the last group has 4 blocks and
-        // 4092 bits of padding.
-        std::fs::File::create(&img)
-            .unwrap()
-            .set_len(16284 * 4096)
-            .unwrap();
-        let Ok(made) = std::process::Command::new("mkfs.ext4")
-            .args(["-q", "-F", "-b", "4096", "-g", "4096", "-O", "^has_journal"])
-            .arg(&img)
-            .output()
-        else {
-            eprintln!("no mkfs.ext4 -- skipping");
-            return;
-        };
-        assert!(
-            made.status.success(),
-            "{}",
-            String::from_utf8_lossy(&made.stderr)
-        );
-        let fs = Filesystem::mount(std::sync::Arc::new(
-            crate::block_io::FileDevice::open(img.to_str().unwrap()).unwrap(),
-        ))
-        .unwrap();
-        let last = fs.sb.blocks_count;
-        assert_ne!(
-            (last - u64::from(fs.sb.first_data_block)) % u64::from(fs.sb.blocks_per_group),
-            0,
-            "fixture: the final group is short"
-        );
-        assert!(
-            fs.group_chunks(last - 2, 2).is_ok(),
-            "a run ending at the last block"
-        );
-        assert!(
-            matches!(fs.group_chunks(last - 2, 3), Err(Error::InvalidBlock(_))),
-            "a run one block into the padding"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
-    }
-
-    /// A freed run that crosses a group boundary credits each group its
-    /// own blocks and clears the second group's bits (#118).
-    ///
-    /// Witnessed by the descriptors and the second group's bitmap, not the
-    /// return value or the superblock delta: those are `len` before and
-    /// after the fix alike. Measured before it: group 1 credited 8 and
-    /// group 2 credited 0, its four bits left set. Skips without e2fsprogs.
-    #[test]
-    fn a_freed_run_across_a_group_boundary_credits_both_groups() {
-        let dir = fs_ext4_test_support::temp_dir()
-            .join(format!("ext4-cross-group-{}", std::process::id()));
-        std::fs::create_dir_all(&dir).unwrap();
-        let img = dir.join("g.img");
-        std::fs::File::create(&img)
-            .unwrap()
-            .set_len(64 * 1024 * 1024)
-            .unwrap();
-        let Ok(made) = std::process::Command::new("mkfs.ext4")
-            .args([
-                "-q",
-                "-F",
-                "-b",
-                "4096",
-                "-g",
-                "4096",
-                "-O",
-                "^metadata_csum,^has_journal",
-            ])
-            .arg(&img)
-            .output()
-        else {
-            eprintln!("no mkfs.ext4 -- skipping");
-            return;
-        };
-        assert!(
-            made.status.success(),
-            "{}",
-            String::from_utf8_lossy(&made.stderr)
-        );
-        let path = img.to_str().unwrap().to_owned();
-        let mount = || {
-            Filesystem::mount(std::sync::Arc::new(
-                crate::block_io::FileDevice::open_rw(&path).unwrap(),
-            ))
-            .unwrap()
-        };
-        let boundary = 2 * 4096u64; // group 2 starts here
-        let bit_set = |fs: &Filesystem, gi: usize, bit: u64| {
-            let bm = fs.read_block(fs.groups[gi].block_bitmap).unwrap();
-            bm[(bit / 8) as usize] & (1 << (bit % 8)) != 0
-        };
-
-        // Four blocks either side of the boundary, allocated per group.
-        {
-            let fs = mount();
-            let mut buf = BlockBuffer::new(fs.sb.block_size());
-            fs.buffer_mark_block_run_used(&mut buf, boundary - 4, 4)
-                .unwrap();
-            fs.buffer_mark_block_run_used(&mut buf, boundary, 4)
-                .unwrap();
-            fs.commit_block_buffer(buf).unwrap();
-        }
-        let (free1, free2) = {
-            let fs = mount();
-            assert!(
-                (0..4).all(|b| bit_set(&fs, 2, b)),
-                "fixture: group 2's run is allocated"
-            );
-            (
-                fs.groups[1].free_blocks_count,
-                fs.groups[2].free_blocks_count,
-            )
-        };
-
-        // One run across the boundary, as a merged extent frees it.
-        {
-            let fs = mount();
-            let mut buf = BlockBuffer::new(fs.sb.block_size());
-            assert_eq!(
-                fs.buffer_free_block_run_and_bgd(&mut buf, boundary - 4, 8)
-                    .unwrap(),
-                8
-            );
-            fs.commit_block_buffer(buf).unwrap();
-        }
-        let fs = mount();
-        assert_eq!(
-            (
-                fs.groups[1].free_blocks_count - free1,
-                fs.groups[2].free_blocks_count - free2
-            ),
-            (4, 4),
-            "(group 1 credited, group 2 credited)"
-        );
-        assert!(
-            (0..4).all(|b| !bit_set(&fs, 2, b)),
-            "group 2's blocks are still marked allocated"
-        );
-        drop(fs);
-
-        let _ = std::fs::remove_dir_all(&dir);
-    }
     use crate::inode::{
         EXTRA_ISIZE_DEFAULT, INODE_SIZE_WITH_CRTIME, INODE_SIZE_WITH_EXTRA, OFF_ATIME, OFF_CRTIME,
         OFF_CTIME, OFF_EXTRA_ISIZE, OFF_GENERATION, OFF_MTIME,
@@ -6769,99 +6619,6 @@ mod tests {
         fs.commit_block_buffer(buf).expect("commit");
     }
 
-    /// The case this crate already handled: nothing names the inode any
-    /// more, so recovery really does delete it. Kept as the other half of
-    /// the pair, so the fix for the truncate case cannot be a blanket
-    /// "leave every orphan alone".
-    /// An ext2 orphan's data blocks and indirect blocks go back to the
-    /// free pool with it (#79).
-    ///
-    /// The file is 20 blocks at 4 KiB, so its tree has a single indirect
-    /// block beside the twelve direct pointers. Recovery used to free the
-    /// inode and none of its blocks, and since #201 declined such an
-    /// orphan altogether rather than strand them; either way the blocks
-    /// stayed allocated. After the fix the free count returns to what it
-    /// was before the file was written, and fsck finds nothing.
-    #[test]
-    fn an_indirect_mapped_orphan_frees_its_data_and_indirect_blocks() {
-        const EXT2_VOL: u64 = 32 * 1024 * 1024;
-        let dev = MemDev::new(EXT2_VOL);
-        crate::mkfs::format_filesystem_with_flavor(
-            dev.as_ref(),
-            Some("ext2orph"),
-            None,
-            EXT2_VOL,
-            BS,
-            crate::features::FsFlavor::Ext2,
-        )
-        .expect("format");
-        let (ino, free_before) = {
-            let fs = mount(&dev);
-            let free_before = fs.sb.free_blocks_count;
-            let ino = fs.apply_create("/gone.bin", 0o644).expect("create");
-            fs.apply_replace_file_content("/gone.bin", &vec![0x5A; 20 * BS as usize])
-                .expect("write");
-            let (inode, _) = fs.read_inode_verified(ino).expect("read");
-            assert!(!inode.has_extents(), "fixture: an indirect-mapped file");
-            assert_ne!(
-                u32::from_le_bytes(inode.block[48..52].try_into().unwrap()),
-                0,
-                "fixture: the file uses its single indirect block"
-            );
-            (ino, free_before)
-        };
-        {
-            let fs = mount(&dev);
-            let (root, _) = fs.read_inode_verified(2).expect("root");
-            let mut buf = BlockBuffer::new(fs.sb.block_size());
-            fs.buffer_remove_dir_entry(&mut buf, 2, &root, b"gone.bin")
-                .expect("remove the name");
-            fs.commit_block_buffer(buf).expect("commit");
-            plant_orphan(&fs, ino, 0, None);
-        }
-        // Recovery runs on this mount; the next one observes the result.
-        drop(mount(&dev));
-
-        let fs = mount(&dev);
-        assert!(
-            fs.orphan_list().expect("orphan_list").is_empty(),
-            "recovery must take the orphan off the chain"
-        );
-        assert!(!fs.inode_bit_is_set(ino).expect("inode bitmap"));
-        assert_eq!(
-            fs.sb.free_blocks_count, free_before,
-            "every block the file used -- 20 data and 1 indirect -- must be free again"
-        );
-        let report = crate::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
-        assert!(report.is_clean(), "fsck: {:?}", report.anomalies);
-        drop(fs);
-
-        // And e2fsck, where it is installed: a block left allocated with
-        // nothing mapping it is exactly what its pass 5 reports.
-        if let Some(e2fsck) = ["/usr/sbin/e2fsck", "/sbin/e2fsck", "/usr/bin/e2fsck"]
-            .into_iter()
-            .find(|p| std::path::Path::new(p).exists())
-        {
-            let image = std::env::temp_dir().join(format!(
-                "fs_ext4_indirect_orphan_{}.img",
-                std::process::id()
-            ));
-            std::fs::write(&image, &*dev.bytes.lock().unwrap()).unwrap();
-            let out = std::process::Command::new(e2fsck)
-                .arg("-fn")
-                .arg(&image)
-                .output()
-                .expect("run e2fsck");
-            let _ = std::fs::remove_file(&image);
-            assert!(
-                out.status.success(),
-                "e2fsck -fn:\n{}{}",
-                String::from_utf8_lossy(&out.stdout),
-                String::from_utf8_lossy(&out.stderr)
-            );
-        }
-    }
-
     /// `s_state` straight off the device, as another handle -- or `e2fsck`
     /// -- would read it.
     fn on_disk_state(dev: &std::sync::Arc<MemDev>) -> u16 {
@@ -6935,6 +6692,10 @@ mod tests {
         assert_eq!(on_disk_state(&dev) & EXT4_VALID_FS, 0);
     }
 
+    /// The case this crate already handled: nothing names the inode any
+    /// more, so recovery really does delete it. Kept as the other half of
+    /// the pair, so the fix for the truncate case cannot be a blanket
+    /// "leave every orphan alone".
     #[test]
     fn an_orphan_with_no_links_is_still_reclaimed() {
         let dev = formatted();
@@ -8477,5 +8238,237 @@ mod tests {
             "i_file_acl_lo (0x68..0x6C) should also be written exactly once, by the same \
              function. Found: {file_acl_lo:?}"
         );
+    }
+
+    /// Tests that run an oracle tool (they run in the harness VM): mkfs.ext4, e2fsck.
+    mod needs_host {
+        use super::*;
+
+        /// A run reaching past `blocks_count` into the short final group's
+        /// padding is refused; one ending at the last block is not.
+        #[test]
+        fn a_run_into_the_final_groups_padding_is_refused() {
+            let dir = fs_ext4_test_support::temp_dir()
+                .join(format!("ext4-short-group-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let img = dir.join("s.img");
+            // 16284 blocks at 4096 per group: the last group has 4 blocks and
+            // 4092 bits of padding.
+            std::fs::File::create(&img)
+                .unwrap()
+                .set_len(16284 * 4096)
+                .unwrap();
+            let made = fs_ext4_test_support::oracle("mkfs.ext4")
+                .args(["-q", "-F", "-b", "4096", "-g", "4096", "-O", "^has_journal"])
+                .arg(&img)
+                .output();
+            assert!(
+                made.status.success(),
+                "{}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+            let fs = Filesystem::mount(std::sync::Arc::new(
+                crate::block_io::FileDevice::open(img.to_str().unwrap()).unwrap(),
+            ))
+            .unwrap();
+            let last = fs.sb.blocks_count;
+            assert_ne!(
+                (last - u64::from(fs.sb.first_data_block)) % u64::from(fs.sb.blocks_per_group),
+                0,
+                "fixture: the final group is short"
+            );
+            assert!(
+                fs.group_chunks(last - 2, 2).is_ok(),
+                "a run ending at the last block"
+            );
+            assert!(
+                matches!(fs.group_chunks(last - 2, 3), Err(Error::InvalidBlock(_))),
+                "a run one block into the padding"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// A freed run that crosses a group boundary credits each group its
+        /// own blocks and clears the second group's bits (#118).
+        ///
+        /// Witnessed by the descriptors and the second group's bitmap, not the
+        /// return value or the superblock delta: those are `len` before and
+        /// after the fix alike. Measured before it: group 1 credited 8 and
+        /// group 2 credited 0, its four bits left set. Fails without mkfs.ext4
+        /// (they run in the harness VM).
+        #[test]
+        fn a_freed_run_across_a_group_boundary_credits_both_groups() {
+            let dir = fs_ext4_test_support::temp_dir()
+                .join(format!("ext4-cross-group-{}", std::process::id()));
+            std::fs::create_dir_all(&dir).unwrap();
+            let img = dir.join("g.img");
+            std::fs::File::create(&img)
+                .unwrap()
+                .set_len(64 * 1024 * 1024)
+                .unwrap();
+            let made = fs_ext4_test_support::oracle("mkfs.ext4")
+                .args([
+                    "-q",
+                    "-F",
+                    "-b",
+                    "4096",
+                    "-g",
+                    "4096",
+                    "-O",
+                    "^metadata_csum,^has_journal",
+                ])
+                .arg(&img)
+                .output();
+            assert!(
+                made.status.success(),
+                "{}",
+                String::from_utf8_lossy(&made.stderr)
+            );
+            let path = img.to_str().unwrap().to_owned();
+            let mount = || {
+                Filesystem::mount(std::sync::Arc::new(
+                    crate::block_io::FileDevice::open_rw(&path).unwrap(),
+                ))
+                .unwrap()
+            };
+            let boundary = 2 * 4096u64; // group 2 starts here
+            let bit_set = |fs: &Filesystem, gi: usize, bit: u64| {
+                let bm = fs.read_block(fs.groups[gi].block_bitmap).unwrap();
+                bm[(bit / 8) as usize] & (1 << (bit % 8)) != 0
+            };
+
+            // Four blocks either side of the boundary, allocated per group.
+            {
+                let fs = mount();
+                let mut buf = BlockBuffer::new(fs.sb.block_size());
+                fs.buffer_mark_block_run_used(&mut buf, boundary - 4, 4)
+                    .unwrap();
+                fs.buffer_mark_block_run_used(&mut buf, boundary, 4)
+                    .unwrap();
+                fs.commit_block_buffer(buf).unwrap();
+            }
+            let (free1, free2) = {
+                let fs = mount();
+                assert!(
+                    (0..4).all(|b| bit_set(&fs, 2, b)),
+                    "fixture: group 2's run is allocated"
+                );
+                (
+                    fs.groups[1].free_blocks_count,
+                    fs.groups[2].free_blocks_count,
+                )
+            };
+
+            // One run across the boundary, as a merged extent frees it.
+            {
+                let fs = mount();
+                let mut buf = BlockBuffer::new(fs.sb.block_size());
+                assert_eq!(
+                    fs.buffer_free_block_run_and_bgd(&mut buf, boundary - 4, 8)
+                        .unwrap(),
+                    8
+                );
+                fs.commit_block_buffer(buf).unwrap();
+            }
+            let fs = mount();
+            assert_eq!(
+                (
+                    fs.groups[1].free_blocks_count - free1,
+                    fs.groups[2].free_blocks_count - free2
+                ),
+                (4, 4),
+                "(group 1 credited, group 2 credited)"
+            );
+            assert!(
+                (0..4).all(|b| !bit_set(&fs, 2, b)),
+                "group 2's blocks are still marked allocated"
+            );
+            drop(fs);
+
+            let _ = std::fs::remove_dir_all(&dir);
+        }
+
+        /// An ext2 orphan's data blocks and indirect blocks go back to the
+        /// free pool with it (#79).
+        ///
+        /// The file is 20 blocks at 4 KiB, so its tree has a single indirect
+        /// block beside the twelve direct pointers. Recovery used to free the
+        /// inode and none of its blocks, and since #201 declined such an
+        /// orphan altogether rather than strand them; either way the blocks
+        /// stayed allocated. After the fix the free count returns to what it
+        /// was before the file was written, and fsck finds nothing.
+        #[test]
+        fn an_indirect_mapped_orphan_frees_its_data_and_indirect_blocks() {
+            const EXT2_VOL: u64 = 32 * 1024 * 1024;
+            let dev = MemDev::new(EXT2_VOL);
+            crate::mkfs::format_filesystem_with_flavor(
+                dev.as_ref(),
+                Some("ext2orph"),
+                None,
+                EXT2_VOL,
+                BS,
+                crate::features::FsFlavor::Ext2,
+            )
+            .expect("format");
+            let (ino, free_before) = {
+                let fs = mount(&dev);
+                let free_before = fs.sb.free_blocks_count;
+                let ino = fs.apply_create("/gone.bin", 0o644).expect("create");
+                fs.apply_replace_file_content("/gone.bin", &vec![0x5A; 20 * BS as usize])
+                    .expect("write");
+                let (inode, _) = fs.read_inode_verified(ino).expect("read");
+                assert!(!inode.has_extents(), "fixture: an indirect-mapped file");
+                assert_ne!(
+                    u32::from_le_bytes(inode.block[48..52].try_into().unwrap()),
+                    0,
+                    "fixture: the file uses its single indirect block"
+                );
+                (ino, free_before)
+            };
+            {
+                let fs = mount(&dev);
+                let (root, _) = fs.read_inode_verified(2).expect("root");
+                let mut buf = BlockBuffer::new(fs.sb.block_size());
+                fs.buffer_remove_dir_entry(&mut buf, 2, &root, b"gone.bin")
+                    .expect("remove the name");
+                fs.commit_block_buffer(buf).expect("commit");
+                plant_orphan(&fs, ino, 0, None);
+            }
+            // Recovery runs on this mount; the next one observes the result.
+            drop(mount(&dev));
+
+            let fs = mount(&dev);
+            assert!(
+                fs.orphan_list().expect("orphan_list").is_empty(),
+                "recovery must take the orphan off the chain"
+            );
+            assert!(!fs.inode_bit_is_set(ino).expect("inode bitmap"));
+            assert_eq!(
+                fs.sb.free_blocks_count, free_before,
+                "every block the file used -- 20 data and 1 indirect -- must be free again"
+            );
+            let report = crate::fsck::audit(&fs, u32::MAX, u32::MAX).expect("audit");
+            assert!(report.is_clean(), "fsck: {:?}", report.anomalies);
+            drop(fs);
+
+            // And e2fsck: a block left allocated with nothing mapping it is
+            // exactly what its pass 5 reports.
+            let image = fs_ext4_test_support::temp_dir().join(format!(
+                "fs_ext4_indirect_orphan_{}.img",
+                std::process::id()
+            ));
+            std::fs::write(&image, &*dev.bytes.lock().unwrap()).unwrap();
+            let out = fs_ext4_test_support::oracle("e2fsck")
+                .arg("-fn")
+                .arg(&image)
+                .output();
+            let _ = std::fs::remove_file(&image);
+            assert!(
+                out.status.success(),
+                "e2fsck -fn:\n{}{}",
+                String::from_utf8_lossy(&out.stdout),
+                String::from_utf8_lossy(&out.stderr)
+            );
+        }
     }
 }

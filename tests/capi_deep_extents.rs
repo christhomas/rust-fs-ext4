@@ -11,24 +11,19 @@
 use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::os::raw::c_void;
-use std::path::Path;
 
-const IMAGE: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-deep-extents.img"
-);
+const IMAGE: &str = "ext4-deep-extents.img";
 
-fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
-    if !Path::new(IMAGE).exists() {
-        eprintln!("skip: {IMAGE} not built");
-        return None;
-    }
-    let p = CString::new(IMAGE).unwrap();
+fn mount_fixture() -> *mut fs_ext4_fs_t {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), IMAGE);
+    let p = CString::new(path.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
-    if fs.is_null() {
-        return None;
-    }
-    Some(fs)
+    assert!(
+        !fs.is_null(),
+        "fs_ext4_mount({path}) failed: {}",
+        unsafe { std::ffi::CStr::from_ptr(fs_ext4_last_error()) }.to_string_lossy()
+    );
+    fs
 }
 
 fn read_file(fs: *mut fs_ext4_fs_t, path: &str, offset: u64, length: u64) -> Vec<u8> {
@@ -57,9 +52,7 @@ fn read_file(fs: *mut fs_ext4_fs_t, path: &str, offset: u64, length: u64) -> Vec
 
 #[test]
 fn dense_file_reads_expected_content() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let data = read_file(fs, "/dense.txt", 0, 64);
     assert_eq!(data, b"control file\n");
     unsafe { fs_ext4_umount(fs) };
@@ -67,9 +60,7 @@ fn dense_file_reads_expected_content() {
 
 #[test]
 fn sparse_file_first_byte_is_x() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     // Image lays down 'X' at every 64 KB boundary. Byte 0 should be 'X'.
     let data = read_file(fs, "/sparse.bin", 0, 1);
     assert_eq!(data, b"X", "first byte of sparse.bin should be 'X'");
@@ -78,9 +69,7 @@ fn sparse_file_first_byte_is_x() {
 
 #[test]
 fn sparse_file_holes_read_as_zero() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     // The second byte (offset 1) is inside a sparse hole — must be zero.
     let data = read_file(fs, "/sparse.bin", 1, 4);
     assert_eq!(data, vec![0u8; 4], "bytes 1..5 should be in a hole → zeros");
@@ -89,9 +78,7 @@ fn sparse_file_holes_read_as_zero() {
 
 #[test]
 fn sparse_file_deep_extent_lookup() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     // Read at 64KB (offset 65536) — second 'X' byte. Hitting this logical
     // block forces walking the extent tree past the first leaf, exercising
     // the multi-level / internal-node descent path.
@@ -102,9 +89,7 @@ fn sparse_file_deep_extent_lookup() {
 
 #[test]
 fn sparse_file_high_offset_read() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     // Near the end of the 16MB file. Offset 15 MiB + some. Still within size.
     let offset = 15 * 1024 * 1024; // 15 MiB
     let data = read_file(fs, "/sparse.bin", offset, 1);
@@ -117,9 +102,7 @@ fn sparse_file_high_offset_read() {
 
 #[test]
 fn sparse_file_stat_reports_full_logical_size() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let c = CString::new("/sparse.bin").unwrap();
     let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
     let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };
@@ -134,9 +117,7 @@ fn sparse_file_stat_reports_full_logical_size() {
 
 #[test]
 fn read_past_eof_returns_zero() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let c = CString::new("/sparse.bin").unwrap();
     let mut buf = [0u8; 16];
     let n = unsafe {

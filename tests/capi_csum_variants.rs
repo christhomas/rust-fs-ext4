@@ -11,7 +11,6 @@
 use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
-use std::path::Path;
 
 fn last_err(fs: *mut fs_ext4_fs_t) -> String {
     let _ = fs;
@@ -24,17 +23,16 @@ fn last_err(fs: *mut fs_ext4_fs_t) -> String {
     }
 }
 
-fn mount_or_skip(image: &str) -> Option<*mut fs_ext4_fs_t> {
-    if !Path::new(image).exists() {
-        eprintln!("skip: {image} not built");
-        return None;
-    }
-    let p = CString::new(image).unwrap();
+fn mount_fixture(image: &str) -> *mut fs_ext4_fs_t {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), image);
+    let p = CString::new(path.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
-    if fs.is_null() {
-        return None;
-    }
-    Some(fs)
+    assert!(
+        !fs.is_null(),
+        "fs_ext4_mount({path}) failed: {}",
+        unsafe { std::ffi::CStr::from_ptr(fs_ext4_last_error()) }.to_string_lossy()
+    );
+    fs
 }
 
 fn read_full(fs: *mut fs_ext4_fs_t, path: &str, cap: usize) -> Vec<u8> {
@@ -60,22 +58,18 @@ fn read_full(fs: *mut fs_ext4_fs_t, path: &str, cap: usize) -> Vec<u8> {
 // ext4-csum-seed.img: INCOMPAT_CSUM_SEED — seed from superblock, not UUID
 // ---------------------------------------------------------------------------
 
-const SEED_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-csum-seed.img");
+const SEED_IMAGE: &str = "ext4-csum-seed.img";
 
 #[test]
 fn csum_seed_image_mounts() {
-    let Some(fs) = mount_or_skip(SEED_IMAGE) else {
-        return;
-    };
+    let fs = mount_fixture(SEED_IMAGE);
     assert_eq!(fs_ext4_last_errno(), 0);
     unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
 fn csum_seed_image_reads_hello_txt() {
-    let Some(fs) = mount_or_skip(SEED_IMAGE) else {
-        return;
-    };
+    let fs = mount_fixture(SEED_IMAGE);
     let data = read_full(fs, "/hello.txt", 64);
     assert_eq!(data, b"pi-style file\n");
     unsafe { fs_ext4_umount(fs) };
@@ -83,9 +77,7 @@ fn csum_seed_image_reads_hello_txt() {
 
 #[test]
 fn csum_seed_image_reads_etc_fstab_through_subdir() {
-    let Some(fs) = mount_or_skip(SEED_IMAGE) else {
-        return;
-    };
+    let fs = mount_fixture(SEED_IMAGE);
     // /etc/fstab — exercises path walk across a subdir on a csum-seed image,
     // which verifies both the mount-time seed and the per-dir-block csum
     // verification stay in sync.
@@ -98,22 +90,18 @@ fn csum_seed_image_reads_etc_fstab_through_subdir() {
 // ext4-no-csum.img: metadata_csum feature absent — verifier must stay off
 // ---------------------------------------------------------------------------
 
-const NO_CSUM_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-no-csum.img");
+const NO_CSUM_IMAGE: &str = "ext4-no-csum.img";
 
 #[test]
 fn no_csum_image_mounts() {
-    let Some(fs) = mount_or_skip(NO_CSUM_IMAGE) else {
-        return;
-    };
+    let fs = mount_fixture(NO_CSUM_IMAGE);
     assert_eq!(fs_ext4_last_errno(), 0);
     unsafe { fs_ext4_umount(fs) };
 }
 
 #[test]
 fn no_csum_image_reads_file_without_verifier_interference() {
-    let Some(fs) = mount_or_skip(NO_CSUM_IMAGE) else {
-        return;
-    };
+    let fs = mount_fixture(NO_CSUM_IMAGE);
     let data = read_full(fs, "/file.txt", 64);
     assert_eq!(data, b"no checksum here\n");
     unsafe { fs_ext4_umount(fs) };
@@ -121,9 +109,7 @@ fn no_csum_image_reads_file_without_verifier_interference() {
 
 #[test]
 fn no_csum_image_stat_works() {
-    let Some(fs) = mount_or_skip(NO_CSUM_IMAGE) else {
-        return;
-    };
+    let fs = mount_fixture(NO_CSUM_IMAGE);
     let c = CString::new("/file.txt").unwrap();
     let mut attr: fs_ext4_attr_t = unsafe { std::mem::zeroed() };
     let rc = unsafe { fs_ext4_stat(fs, c.as_ptr(), &mut attr) };

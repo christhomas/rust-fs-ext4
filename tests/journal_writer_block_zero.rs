@@ -7,18 +7,17 @@
 //! primary superblock. The image is a fresh `mkfs.ext4` (no metadata_csum,
 //! so no inode checksum to restamp) with the journal inode's second extent
 //! moved, so the journal's own superblock at logical block 0 stays
-//! readable; skips without e2fsprogs.
+//! readable; fails when the harness VM the e2fsprogs tools run in is unreachable.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::error::Error;
 use fs_ext4::journal_writer::JournalWriter;
 use fs_ext4::{bgd, Filesystem};
-use std::process::Command;
 use std::sync::Arc;
 
 /// A fresh image with the journal inode's second extent starting at
-/// `start`, or untouched for `None`; `None` without mkfs.ext4.
-fn image_with_journal_at(name: &str, start: Option<u64>) -> Option<std::path::PathBuf> {
+/// `start`, or untouched for `None`.
+fn image_with_journal_at(name: &str, start: Option<u64>) -> std::path::PathBuf {
     let dir =
         fs_ext4_test_support::temp_dir().join(format!("ext4-jblock-{}-{name}", std::process::id()));
     std::fs::create_dir_all(&dir).unwrap();
@@ -27,18 +26,17 @@ fn image_with_journal_at(name: &str, start: Option<u64>) -> Option<std::path::Pa
         .unwrap()
         .set_len(64 * 1024 * 1024)
         .unwrap();
-    let made = Command::new("mkfs.ext4")
+    let made = fs_ext4_test_support::oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", "4096", "-O", "^metadata_csum"])
         .arg(&img)
-        .output()
-        .ok()?;
+        .output();
     assert!(
         made.status.success(),
         "{}",
         String::from_utf8_lossy(&made.stderr)
     );
     let Some(start) = start else {
-        return Some(img);
+        return img;
     };
     let (block, offset, bs) = {
         let fs =
@@ -79,7 +77,7 @@ fn image_with_journal_at(name: &str, start: Option<u64>) -> Option<std::path::Pa
     bytes[second + 6..second + 8].copy_from_slice(&((start >> 32) as u16).to_le_bytes());
     bytes[second + 8..second + 12].copy_from_slice(&(start as u32).to_le_bytes());
     std::fs::write(&img, &bytes).unwrap();
-    Some(img)
+    img
 }
 
 fn open_writer(img: &std::path::Path) -> Result<bool, Error> {
@@ -92,10 +90,7 @@ fn open_writer(img: &std::path::Path) -> Result<bool, Error> {
 #[test]
 fn a_journal_block_on_the_superblock_or_its_descriptor_table_is_refused_at_open() {
     for start in [0u64, 1] {
-        let Some(img) = image_with_journal_at(&format!("at{start}"), Some(start)) else {
-            eprintln!("no mkfs.ext4 -- skipping");
-            return;
-        };
+        let img = image_with_journal_at(&format!("at{start}"), Some(start));
         match open_writer(&img) {
             Err(Error::Corrupt(m)) => assert!(
                 m.contains("journal inode maps a block"),
@@ -113,10 +108,7 @@ fn a_journal_block_on_the_superblock_or_its_descriptor_table_is_refused_at_open(
 /// one that ends at its last block is not.
 #[test]
 fn the_refusal_ends_exactly_at_group_zeros_metadata_and_the_filesystems_end() {
-    let Some(img) = image_with_journal_at("geometry", None) else {
-        eprintln!("no mkfs.ext4 -- skipping");
-        return;
-    };
+    let img = image_with_journal_at("geometry", None);
     let (metadata_end, blocks_count, second_len) = {
         let fs =
             Filesystem::mount(Arc::new(FileDevice::open(img.to_str().unwrap()).unwrap())).unwrap();
@@ -153,7 +145,7 @@ fn the_refusal_ends_exactly_at_group_zeros_metadata_and_the_filesystems_end() {
         ("one-past-the-end", blocks_count - second_len + 1, true),
         ("ending-at-the-end", blocks_count - second_len, false),
     ] {
-        let img = image_with_journal_at(name, Some(start)).unwrap();
+        let img = image_with_journal_at(name, Some(start));
         match (open_writer(&img), refused) {
             (Err(Error::Corrupt(m)), true) => {
                 assert!(m.contains("journal inode maps a block"), "{name}: {m}")
@@ -168,10 +160,7 @@ fn the_refusal_ends_exactly_at_group_zeros_metadata_and_the_filesystems_end() {
 /// Control: the journal mkfs placed opens a writer.
 #[test]
 fn the_journal_mkfs_placed_opens_a_writer() {
-    let Some(img) = image_with_journal_at("control", None) else {
-        eprintln!("no mkfs.ext4 -- skipping");
-        return;
-    };
+    let img = image_with_journal_at("control", None);
     assert!(open_writer(&img).expect("the untouched journal opens"));
     let _ = std::fs::remove_dir_all(img.parent().unwrap());
 }

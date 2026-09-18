@@ -25,7 +25,7 @@ const UUID: [u8; 16] = [
 ];
 
 /// Format a fresh 8 MiB / 1 KiB-block Ext4 image and return its path.
-fn mkfs_1k(tag: &str) -> Option<String> {
+fn mkfs_1k(tag: &str) -> String {
     static N: AtomicUsize = AtomicUsize::new(0);
     let n = N.fetch_add(1, Ordering::Relaxed);
     let path =
@@ -43,7 +43,7 @@ fn mkfs_1k(tag: &str) -> Option<String> {
             .expect("format_filesystem 1k");
         dev.flush().expect("flush");
     }
-    Some(path)
+    path
 }
 
 fn rw(path: &str) -> Filesystem {
@@ -73,9 +73,7 @@ fn done(path: &str, tag: &str) {
 
 #[test]
 fn mk1k_file_write_truncate() {
-    let Some(p) = mkfs_1k("write_trunc") else {
-        return;
-    };
+    let p = mkfs_1k("write_trunc");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/f", 0o644).expect("create");
@@ -89,9 +87,7 @@ fn mk1k_file_write_truncate() {
 
 #[test]
 fn mk1k_multiblock_write() {
-    let Some(p) = mkfs_1k("multiblock") else {
-        return;
-    };
+    let p = mkfs_1k("multiblock");
     {
         let fs = rw(&p);
         fs.apply_create("/big", 0o644).expect("create");
@@ -103,9 +99,7 @@ fn mk1k_multiblock_write() {
 
 #[test]
 fn mk1k_mkdir_rmdir() {
-    let Some(p) = mkfs_1k("mkdir_rmdir") else {
-        return;
-    };
+    let p = mkfs_1k("mkdir_rmdir");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/d1", 0o755).expect("mkdir d1");
@@ -118,9 +112,7 @@ fn mk1k_mkdir_rmdir() {
 
 #[test]
 fn mk1k_hardlink_unlink() {
-    let Some(p) = mkfs_1k("hardlink") else {
-        return;
-    };
+    let p = mkfs_1k("hardlink");
     {
         let fs = rw(&p);
         fs.apply_create("/a", 0o644).expect("create a");
@@ -132,7 +124,7 @@ fn mk1k_hardlink_unlink() {
 
 #[test]
 fn mk1k_rename() {
-    let Some(p) = mkfs_1k("rename") else { return };
+    let p = mkfs_1k("rename");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create x");
@@ -146,9 +138,7 @@ fn mk1k_rename() {
 
 #[test]
 fn mk1k_chmod_chown() {
-    let Some(p) = mkfs_1k("chmod_chown") else {
-        return;
-    };
+    let p = mkfs_1k("chmod_chown");
     {
         let fs = rw(&p);
         fs.apply_create("/m", 0o644).expect("create");
@@ -165,7 +155,7 @@ fn mk1k_chmod_chown() {
 /// feature, as the kernel does (#88).
 #[test]
 fn mk1k_xattr_inline_external_remove() {
-    let Some(p) = mkfs_1k("xattr") else { return };
+    let p = mkfs_1k("xattr");
     {
         let fs = rw(&p);
         fs.apply_create("/x", 0o644).expect("create");
@@ -183,9 +173,7 @@ fn mk1k_xattr_inline_external_remove() {
 
 #[test]
 fn mk1k_removexattr_last_frees_block() {
-    let Some(p) = mkfs_1k("xattr_free") else {
-        return;
-    };
+    let p = mkfs_1k("xattr_free");
     {
         let fs = rw(&p);
         fs.apply_create("/xr", 0o644).expect("create");
@@ -201,9 +189,7 @@ fn mk1k_removexattr_last_frees_block() {
 
 #[test]
 fn mk1k_fallocate_variants() {
-    let Some(p) = mkfs_1k("fallocate") else {
-        return;
-    };
+    let p = mkfs_1k("fallocate");
     {
         let fs = rw(&p);
         let ino = fs.apply_create("/fa", 0o644).expect("create");
@@ -219,9 +205,7 @@ fn mk1k_fallocate_variants() {
 
 #[test]
 fn mk1k_slow_symlink_unlink() {
-    let Some(p) = mkfs_1k("slow_symlink") else {
-        return;
-    };
+    let p = mkfs_1k("slow_symlink");
     {
         let fs = rw(&p);
         let target = "/a/very/long/symlink/target/path/that/exceeds/sixty/bytes/for/sure/x";
@@ -233,7 +217,7 @@ fn mk1k_slow_symlink_unlink() {
 
 #[test]
 fn mk1k_htree_dir_growth() {
-    let Some(p) = mkfs_1k("htree") else { return };
+    let p = mkfs_1k("htree");
     {
         let fs = rw(&p);
         fs.apply_mkdir("/h", 0o755).expect("mkdir h");
@@ -249,9 +233,7 @@ fn mk1k_htree_dir_growth() {
 
 #[test]
 fn mk1k_large_chunked_write() {
-    let Some(p) = mkfs_1k("large_chunked") else {
-        return;
-    };
+    let p = mkfs_1k("large_chunked");
     {
         let fs = rw(&p);
         fs.apply_create("/lc", 0o644).expect("create");
@@ -267,9 +249,7 @@ fn mk1k_large_chunked_write() {
 
 #[test]
 fn mk1k_fragmented_extent_tree() {
-    let Some(p) = mkfs_1k("frag_extents") else {
-        return;
-    };
+    let p = mkfs_1k("frag_extents");
     {
         let fs = rw(&p);
         fs.apply_create("/frag", 0o644).expect("create");

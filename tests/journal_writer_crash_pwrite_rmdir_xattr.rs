@@ -29,21 +29,14 @@ use std::sync::Arc;
 
 const IMG: &str = "ext4-csum-seed.img";
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_jw_cnp_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 /// Drops writes after `write_budget` is exhausted; reads always pass through.
@@ -117,9 +110,7 @@ fn crash_during_pwrite_yields_consistent_state() {
     // versa).
     const N: u64 = 8192;
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp(IMG, &format!("pw_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp(IMG, &format!("pw_b{budget}"));
         {
             let dev = FileDevice::open_rw(&path).expect("rw setup");
             let fs = Filesystem::mount(Arc::new(dev)).expect("mount setup");
@@ -164,9 +155,7 @@ fn crash_during_large_pwrite_yields_consistent_state() {
     // tree). Budgets are coarse and span several chunk boundaries.
     const FULL: u64 = 2 * 1024 * 1024;
     for budget in [0usize, 5, 20, 60, 150, 400, 1000, 2500, 6000] {
-        let Some(path) = copy_to_tmp(IMG, &format!("bigpw_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp(IMG, &format!("bigpw_b{budget}"));
         {
             let dev = FileDevice::open_rw(&path).expect("rw setup");
             let fs = Filesystem::mount(Arc::new(dev)).expect("mount setup");
@@ -208,9 +197,7 @@ fn crash_during_rmdir_yields_consistent_state() {
     // fully present (pre) or fully gone (post), and root's link count must
     // AGREE with victim's existence — the tear detector.
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp(IMG, &format!("rmdir_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp(IMG, &format!("rmdir_b{budget}"));
         let links_before_mkdir;
         let links_with_victim;
         {
@@ -262,9 +249,7 @@ fn crash_during_removexattr_frees_block_yields_consistent_state() {
     // the block count must agree: both still owned (pre) or both released
     // (post) — never a dangling pointer or a leaked/double-counted block.
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp(IMG, &format!("rmxattr_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp(IMG, &format!("rmxattr_b{budget}"));
         {
             let dev = FileDevice::open_rw(&path).expect("rw setup");
             let fs = Filesystem::mount(Arc::new(dev)).expect("mount setup");

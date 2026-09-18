@@ -10,26 +10,16 @@
 //! The volume comes from the real toolchain: `mkfs.ext4 -d` copies in a
 //! directory of names, and `e2fsck -fyD` indexes it. The driver then creates,
 //! links, renames into and unlinks from that directory, and `e2fsck -fn` must
-//! find nothing, with and without metadata_csum. Skips without e2fsprogs.
+//! find nothing, with and without metadata_csum. Fails without e2fsprogs
+//! (they run in the harness VM).
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::InodeFlags;
-use std::process::Command;
 use std::sync::Arc;
 
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
-
-fn run(cmd: &str, args: &[&str]) -> (Option<i32>, String) {
-    let out = Command::new(tool(cmd).unwrap())
-        .args(args)
-        .output()
-        .unwrap();
+fn run(tool: &str, args: &[&str]) -> (Option<i32>, String) {
+    let out = fs_ext4_test_support::oracle(tool).args(args).output();
     (
         out.status.code(),
         format!(
@@ -41,11 +31,7 @@ fn run(cmd: &str, args: &[&str]) -> (Option<i32>, String) {
 }
 
 /// A fresh image whose `/bigdir` holds `count` files and is indexed.
-fn indexed_volume(tag: &str, features: &str, count: usize) -> Option<String> {
-    if tool("mkfs.ext4").is_none() || tool("e2fsck").is_none() {
-        eprintln!("skip: e2fsprogs not installed");
-        return None;
-    }
+fn indexed_volume(tag: &str, features: &str, count: usize) -> String {
     let root = fs_ext4_test_support::temp_path!("fs_ext4_htree_w_{tag}_{}", std::process::id());
     let bigdir = std::path::Path::new(&root).join("bigdir");
     std::fs::create_dir_all(bigdir.join("sub")).unwrap();
@@ -75,7 +61,7 @@ fn indexed_volume(tag: &str, features: &str, count: usize) -> Option<String> {
     let (code, log) = run("e2fsck", &["-fyD", &image]);
     assert!(matches!(code, Some(0 | 1)), "e2fsck -fyD: {log}");
     let _ = std::fs::remove_dir_all(&root);
-    Some(image)
+    image
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> fs_ext4::Result<u32> {
@@ -100,9 +86,7 @@ fn e2fsck_clean(image: &str) -> Result<(), String> {
 }
 
 fn exercise(tag: &str, features: &str) {
-    let Some(image) = indexed_volume(tag, features, 600) else {
-        return;
-    };
+    let image = indexed_volume(tag, features, 600);
     {
         let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
         assert!(
@@ -161,9 +145,7 @@ fn writes_into_an_indexed_directory_with_metadata_csum() {
 /// linear scan, so finding it is not enough -- and e2fsck, which checks the
 /// whole index, must be clean.
 fn split_leaves(tag: &str, features: &str) {
-    let Some(image) = indexed_volume(tag, features, 600) else {
-        return;
-    };
+    let image = indexed_volume(tag, features, 600);
     {
         let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
         let root_count = |fs: &Filesystem| {
@@ -244,9 +226,7 @@ fn a_full_leaf_splits_with_metadata_csum() {
 /// metadata_csum each converted block needs a dirent tail, and e2fsck checks
 /// every one.
 fn fill_a_leaf(tag: &str, features: &str) {
-    let Some(image) = indexed_volume(tag, features, 6000) else {
-        return;
-    };
+    let image = indexed_volume(tag, features, 6000);
     let mut created = Vec::new();
     {
         let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
@@ -302,9 +282,7 @@ fn a_full_leaf_drops_the_index_with_metadata_csum() {
 /// offset. Tested without metadata_csum, where no checksum would catch it.
 #[test]
 fn a_root_with_a_wrong_info_length_is_refused() {
-    let Some(image) = indexed_volume("info_len", "^metadata_csum,^has_journal", 600) else {
-        return;
-    };
+    let image = indexed_volume("info_len", "^metadata_csum,^has_journal", 600);
     {
         let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();
         let ino = resolve(&fs, "/bigdir").expect("resolve");
@@ -350,9 +328,7 @@ fn corrupt_dx_root_checksum(image: &str, path: &str) {
 /// checksum.
 #[test]
 fn a_corrupt_index_root_is_neither_routed_through_nor_restamped() {
-    let Some(image) = indexed_volume("corrupt_root", "metadata_csum", 600) else {
-        return;
-    };
+    let image = indexed_volume("corrupt_root", "metadata_csum", 600);
     corrupt_dx_root_checksum(&image, "/bigdir");
     corrupt_dx_root_checksum(&image, "/elsewhere/bigsub");
     let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).unwrap();

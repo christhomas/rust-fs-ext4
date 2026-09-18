@@ -11,38 +11,36 @@
 //! could not be made.
 //!
 //! Volumes come from `mkfs.ext4`, and `e2fsck -fn` must accept every result.
-//! Skips without e2fsprogs.
+//! The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
-fn mkfs(tag: &str) -> Option<String> {
-    let mkfs = ["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())?;
+fn mkfs(tag: &str) -> String {
+    let mkfs = "mkfs.ext4";
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_prealloc_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-b", "4096"])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 fn e2fsck_clean(path: &str) {
-    let out = Command::new("e2fsck").args(["-fn", path]).output().unwrap();
+    let out = fs_ext4_test_support::oracle("e2fsck")
+        .args(["-fn", path])
+        .output();
     assert!(
         out.status.success(),
         "e2fsck -fn rejected the volume:\n{}{}",
@@ -74,10 +72,7 @@ fn a_write_into_a_preallocated_range_lands_there() {
         ("past_end", PREALLOC - 1000, 9000),
     ];
     for (tag, offset, len) in cases {
-        let Some(path) = mkfs(tag) else {
-            eprintln!("skip: e2fsprogs not installed");
-            return;
-        };
+        let path = mkfs(tag);
         let data: Vec<u8> = (0..len).map(|i| (i % 251) as u8 + 1).collect();
         let fs = mount(&path);
         let ino = fs.apply_create("/f", 0o644).expect("create");

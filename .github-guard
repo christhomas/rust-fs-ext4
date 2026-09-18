@@ -1,0 +1,19 @@
+# .github-guard — declarations github-guard reads (see the github-guard skill:
+# https://github.com/antimatter-studios/agent-skills/blob/main/.claude/skills/github-guard/README.md).
+# git-config format: check with `git config -f .github-guard --list`, and
+# double-quote any value containing # or ;.
+
+# What must pass before main takes a merge. github-guard reads this from the
+# default branch on the server and applies it to branch protection.
+#
+#   ci-ok   ci.yml: the one always-run gate. It fails when any job it needs
+#           failed, was cancelled or was skipped: the unit tier with no
+#           fixtures, the kernel-made fixtures built in the
+#           fs-linux-test-harness VM, and the whole suite (lint, unit,
+#           fixtures, the e2fsprogs oracles) on x86_64 and aarch64.
+#
+# Requiring the gate rather than each job means a job can be renamed, split or
+# made conditional without leaving a required check that never reports, which
+# would block every pull request with nothing to point at.
+[checks]
+	required = ci-ok

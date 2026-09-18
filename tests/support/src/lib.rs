@@ -1,3 +1,12 @@
+//! Shared helpers for the ext4 test suite: where scratch files live,
+//! where fixtures come from, and the oracle tools (see [`oracle`]).
+
+mod kernel;
+mod oracle;
+
+pub use kernel::{guest_kernel_report, guest_kernel_write, sha256_hex};
+pub use oracle::{guest_base64, guest_quote, oracle, Oracle};
+
 use std::ffi::OsStr;
 use std::fmt;
 use std::fs;
@@ -8,34 +17,32 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 static TEST_TEMP_DIR: OnceLock<PathBuf> = OnceLock::new();
 
-/// Select the configured scratch root before per-process isolation is applied.
-pub fn select_temp_dir(
-    explicit: Option<&OsStr>,
-    managed_base: Option<&OsStr>,
-    github_actions: bool,
-    runner_temp: Option<&OsStr>,
-    device_model: Option<&[u8]>,
-    worktree: &Path,
-    platform_temp: &Path,
-) -> PathBuf {
-    if let Some(path) = explicit.filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
-    }
-    if let Some(path) = managed_base.filter(|path| !path.is_empty()) {
-        return PathBuf::from(path);
-    }
-    if github_actions {
-        if let Some(path) = runner_temp.filter(|path| !path.is_empty()) {
-            return PathBuf::from(path);
-        }
-    }
-    if device_model
-        .map(|model| String::from_utf8_lossy(model).contains("Raspberry Pi"))
-        .unwrap_or(false)
-    {
+/// The scratch root: `<repo>/tmp`, or `FS_EXT4_TEST_TMPDIR` when a
+/// caller supplies an exact directory of its own.
+///
+/// ONE RULE, AND IT IS THE ORACLE'S. Scratch files are what the oracle
+/// tools read, and those tools run in the harness VM, which sees this
+/// repository mounted at the path the host knows it by — and nothing
+/// else of the host. A scratch directory under `/tmp` or `$RUNNER_TEMP`
+/// would not exist there. So it lives in the repository (gitignored),
+/// on every machine and on CI alike, and a caller-supplied directory
+/// outside the repository is refused rather than quietly breaking every
+/// oracle test.
+#[track_caller]
+pub fn select_temp_dir(explicit: Option<&OsStr>, worktree: &Path) -> PathBuf {
+    let Some(path) = explicit.filter(|path| !path.is_empty()) else {
         return worktree.join("tmp");
-    }
-    platform_temp.to_path_buf()
+    };
+    let path = PathBuf::from(path);
+    assert!(
+        path.starts_with(worktree),
+        "FS_EXT4_TEST_TMPDIR is {}, which is outside {}. The oracle tools run in the \
+         harness VM, which sees this repository and nothing else of the host, so scratch \
+         files have to live inside it.",
+        path.display(),
+        worktree.display()
+    );
+    path
 }
 
 /// Create a collision-resistant per-process scratch directory below `base`.
@@ -88,26 +95,14 @@ pub fn temp_dir() -> &'static Path {
                 .parent()
                 .and_then(Path::parent)
                 .expect("test support crate must live at <worktree>/tests/support");
-            let model = fs::read("/proc/device-tree/model").ok();
             let explicit = std::env::var_os("FS_EXT4_TEST_TMPDIR");
-            let managed_base = std::env::var_os("FS_EXT4_TEST_TMP_BASE");
-            let selected_root = select_temp_dir(
-                explicit.as_deref(),
-                managed_base.as_deref(),
-                std::env::var_os("GITHUB_ACTIONS").as_deref() == Some(OsStr::new("true")),
-                std::env::var_os("RUNNER_TEMP").as_deref(),
-                model.as_deref(),
-                worktree,
-                &std::env::temp_dir(),
-            );
-            let selected = materialize_temp_dir(explicit.as_deref(), &selected_root)
-                .unwrap_or_else(|error| {
-                    panic!(
-                        "cannot create ext4 test scratch directory below {}: {error}",
-                        selected_root.display()
-                    )
-                });
-            selected
+            let selected_root = select_temp_dir(explicit.as_deref(), worktree);
+            materialize_temp_dir(explicit.as_deref(), &selected_root).unwrap_or_else(|error| {
+                panic!(
+                    "cannot create ext4 test scratch directory below {}: {error}",
+                    selected_root.display()
+                )
+            })
         })
         .as_path()
 }
@@ -131,51 +126,36 @@ macro_rules! temp_path {
 /// The path of a generated fixture under `test-disks/`, or a panic that
 /// says how to build it (#137).
 ///
-/// The images are gitignored and built by
-/// `test-disks/build-ext4-feature-images.sh`. Without them a mount failed
-/// deep inside `open` with a bare `No such file or directory`, once per
-/// test, which read as that many defects in whatever branch was being
-/// checked. Only for suites that cannot say anything without the image;
-/// the ones that skip honestly when it is absent keep doing so.
+/// The images are gitignored and built by `chore fixtures` (the kernel
+/// populates them, inside the fs-linux-test-harness VM). THE ONLY WAY A
+/// TEST REACHES A FIXTURE: a test that found its image absent used to
+/// print "skip" and return, and a skipped test reads exactly like a
+/// passing one, so a checkout without fixtures ran most of the suite
+/// against nothing and reported green. `chore test:unit` also relies on
+/// this: a test binary that never calls it needs no fixture.
 #[track_caller]
 pub fn fixture(manifest_dir: &str, name: &str) -> String {
     let path = format!("{manifest_dir}/test-disks/{name}");
     assert!(
-        Path::new(&path).exists(),
+        Path::new(&path).is_file(),
         "test-disks/{name} is missing: the fixtures are gitignored and generated. \
-         Build them with `bash test-disks/build-ext4-feature-images.sh` (Linux, or \
-         the oracle VM) and run the tests again."
+         Build them with `chore fixtures` (it boots the fs-linux-test-harness VM; \
+         `chore siblings` checks the harness out) and run the tests again. \
+         Tests never skip on a missing fixture."
     );
     path
 }
-
 
 /// `e2fsck -fn` on `image` must exit 0, or the test fails with its report
 /// (#88).
 ///
 /// The oracle suites checked their images with this crate's own reader,
-/// which cannot see a wrong checksum, and left the external check to
-/// someone running `scripts/vm-e2fsck.sh` by hand, which nothing did.
-/// Where e2fsprogs is not installed this skips with a note, except under CI
-/// (`CI` set, as GitHub Actions sets it), which installs it: there a
-/// missing checker is a failure rather than a silent pass.
+/// which cannot see a wrong checksum. `-f` forces a full check, `-n`
+/// answers no to every repair, so it reports without touching the image.
+/// It runs in the harness VM, like every oracle tool (see [`oracle`]).
 #[track_caller]
 pub fn assert_e2fsck_clean(image: &str, tag: &str) {
-    let Some(e2fsck) = ["/usr/sbin/e2fsck", "/sbin/e2fsck", "/usr/bin/e2fsck", "/bin/e2fsck"]
-        .into_iter()
-        .find(|p| Path::new(p).exists())
-    else {
-        assert!(
-            std::env::var_os("CI").is_none(),
-            "[{tag}] e2fsck is not installed, and CI must run the oracle"
-        );
-        eprintln!("[{tag}] skip e2fsck: e2fsprogs not installed");
-        return;
-    };
-    let out = std::process::Command::new(e2fsck)
-        .args(["-fn", image])
-        .output()
-        .unwrap_or_else(|error| panic!("[{tag}] run {e2fsck}: {error}"));
+    let out = oracle("e2fsck").args(["-fn", image]).output();
     assert_eq!(
         out.status.code(),
         Some(0),

@@ -19,21 +19,14 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_jw_rwx_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn jsb_seq(path: &str) -> Option<u32> {
@@ -58,9 +51,7 @@ fn assert_clean(path: &str, tag: &str) {
 
 #[test]
 fn rename_advances_journal_sequence() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "rename") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "rename");
     let seq_before = jsb_seq(&path);
     {
         let dev = FileDevice::open_rw(&path).expect("rw");
@@ -92,9 +83,7 @@ fn rename_advances_journal_sequence() {
 
 #[test]
 fn replace_file_content_advances_journal_sequence() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "rfc") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "rfc");
     let seq_before = jsb_seq(&path);
     {
         let dev = FileDevice::open_rw(&path).expect("rw");
@@ -130,9 +119,7 @@ fn replace_file_content_advances_journal_sequence() {
 
 #[test]
 fn external_block_setxattr_advances_journal_sequence() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "extxattr") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "extxattr");
     let seq_before = jsb_seq(&path);
     {
         let dev = FileDevice::open_rw(&path).expect("rw");

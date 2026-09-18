@@ -4,13 +4,12 @@
 //! The group count divided the whole `s_blocks_count` instead of starting
 //! at `s_first_data_block`, so a `mkfs.ext4 -b 1024` image of 16385 blocks
 //! read as three groups where it has two; the phantom descriptor's zeros
-//! failed their checksum and the mount was refused. Skips without
-//! e2fsprogs.
+//! failed their checksum and the mount was refused. Fails without
+//! e2fsprogs (they run in the harness VM).
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::fs::Filesystem;
 
-use std::process::Command;
 use std::sync::Arc;
 
 #[test]
@@ -23,15 +22,11 @@ fn a_one_kib_volume_one_block_past_a_group_boundary_mounts_with_its_real_group_c
         .unwrap()
         .set_len(16385 * 1024)
         .unwrap();
-    let Ok(made) = Command::new("mkfs.ext4")
+    let made = fs_ext4_test_support::oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", "1024", "-O", "metadata_csum"])
         .arg(&img)
         .arg("16385")
-        .output()
-    else {
-        eprintln!("no mkfs.ext4 -- skipping");
-        return;
-    };
+        .output();
     assert!(
         made.status.success(),
         "{}",

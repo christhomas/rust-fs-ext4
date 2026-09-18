@@ -109,17 +109,17 @@ fn prng_images_never_panic() {
     }
 }
 
+/// The bytes of fixture `name`; fails (never skips) when it is absent.
+fn read_fixture(name: &str) -> Vec<u8> {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
+    std::fs::read(&path).unwrap_or_else(|e| panic!("read {path}: {e}"))
+}
+
 /// Flip a single byte in a real ext4 image and confirm mount either
 /// rejects it or reads without panicking.
 #[test]
 fn single_byte_flips_in_basic_image_dont_panic() {
-    let bytes = match std::fs::read("test-disks/ext4-basic.img") {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("skip: test-disks/ext4-basic.img absent");
-            return;
-        }
-    };
+    let bytes = read_fixture("ext4-basic.img");
     // Flip bytes at a sampling of positions that are known to sit inside
     // a superblock, a block-group descriptor, and an inode table block.
     // (The exact offsets don't matter — any of these should either produce
@@ -147,13 +147,7 @@ fn dir_structure_walks_never_panic_on_byte_flipped_basic() {
     use fs_ext4::extent;
     use fs_ext4::inode::Inode;
 
-    let bytes = match std::fs::read("test-disks/ext4-basic.img") {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("skip: test-disks/ext4-basic.img absent");
-            return;
-        }
-    };
+    let bytes = read_fixture("ext4-basic.img");
     let sb_size = bytes.len();
     let sample_offsets: Vec<u64> = vec![
         0x400, 0x408, 0x450, 0x500, // superblock
@@ -269,13 +263,7 @@ fn extent_parsers_never_panic_on_random_bytes() {
 /// flip surface available for the superblock region.
 #[test]
 fn exhaustive_single_bit_flip_first_sector_never_panics() {
-    let bytes = match std::fs::read("test-disks/ext4-basic.img") {
-        Ok(b) => b,
-        Err(_) => {
-            eprintln!("skip: test-disks/ext4-basic.img absent");
-            return;
-        }
-    };
+    let bytes = read_fixture("ext4-basic.img");
     for byte_off in 0x400..0x600usize {
         if byte_off >= bytes.len() {
             break;
@@ -314,9 +302,7 @@ fn deep_walk_byte_flip_fuzz_never_panics() {
     let mut panics: Vec<String> = Vec::new();
 
     for img in images {
-        let Ok(bytes) = std::fs::read(format!("test-disks/{img}")) else {
-            continue;
-        };
+        let bytes = read_fixture(img);
         let hi = bytes.len().min(0x2800); // superblock + GDT + first inode-table/dir blocks
         let mut off = 0x400usize;
         while off < hi {

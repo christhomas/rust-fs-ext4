@@ -11,21 +11,14 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_jw_crw_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 struct CrashDevice {
@@ -90,9 +83,7 @@ fn crash_during_rename_yields_consistent_state() {
     // does not) OR (/test.txt gone, /renamed.txt exists). Anything
     // else is a tear.
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp("ext4-basic.img", &format!("rename_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp("ext4-basic.img", &format!("rename_b{budget}"));
         assert!(exists(&path, "/test.txt"), "fixture sanity");
         let result = std::panic::catch_unwind(|| {
             let inner = FileDevice::open_rw(&path).expect("rw");
@@ -125,9 +116,7 @@ fn crash_during_replace_file_content_yields_consistent_state() {
     // Replace the file with new content. After remount: i_size must
     // equal either the original size or the new payload's size — never
     // any other value (which would indicate a partially-applied tx).
-    let Some(probe) = copy_to_tmp("ext4-basic.img", "rfc_probe") else {
-        return;
-    };
+    let probe = copy_to_tmp("ext4-basic.img", "rfc_probe");
     let original_size = read_file_size(&probe, "/test.txt").expect("probe read");
     fs::remove_file(probe).ok();
 
@@ -135,9 +124,7 @@ fn crash_during_replace_file_content_yields_consistent_state() {
     let new_size = payload.len() as u64;
 
     for budget in 0..=40 {
-        let Some(path) = copy_to_tmp("ext4-basic.img", &format!("rfc_b{budget}")) else {
-            continue;
-        };
+        let path = copy_to_tmp("ext4-basic.img", &format!("rfc_b{budget}"));
         let result = std::panic::catch_unwind(|| {
             let inner = FileDevice::open_rw(&path).expect("rw");
             let crash = Arc::new(CrashDevice::new(Arc::new(inner), budget));

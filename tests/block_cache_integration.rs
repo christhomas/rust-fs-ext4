@@ -55,8 +55,9 @@ impl BlockDevice for CountingFile {
     }
 }
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
 fn workload(fs: &Filesystem) {
@@ -70,9 +71,6 @@ fn workload(fs: &Filesystem) {
 #[test]
 fn repeated_lookups_hit_cache_not_inner_device() {
     let path = image_path("ext4-basic.img");
-    if !std::path::Path::new(&path).exists() {
-        return;
-    }
 
     let inner = CountingFile::from_file(&path);
     let fs = Filesystem::mount(inner.clone()).expect("mount");

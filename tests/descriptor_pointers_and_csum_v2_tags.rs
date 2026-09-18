@@ -14,35 +14,31 @@
 //! committed to a CSUM_V2 journal and walked back, and the SECOND
 //! destination is checked.
 //!
-//! Volumes come from `mkfs.ext4`; skips without e2fsprogs.
+//! Volumes come from `mkfs.ext4`; fails when the harness VM the e2fsprogs tools run in is unreachable.
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::Inode;
 use fs_ext4::journal_writer::JournalWriter;
 use fs_ext4::{jbd2, journal};
-use std::process::Command;
 use std::sync::Arc;
 
-fn mkfs(tag: &str, features: &str) -> Option<String> {
-    let mkfs = ["/usr/sbin/mkfs.ext4", "/sbin/mkfs.ext4"]
-        .into_iter()
-        .find(|p| std::path::Path::new(p).exists())?;
+fn mkfs(tag: &str, features: &str) -> String {
+    let mkfs = "mkfs.ext4";
     let path = fs_ext4_test_support::temp_path!("fs_ext4_184_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
-    let out = Command::new(mkfs)
+    let out = fs_ext4_test_support::oracle(mkfs)
         .args(["-q", "-F", "-b", "4096", "-O", features])
         .arg(&path)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         out.status.success(),
         "{}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 // ---------------------------------------------------------------------------
@@ -83,10 +79,7 @@ fn mount_result(path: &str) -> Result<(), String> {
 
 #[test]
 fn every_descriptor_pointer_is_bounded_including_the_high_halves() {
-    let Some(base) = mkfs("desc", "^metadata_csum,^uninit_bg,^has_journal,64bit") else {
-        eprintln!("skip: mkfs.ext4 not installed");
-        return;
-    };
+    let base = mkfs("desc", "^metadata_csum,^uninit_bg,^has_journal,64bit");
     let blocks_count = Filesystem::mount(Arc::new(FileDevice::open(&base).unwrap()))
         .unwrap()
         .sb
@@ -138,10 +131,7 @@ fn every_descriptor_pointer_is_bounded_including_the_high_halves() {
 
 #[test]
 fn a_csum_v2_journal_replays_every_tag_onto_its_own_block() {
-    let Some(path) = mkfs("csumv2", "metadata_csum") else {
-        eprintln!("skip: mkfs.ext4 not installed");
-        return;
-    };
+    let path = mkfs("csumv2", "metadata_csum");
     // Give the journal CSUM_V2 (s_feature_incompat, big-endian at 0x28 of
     // the journal superblock) with the crc32c checksum type (0x50) that V2
     // and V3 both use. mkfs writes a journal with no checksum feature; the

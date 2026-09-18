@@ -13,33 +13,17 @@
 //! groups so directory spreading reaches groups that are still `INODE_UNINIT`
 //! and `BLOCK_UNINIT`, which is where the descriptor edits happen.
 //!
-//! Skips (with a note) when `mkfs.ext4` or `e2fsck` is not installed.
+//! `mkfs.ext4` and `e2fsck` run in the harness VM.
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::features::RoCompat;
 use fs_ext4::{Error, Filesystem};
-use std::process::Command;
+use fs_ext4_test_support::oracle;
 use std::sync::Arc;
 
-const MKFS: &str = "mkfs.ext4";
-const E2FSCK: &str = "e2fsck";
-
-fn tool(name: &str) -> Option<String> {
-    for dir in ["/usr/sbin", "/sbin", "/usr/bin", "/bin", "/usr/local/sbin"] {
-        let p = format!("{dir}/{name}");
-        if std::path::Path::new(&p).exists() {
-            return Some(p);
-        }
-    }
-    None
-}
-
 /// A fresh `mkfs.ext4` volume with `GDT_CSUM` and not `METADATA_CSUM`.
-fn make_volume(tag: &str, sixty_four: bool) -> Option<String> {
-    let (Some(mkfs), Some(_)) = (tool(MKFS), tool(E2FSCK)) else {
-        eprintln!("skip: {MKFS} or {E2FSCK} not installed");
-        return None;
-    };
+fn make_volume(tag: &str, sixty_four: bool) -> String {
+    let mkfs = "mkfs.ext4";
     let path =
         fs_ext4_test_support::temp_path!("fs_ext4_gdt_csum_{tag}_{}.img", std::process::id());
     std::fs::File::create(&path)
@@ -50,7 +34,7 @@ fn make_volume(tag: &str, sixty_four: bool) -> Option<String> {
     } else {
         "^metadata_csum,uninit_bg,^64bit"
     };
-    let out = Command::new(mkfs)
+    let out = oracle(mkfs)
         .args([
             "-q",
             "-F",
@@ -62,21 +46,17 @@ fn make_volume(tag: &str, sixty_four: bool) -> Option<String> {
             "lazy_itable_init=1",
         ])
         .arg(&path)
-        .output()
-        .expect("run mkfs.ext4");
+        .output();
     assert!(
         out.status.success(),
         "mkfs.ext4 failed: {}",
         String::from_utf8_lossy(&out.stderr)
     );
-    Some(path)
+    path
 }
 
 fn e2fsck_clean(path: &str) -> (bool, String) {
-    let out = Command::new(tool(E2FSCK).unwrap())
-        .args(["-fn", path])
-        .output()
-        .expect("run e2fsck");
+    let out = oracle("e2fsck").args(["-fn", path]).output();
     (
         out.status.success(),
         format!(
@@ -88,9 +68,7 @@ fn e2fsck_clean(path: &str) -> (bool, String) {
 }
 
 fn write_and_check(tag: &str, sixty_four: bool) {
-    let Some(path) = make_volume(tag, sixty_four) else {
-        return;
-    };
+    let path = make_volume(tag, sixty_four);
     {
         let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&path).expect("open_rw")))
             .expect("mount");

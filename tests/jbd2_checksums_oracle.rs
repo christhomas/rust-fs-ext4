@@ -12,7 +12,7 @@
 //!   a revoke block) must be replayed by this crate, and not replayed once a
 //!   journalled data block or the commit block is damaged.
 //!
-//! Skips when e2fsprogs is not installed.
+//! The e2fsprogs tools run in the harness VM; a test fails when it cannot reach them.
 
 #![cfg(unix)]
 
@@ -21,7 +21,7 @@ use fs_ext4::error::Result;
 use fs_ext4::inode::Inode;
 use fs_ext4::journal_writer::JournalWriter;
 use fs_ext4::Filesystem;
-use std::process::Command;
+use fs_ext4_test_support::oracle;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
@@ -30,56 +30,36 @@ const BS: u64 = 4096;
 const TARGETS: [u64; 3] = [9000, 9001, 9002];
 const REVOKED: u64 = 9100;
 
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
-
-fn run(program: &str, args: &[&str], stdin: Option<&str>) -> (Option<i32>, String) {
-    use std::io::Write;
-    let mut child = Command::new(program)
-        .args(args)
-        .stdin(std::process::Stdio::piped())
-        .stdout(std::process::Stdio::piped())
-        .stderr(std::process::Stdio::piped())
-        .spawn()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
-    let input = stdin.unwrap_or("").to_owned();
-    child
-        .stdin
-        .take()
-        .unwrap()
-        .write_all(input.as_bytes())
-        .unwrap();
-    let out = child.wait_with_output().unwrap();
+fn run(tool: &str, args: &[&str], stdin: Option<&str>) -> (Option<i32>, String) {
+    let mut call = oracle(tool).args(args);
+    if let Some(script) = stdin {
+        call = call.stdin(script.as_bytes().to_vec());
+    }
+    let out = call.output();
     (
         out.status.code(),
         format!(
-            "{program} {args:?}: {}{}",
+            "{tool} {args:?}: {}{}",
             String::from_utf8_lossy(&out.stdout),
             String::from_utf8_lossy(&out.stderr)
         ),
     )
 }
 
-fn fresh_image(tag: &str, features: &str) -> Option<String> {
-    let mkfs = tool("mkfs.ext4")?;
-    tool("e2fsck")?;
-    tool("debugfs")?;
+fn fresh_image(tag: &str, features: &str) -> String {
+    let mkfs = "mkfs.ext4";
     let image =
         fs_ext4_test_support::temp_path!("fs_ext4_jbd2_csum_{tag}_{}.img", std::process::id());
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(64 * 1024 * 1024))
         .unwrap();
     let (code, log) = run(
-        &mkfs,
+        mkfs,
         &["-q", "-F", "-b", "4096", "-O", features, &image],
         None,
     );
     assert_eq!(code, Some(0), "{log}");
-    Some(image)
+    image
 }
 
 fn pattern(i: usize) -> Vec<u8> {
@@ -96,7 +76,7 @@ fn read_block(image: &str, block: u64) -> Vec<u8> {
 }
 
 fn incompat_features(image: &str) -> String {
-    let (_, log) = run(&tool("dumpe2fs").unwrap(), &["-h", image], None);
+    let (_, log) = run("dumpe2fs", &["-h", image], None);
     log.lines()
         .filter(|l| l.starts_with("Journal features:"))
         .collect()
@@ -155,10 +135,7 @@ fn set_journal_incompat(image: &str, bits: u32) {
 }
 
 fn e2fsck_replays_what_this_crate_committed(tag: &str, features: &str, bits: u32, journal: &str) {
-    let Some(image) = fresh_image(tag, features) else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = fresh_image(tag, features);
     set_journal_incompat(&image, bits);
     assert!(
         incompat_features(&image).contains(journal),
@@ -190,8 +167,8 @@ fn e2fsck_replays_what_this_crate_committed(tag: &str, features: &str, bits: u32
         );
     }
 
-    let e2fsck = tool("e2fsck").unwrap();
-    let (code, log) = run(&e2fsck, &["-fy", &image], None);
+    let e2fsck = "e2fsck";
+    let (code, log) = run(e2fsck, &["-fy", &image], None);
     assert!(matches!(code, Some(0 | 1)), "[{tag}] {log}");
     for (i, &block) in TARGETS.iter().enumerate() {
         assert!(
@@ -199,7 +176,7 @@ fn e2fsck_replays_what_this_crate_committed(tag: &str, features: &str, bits: u32
             "[{tag}] e2fsck did not replay block {block} of the crate's transaction: {log}"
         );
     }
-    let (code, log) = run(&e2fsck, &["-fn", &image], None);
+    let (code, log) = run(e2fsck, &["-fn", &image], None);
     assert_eq!(code, Some(0), "[{tag}] {log}");
     let _ = std::fs::remove_file(&image);
 }
@@ -228,21 +205,17 @@ fn e2fsck_replays_a_csum_v3_32bit_transaction() {
 
 /// A dirty journal written by `debugfs`: one transaction logging `TARGETS`
 /// and revoking `REVOKED`.
-fn debugfs_journal(tag: &str) -> Option<String> {
-    let image = fresh_image(tag, "metadata_csum,64bit")?;
+fn debugfs_journal(tag: &str) -> String {
+    let image = fresh_image(tag, "metadata_csum,64bit");
     let data = format!("{image}.data");
     let bytes: Vec<u8> = (0..TARGETS.len()).flat_map(pattern).collect();
     std::fs::write(&data, bytes).unwrap();
     let blocks = TARGETS.map(|b| b.to_string()).join(",");
     let script = format!("jo -c\njw -b {blocks} -r {REVOKED} {data}\njc\n");
-    let (code, log) = run(
-        &tool("debugfs").unwrap(),
-        &["-w", "-f", "-", &image],
-        Some(&script),
-    );
+    let (code, log) = run("debugfs", &["-w", "-f", "-", &image], Some(&script));
     let _ = std::fs::remove_file(&data);
     assert!(code == Some(0) && log.contains("Setting csum v3"), "{log}");
-    Some(image)
+    image
 }
 
 /// Flip one byte of journal block `journal_block` at `offset`.
@@ -266,10 +239,7 @@ fn damage_journal(image: &str, journal_block: u64, offset: u64) {
 
 #[test]
 fn a_debugfs_transaction_is_replayed() {
-    let Some(image) = debugfs_journal("replayed") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = debugfs_journal("replayed");
     Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap())).expect("mount replays");
     for (i, &block) in TARGETS.iter().enumerate() {
         assert!(
@@ -285,10 +255,7 @@ fn a_debugfs_transaction_is_replayed() {
 /// corruption: nothing is replayed.
 #[test]
 fn a_damaged_data_block_is_refused() {
-    let Some(image) = debugfs_journal("data") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = debugfs_journal("data");
     damage_journal(&image, 3, 100);
     let err = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
         .err()
@@ -304,10 +271,7 @@ fn a_damaged_data_block_is_refused() {
 /// transaction is not replayed and the mount goes ahead.
 #[test]
 fn a_damaged_commit_block_ends_the_log() {
-    let Some(image) = debugfs_journal("commit") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = debugfs_journal("commit");
     damage_journal(&image, 6, 100);
     Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
         .expect("a torn commit is the end of the log, not an error");
@@ -322,10 +286,7 @@ fn a_damaged_commit_block_ends_the_log() {
 /// nothing replayed.
 #[test]
 fn a_damaged_descriptor_in_a_committed_transaction_is_refused() {
-    let Some(image) = debugfs_journal("descriptor") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = debugfs_journal("descriptor");
     damage_journal(&image, 1, 4000);
     let err = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
         .err()
@@ -341,10 +302,7 @@ fn a_damaged_descriptor_in_a_committed_transaction_is_refused() {
 /// crash tore: the end of the log.
 #[test]
 fn a_torn_transaction_ends_the_log() {
-    let Some(image) = debugfs_journal("torn") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = debugfs_journal("torn");
     damage_journal(&image, 1, 4000);
     damage_journal(&image, 6, 100);
     Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
@@ -359,10 +317,7 @@ fn a_torn_transaction_ends_the_log() {
 /// does too, rather than pick one layout.
 #[test]
 fn both_checksum_versions_are_refused() {
-    let Some(image) = debugfs_journal("v2v3") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = debugfs_journal("v2v3");
     set_journal_incompat(&image, 0x8);
     let err = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))
         .err()
@@ -378,10 +333,7 @@ fn both_checksum_versions_are_refused() {
 /// replay refuses rather than walks.
 #[test]
 fn an_unsupported_journal_feature_is_refused() {
-    let Some(image) = debugfs_journal("async") else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let image = debugfs_journal("async");
     set_journal_incompat(&image, 0x4);
 
     let err = Filesystem::mount(Arc::new(FileDevice::open_rw(&image).unwrap()))

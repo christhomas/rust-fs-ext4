@@ -1,6 +1,6 @@
 //! C ABI read-through test for files using INCOMPAT_INLINE_DATA.
 //!
-//! ext4-inline.img layout (built by test-disks/build-ext4-feature-images.sh):
+//! ext4-inline.img layout (built by `chore fixtures`; recipe in test-disks/guest-build-images.sh):
 //!   /tiny.txt   — "tiny inline\n" (12 bytes, fits in i_block alone)
 //!   /medium.txt — 100x 'A' (overflows into system.data xattr)
 //!   /symlink    — symlink to "target/path/here"
@@ -12,7 +12,7 @@ use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
 use std::os::raw::c_void;
 
-const TEST_IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-inline.img");
+const TEST_IMAGE: &str = "ext4-inline.img";
 
 fn last_err_str() -> String {
     unsafe {
@@ -25,9 +25,10 @@ fn last_err_str() -> String {
 }
 
 fn mount() -> *mut fs_ext4_fs_t {
-    let path = CString::new(TEST_IMAGE).unwrap();
+    let image = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), TEST_IMAGE);
+    let path = CString::new(image.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
-    assert!(!fs.is_null(), "mount failed: {}", last_err_str());
+    assert!(!fs.is_null(), "mount {image} failed: {}", last_err_str());
     fs
 }
 

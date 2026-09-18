@@ -75,9 +75,9 @@ fn volume_info_flags_dirty_image() {
     // exercises superblock parse → Filesystem.sb → fs_ext4_get_volume_info.
     use std::fs;
     use std::io::{Read, Seek, SeekFrom, Write};
-    let src = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-no-csum.img");
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-no-csum.img");
     let tmp = fs_ext4_test_support::temp_dir().join("fs_ext4-dirty-fixture.img");
-    fs::copy(src, &tmp).expect("copy no-csum image");
+    fs::copy(&src, &tmp).expect("copy no-csum image");
 
     // `s_state` lives at superblock byte offset 0x3A → file offset 1024+0x3A.
     {
@@ -212,13 +212,14 @@ fn stat_non_root_path() {
     }
     unsafe { fs_ext4_dir_close(iter) };
 
-    if let Some(name) = found_file {
-        let p = CString::new(format!("/{}", name)).unwrap();
-        let mut attr = unsafe { std::mem::zeroed::<fs_ext4_attr_t>() };
-        let rc = unsafe { fs_ext4_stat(fs, p.as_ptr(), &mut attr) };
-        assert_eq!(rc, 0, "stat /{} failed: {}", name, last_err_str());
-        assert_eq!(attr.file_type as u32, fs_ext4_file_type_t::RegFile as u32);
-    }
+    // ext4-basic.img's recipe writes /test.txt, so the root has a regular file.
+    let name =
+        found_file.expect("ext4-basic.img's root has no regular file (recipe writes /test.txt)");
+    let p = CString::new(format!("/{}", name)).unwrap();
+    let mut attr = unsafe { std::mem::zeroed::<fs_ext4_attr_t>() };
+    let rc = unsafe { fs_ext4_stat(fs, p.as_ptr(), &mut attr) };
+    assert_eq!(rc, 0, "stat /{} failed: {}", name, last_err_str());
+    assert_eq!(attr.file_type as u32, fs_ext4_file_type_t::RegFile as u32);
 
     unsafe { fs_ext4_umount(fs) };
 }
@@ -240,8 +241,8 @@ fn stat_missing_path_returns_error() {
 
 #[test]
 fn read_file_returns_expected_content() {
-    // test-disks/ext4-basic.img has /test.txt = "hello from ext4.\n"
-    // (per instance 5's end-to-end milestone announcement)
+    // test-disks/ext4-basic.img has /test.txt = "hello from ext4\n"
+    // (test-disks/guest-build-images.sh, build_basic)
     let path = CString::new(test_image()).unwrap();
     let fs = unsafe { fs_ext4_mount(path.as_ptr()) };
     assert!(!fs.is_null());
@@ -258,18 +259,19 @@ fn read_file_returns_expected_content() {
         )
     };
 
-    if n > 0 {
-        let content = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
-        println!("/test.txt content: {:?} ({} bytes)", content, n);
-        assert!(
-            content.contains("hello"),
-            "expected 'hello' in {:?}",
-            content
-        );
-    } else {
-        // If the test image doesn't have /test.txt, at least verify the error path works
-        eprintln!("skip: read_file returned {n}: {}", last_err_str());
-    }
+    // ext4-basic.img's recipe writes /test.txt; a failed read is a failure.
+    assert!(
+        n > 0,
+        "read_file /test.txt returned {n}: {}",
+        last_err_str()
+    );
+    let content = std::str::from_utf8(&buf[..n as usize]).unwrap_or("");
+    println!("/test.txt content: {:?} ({} bytes)", content, n);
+    assert!(
+        content.contains("hello"),
+        "expected 'hello' in {:?}",
+        content
+    );
 
     unsafe { fs_ext4_umount(fs) };
 }

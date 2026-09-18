@@ -12,7 +12,6 @@ use fs_ext4::capi::*;
 use std::ffi::{c_char, c_int, c_void, CString};
 use std::fs;
 use std::io::{Read, Seek, SeekFrom, Write};
-use std::path::Path;
 use std::sync::Mutex;
 
 struct FileCtx {
@@ -115,15 +114,8 @@ const FT_REG_FILE: u8 = 1;
 ///
 /// Per-image entry points below call this and surface PASS/FAIL in the test name.
 fn run_round_trip(image_basename: &str) {
-    let src = format!(
-        "{}/test-disks/{}.img",
-        env!("CARGO_MANIFEST_DIR"),
-        image_basename
-    );
-    if !Path::new(&src).exists() {
-        eprintln!("SKIP {image_basename}: fixture missing at {src}");
-        return;
-    }
+    let src =
+        fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), &format!("{image_basename}.img"));
     let scratch = format!(
         "{}/test-disks/_smoke_{}.img",
         env!("CARGO_MANIFEST_DIR"),

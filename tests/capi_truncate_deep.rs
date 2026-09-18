@@ -15,27 +15,20 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(
-    env!("CARGO_MANIFEST_DIR"),
-    "/test-disks/ext4-deep-extents.img"
-);
-
-fn scratch() -> Option<PathBuf> {
-    if !std::path::Path::new(SRC).exists() {
-        eprintln!("skip: {SRC} not built");
-        return None;
-    }
+#[track_caller]
+fn scratch() -> PathBuf {
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-deep-extents.img");
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
         "fs_ext4_capi_truncate_deep_{}_{n}.img",
         std::process::id()
     ));
-    let bytes = fs::read(SRC).expect("read src");
+    let bytes = fs::read(&src).expect("read src");
     let mut out = fs::File::create(&dst).expect("create");
     out.write_all(&bytes).expect("write");
     out.flush().expect("flush");
-    Some(dst)
+    dst
 }
 
 fn last_err() -> String {
@@ -50,9 +43,7 @@ fn last_err() -> String {
 
 #[test]
 fn truncate_on_multi_level_extent_tree_rejects_cleanly() {
-    let Some(img) = scratch() else {
-        return;
-    };
+    let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let path_c = CString::new("/sparse.bin").unwrap();
 
@@ -84,9 +75,7 @@ fn truncate_on_single_extent_file_still_works_after_deep_reject() {
     // Same idea as above but isolated, in case someone removes the dense
     // fallback from the first test: verify the straightforward case stays
     // healthy on this image.
-    let Some(img) = scratch() else {
-        return;
-    };
+    let img = scratch();
     let img_c = CString::new(img.to_str().unwrap()).unwrap();
     let fs = unsafe { fs_ext4_mount_rw(img_c.as_ptr()) };
     assert!(!fs.is_null(), "mount_rw: {}", last_err());

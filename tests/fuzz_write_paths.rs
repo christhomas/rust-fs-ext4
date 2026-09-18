@@ -17,21 +17,14 @@ use std::io::{Seek, SeekFrom, Write};
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_fuzzwp_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 /// Stomp `len` bytes at `offset` with a deterministic pattern.
@@ -55,9 +48,7 @@ fn write_paths_on_stomped_inode_table_never_panic() {
     // Stomp the inode table region (varies by image but typically starts
     // around block 5-10 of group 0 → byte offset 20480-40960). Picking
     // 24 KiB to land somewhere meaningful for ext4-basic.img.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "inode_stomp") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "inode_stomp");
     stomp(&path, 24576, 4096);
 
     let result = try_call(|| {
@@ -82,9 +73,7 @@ fn write_paths_on_stomped_inode_table_never_panic() {
 fn write_paths_on_stomped_block_bitmap_never_panic() {
     // Stomp the block bitmap area. For ext4-basic.img the bitmap is
     // typically a few blocks into the image — try byte offset 8192.
-    let Some(path) = copy_to_tmp("ext4-basic.img", "bitmap_stomp") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "bitmap_stomp");
     stomp(&path, 8192, 4096);
 
     let result = try_call(|| {
@@ -105,9 +94,7 @@ fn write_paths_on_stomped_block_bitmap_never_panic() {
 
 #[test]
 fn extreme_setxattr_value_lengths_never_panic() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "extreme_xattr") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "extreme_xattr");
     let result = try_call(|| {
         let dev = FileDevice::open_rw(&path).expect("open");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
@@ -127,17 +114,13 @@ fn extreme_setxattr_value_lengths_never_panic() {
 
 #[test]
 fn extreme_truncate_sizes_never_panic() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "extreme_trunc") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "extreme_trunc");
     let result = try_call(|| {
         let dev = FileDevice::open_rw(&path).expect("open");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
         let mut reader = |ino: u32| fs.read_inode_verified(ino).map(|(i, _)| i);
-        let Ok(ino) = fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, "/test.txt")
-        else {
-            return;
-        };
+        let ino = fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut reader, "/test.txt")
+            .expect("ext4-basic.img carries /test.txt");
         // Truncate to ridiculous sizes — must not panic.
         let _ = fs.apply_truncate_grow(ino, u64::MAX);
         let _ = fs.apply_truncate_grow(ino, u64::MAX / 2);
@@ -151,9 +134,7 @@ fn extreme_truncate_sizes_never_panic() {
 
 #[test]
 fn writes_to_nonexistent_paths_never_panic() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "nonexistent") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "nonexistent");
     let result = try_call(|| {
         let dev = FileDevice::open_rw(&path).expect("open");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
@@ -177,9 +158,7 @@ fn writes_to_nonexistent_paths_never_panic() {
 
 #[test]
 fn read_only_device_rejects_all_writes_cleanly() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "ro_writes") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "ro_writes");
     let result = try_call(|| {
         let dev = FileDevice::open(&path).expect("open ro");
         let fs = Filesystem::mount(Arc::new(dev)).expect("mount");

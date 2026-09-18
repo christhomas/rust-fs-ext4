@@ -12,8 +12,8 @@
 //! the Pi SD card"); `ext4-basic.img` is the control.
 //!
 //! The mutated image is intentionally left in the selected scratch directory
-//! (path is printed) so the
-//! Alpine-VM `e2fsck` pass can validate it against a real Linux ext4 — the
+//! (path is printed) so `e2fsck -fn` on the host can validate it against a
+//! real Linux ext4 — the
 //! in-process `is_clean()` check cannot catch a bad-checksum-but-marked-clean
 //! journal, which is exactly the field symptom.
 
@@ -23,35 +23,30 @@ use std::fs;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     static COUNTER: AtomicUsize = AtomicUsize::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst = fs_ext4_test_support::temp_path!(
         "fs_ext4_repro_wants_{}_{tag}_{n}.img",
         std::process::id()
     );
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn assert_clean(path: &str, tag: &str) {
     let dev = FileDevice::open(path).expect("ro reopen");
     let fs = Filesystem::mount(Arc::new(dev)).expect("remount");
-    if let Some(jsb) = fs_ext4::jbd2::read_superblock(&fs).expect("jsb") {
-        assert!(
-            jsb.is_clean(),
-            "[{tag}] journal NOT clean after the field ops (start={}) — the field bug",
-            jsb.start
-        );
-    }
+    // Both fixtures (ext4-csum-seed.img, ext4-basic.img) are built with has_journal.
+    let jsb = fs_ext4::jbd2::read_superblock(&fs)
+        .expect("jsb")
+        .unwrap_or_else(|| panic!("[{tag}] fixture has no journal superblock"));
+    assert!(
+        jsb.is_clean(),
+        "[{tag}] journal NOT clean after the field ops (start={}) — the field bug",
+        jsb.start
+    );
 }
 
 /// The JBD2 superblock checksum on disk must match a fresh recompute after our
@@ -61,12 +56,15 @@ fn assert_clean(path: &str, tag: &str) {
 fn assert_jsb_checksum_valid(path: &str, tag: &str) {
     let dev = FileDevice::open(path).expect("ro");
     let fs = Filesystem::mount(Arc::new(dev)).expect("remount");
-    let Some(jsb) = fs_ext4::jbd2::read_superblock(&fs).expect("jsb") else {
-        return;
-    };
-    if !jsb.uses_csum_v2_or_v3() {
-        return; // v1 journals carry no superblock checksum
-    }
+    // Both fixtures are built with has_journal + metadata_csum, which gives the
+    // journal journal_checksum_v3.
+    let jsb = fs_ext4::jbd2::read_superblock(&fs)
+        .expect("jsb")
+        .unwrap_or_else(|| panic!("[{tag}] fixture has no journal superblock"));
+    assert!(
+        jsb.uses_csum_v2_or_v3(),
+        "[{tag}] fixture journal has no v2/v3 checksum (expected journal_checksum_v3)"
+    );
     let (jinode, _) = fs
         .read_inode_verified(fs.sb.journal_inode)
         .expect("journal inode");
@@ -100,10 +98,7 @@ const UNITS: &[&str] = &[
 ];
 
 fn run_field_ops(img: &str, tag: &str) {
-    let Some(path) = copy_to_tmp(img, tag) else {
-        eprintln!("[{tag}] fixture {img} missing — skipping");
-        return;
-    };
+    let path = copy_to_tmp(img, tag);
 
     {
         let dev = FileDevice::open_rw(&path).expect("open_rw");

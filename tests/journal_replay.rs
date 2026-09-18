@@ -21,33 +21,24 @@ use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str) -> Option<String> {
+fn copy_to_tmp(name: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     // Unique-per-call: cargo runs test fns in parallel threads; a shared name
     // would race on create/delete.
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_replay_{}_{n}_{}.img", std::process::id(), name);
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 #[test]
 fn writable_mount_preserves_read_path() {
     // A read-write-opened copy of ext4-basic.img must mount cleanly and
     // return the same sb info as a read-only mount.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open_rw");
     assert!(dev.is_writable());
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount rw");
@@ -60,9 +51,7 @@ fn writable_mount_preserves_read_path() {
 fn clean_journal_is_no_op() {
     // A freshly-built image has jsb.start == 0 (clean). replay_if_dirty
     // must return 0 and not attempt any writes.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open_rw(&path).expect("open_rw");
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
     let n = journal_apply::replay_if_dirty(&fs).expect("replay_if_dirty");
@@ -75,9 +64,7 @@ fn synthetic_dirty_journal_round_trip() {
     // End-to-end: inject a descriptor+data+commit sequence into the journal
     // file, bump jsb.start so walk() sees it as dirty, replay, and assert
     // the target fs block now holds the data we wrote.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
 
     let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
     let fs = Filesystem::mount(dev.clone()).expect("mount");
@@ -180,9 +167,7 @@ fn synthetic_dirty_journal_round_trip() {
 fn read_only_device_skips_replay_silently() {
     // A read-only open on a clean image: replay_if_dirty returns 0 without
     // error even though write_at would fail.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = FileDevice::open(&path).expect("open RO");
     assert!(!dev.is_writable());
     let fs = Filesystem::mount(Arc::new(dev)).expect("mount RO");
@@ -223,9 +208,7 @@ fn plan_writing_to(fs_block: u64) -> journal::ReplayPlan {
 
 #[test]
 fn replay_refuses_a_destination_past_the_last_block() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
     let fs = Filesystem::mount(dev).expect("mount");
 
@@ -251,9 +234,7 @@ fn replay_refuses_a_destination_past_the_last_block() {
 
 #[test]
 fn replay_refuses_a_destination_whose_byte_offset_wraps() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
     let fs = Filesystem::mount(dev).expect("mount");
     let block_size = fs.sb.block_size() as u64;

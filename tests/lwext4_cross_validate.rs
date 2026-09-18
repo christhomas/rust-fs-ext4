@@ -1,10 +1,13 @@
 //! Cross-validate fs-ext4 images against lwext4 (BSD-2-Clause).
 //!
-//! **Opt-in.** This harness is silently skipped unless the env var
-//! `LWEXT4_DIR` points at a built lwext4 source tree. The intent: dev
-//! machines run `cargo test` without needing a C compiler + lwext4
-//! checkout, while a dedicated CI lane (or
-//! `scripts/cross-validate-lwext4.sh`) explicitly opts in.
+//! **Not implemented yet (#99), and ignored rather than skipped.** The
+//! comparison itself has not been written, so there is nothing for a
+//! default `cargo test` to run. It used to "skip" when `LWEXT4_DIR` was
+//! unset — two tests printing SKIP and passing, which reads exactly like
+//! validation that happened. It is now one `#[ignore]`d test, counted as
+//! ignored in every run, that fails when asked for
+//! (`scripts/cross-validate-lwext4.sh` runs it with `--ignored`) until
+//! the comparison exists.
 //!
 //! ## Why a separate impl?
 //!
@@ -28,58 +31,34 @@
 //!   4. Report any divergence as the test failure — the message points
 //!      at which file diverged and how.
 //!
-//! Phase A status: the env-var-gated skeleton lands here so the test
-//! contract is recorded and `scripts/cross-validate-lwext4.sh` has a
-//! target to invoke. The full diff machinery is a focused follow-up
-//! once a lwext4 build is committed to either CI or a dev's local box.
+//! Status: the contract is recorded here and
+//! `scripts/cross-validate-lwext4.sh` builds lwext4 and invokes the
+//! ignored test. The diff machinery is the follow-up (#99); when it
+//! lands, lwext4 becomes another oracle the harness VM provides and the
+//! `#[ignore]` goes.
 //!
 //! Spec source: github.com/gkostka/lwext4 (BSD-2-Clause).
 
-use std::path::PathBuf;
-
-/// Resolve the lwext4 build dir from env. Returns `None` (test skipped)
-/// when not set or not pointing at a built tree.
-fn lwext4_dir() -> Option<PathBuf> {
-    let raw = std::env::var("LWEXT4_DIR").ok()?;
-    let p = PathBuf::from(raw);
-    // Existence check on the static lib — proves we're pointing at a
-    // built tree, not just an empty checkout. The script
-    // (`cross-validate-lwext4.sh`) builds this artifact via `make
-    // generic` before invoking the test.
-    let lib = p.join("build_generic/src/liblwext4.a");
-    if lib.exists() {
-        Some(p)
-    } else {
-        None
-    }
-}
-
+/// The one entry point, and it is ignored: see the module header. Asked
+/// for explicitly (`--ignored`), it requires `LWEXT4_DIR` — a built
+/// lwext4 tree — and then fails, because the comparison does not exist.
 #[test]
-fn lwext4_cross_validate_skips_when_lwext4_dir_unset() {
-    // Self-test of the gating logic. Always passes; documents the
-    // skip contract so a developer running `cargo test` on a stock
-    // box understands why no validation actually happens here.
-    let dir = lwext4_dir();
-    if dir.is_none() {
-        eprintln!(
-            "[lwext4_cross_validate] SKIP: set LWEXT4_DIR to a built lwext4 tree to enable. \
-             Easiest: run `scripts/cross-validate-lwext4.sh` which clones, builds, \
-             exports the env var, and re-invokes this test."
-        );
-        return;
-    }
-    eprintln!(
-        "[lwext4_cross_validate] lwext4 detected at {}",
-        dir.as_ref().unwrap().display()
-    );
-}
-
-#[test]
+#[ignore = "lwext4 cross-validation is not implemented (#99); scripts/cross-validate-lwext4.sh runs it with --ignored"]
 fn lwext4_cross_validate_each_test_image() {
-    match lwext4_dir() {
-        None => eprintln!("[lwext4_cross_validate] SKIP (no LWEXT4_DIR)"),
-        Some(dir) => cross_validate_each_test_image(&dir),
-    }
+    let dir = std::env::var_os("LWEXT4_DIR")
+        .map(std::path::PathBuf::from)
+        .unwrap_or_else(|| {
+            panic!(
+                "[lwext4_cross_validate] LWEXT4_DIR is not set: run \
+             `scripts/cross-validate-lwext4.sh`, which builds lwext4 and sets it"
+            )
+        });
+    assert!(
+        dir.join("build_generic/src/liblwext4.a").is_file(),
+        "[lwext4_cross_validate] LWEXT4_DIR={} is not a built lwext4 tree",
+        dir.display()
+    );
+    cross_validate_each_test_image(&dir);
 }
 
 /// The comparison, when a built lwext4 tree is present.
@@ -111,7 +90,7 @@ fn cross_validate_each_test_image(dir: &std::path::Path) {
 /// lane that sets `LWEXT4_DIR` cannot go green on an empty body.
 #[test]
 fn enabling_the_harness_fails_until_it_compares_something() {
-    let fake = std::env::temp_dir().join(format!("lwext4-fake-{}", std::process::id()));
+    let fake = fs_ext4_test_support::temp_dir().join(format!("lwext4-fake-{}", std::process::id()));
     std::fs::create_dir_all(fake.join("build_generic/src")).unwrap();
     std::fs::write(fake.join("build_generic/src/liblwext4.a"), b"").unwrap();
     let outcome = std::panic::catch_unwind(|| cross_validate_each_test_image(&fake));

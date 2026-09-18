@@ -1,13 +1,12 @@
 //! POSIX ACL decoding tests against test-disks/ext4-acl.img.
 //!
-//! Image layout (see build-ext4-feature-images.sh build_acl):
+//! Image layout (see test-disks/guest-build-images.sh build_acl):
 //!   /mode_only.txt  — u::rwx g::r-x o::r--  (3 short entries, no MASK)
 //!   /named.txt      — u::rwx u:1000:rw- g::r-x g:2000:r-- m::rwx o::r--
 //!   /acl_dir/       — access + default ACL
 //!   /plain.txt      — no ACL
 //!
-//! These tests are skipped when the image is not present (the Docker builder
-//! is macOS-unavailable without docker), matching @5's pattern.
+//! The image is built by `chore fixtures`; these tests fail when it is absent.
 
 use fs_ext4::acl::{self, AclKind, AclTag, ACL_EXECUTE, ACL_READ, ACL_WRITE};
 use fs_ext4::bgd;
@@ -17,20 +16,16 @@ use fs_ext4::fs::Filesystem;
 use fs_ext4::inode::Inode;
 use fs_ext4::path;
 use fs_ext4::xattr;
-use std::path::Path;
 use std::sync::Arc;
 
-const TEST_IMAGE: &str = "test-disks/ext4-acl.img";
+const TEST_IMAGE: &str = "ext4-acl.img";
 
-fn open_or_skip() -> Option<(Arc<dyn BlockDevice>, Filesystem)> {
-    if !Path::new(TEST_IMAGE).exists() {
-        eprintln!("skip: {TEST_IMAGE} not built; run test-disks/build-ext4-feature-images.sh acl");
-        return None;
-    }
-    let dev = Arc::new(FileDevice::open(TEST_IMAGE).expect("open acl image"));
+fn open_fixture() -> (Arc<dyn BlockDevice>, Filesystem) {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), TEST_IMAGE);
+    let dev = Arc::new(FileDevice::open(&path).expect("open acl image"));
     let dev_dyn: Arc<dyn BlockDevice> = dev.clone();
     let fs = Filesystem::mount(dev_dyn.clone()).expect("mount");
-    Some((dev_dyn, fs))
+    (dev_dyn, fs)
 }
 
 fn read_inode_raw_bytes(fs: &Filesystem, ino: u32) -> Vec<u8> {
@@ -61,11 +56,18 @@ fn read_parsed(fs: &Filesystem, ino: u32) -> Inode {
     Inode::parse(&raw).expect("parse")
 }
 
+/// `setfacl -m u::rwx,g::r-x,o::r--` names only the owner, group and other
+/// entries, which the mode bits already hold, so the kernel folds the ACL
+/// into `i_mode` (0754) and stores no `system.posix_acl_access` at all
+/// (`debugfs -R 'ea_list /mode_only.txt'` lists nothing). The reader must
+/// report no ACL rather than invent one.
+///
+/// This test used to accept either "no xattr" or "three entries" and
+/// return early on the first — which, on a kernel-made fixture, is the
+/// only case that ever happens, so the assertions after it never ran.
 #[test]
-fn mode_only_file_has_three_short_entries() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+fn mode_only_acl_is_folded_into_the_mode_bits() {
+    let (dev, fs) = open_fixture();
     let ino = resolve(dev.as_ref(), &fs, "/mode_only.txt");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);
@@ -80,26 +82,20 @@ fn mode_only_file_has_three_short_entries() {
     )
     .expect("read acl");
 
-    // A minimal mode-mapped ACL (u/g/o only) may be omitted by the kernel entirely
-    // since it's derivable from st_mode. Tolerate both "no xattr" and "three entries".
-    let Some(entries) = entries else {
-        eprintln!("note: kernel stored mode-only ACL inline in st_mode (no xattr)");
-        return;
-    };
-    assert_eq!(entries.len(), 3, "expected 3 entries, got {entries:?}");
-    assert_eq!(entries[0].tag, AclTag::UserObj);
-    assert_eq!(entries[0].perm, ACL_READ | ACL_WRITE | ACL_EXECUTE);
-    assert_eq!(entries[1].tag, AclTag::GroupObj);
-    assert_eq!(entries[1].perm, ACL_READ | ACL_EXECUTE);
-    assert_eq!(entries[2].tag, AclTag::Other);
-    assert_eq!(entries[2].perm, ACL_READ);
+    assert!(
+        entries.is_none(),
+        "a mode-equivalent ACL is not stored as an xattr, got {entries:?}"
+    );
+    assert_eq!(
+        inode.mode & 0o777,
+        0o754,
+        "u::rwx,g::r-x,o::r-- as mode bits"
+    );
 }
 
 #[test]
 fn named_user_and_group_entries_present() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     let ino = resolve(dev.as_ref(), &fs, "/named.txt");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);
@@ -136,9 +132,7 @@ fn named_user_and_group_entries_present() {
 
 #[test]
 fn directory_has_access_and_default_acl() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     let ino = resolve(dev.as_ref(), &fs, "/acl_dir");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);
@@ -188,9 +182,7 @@ fn directory_has_access_and_default_acl() {
 
 #[test]
 fn plain_file_has_no_acl() {
-    let Some((dev, fs)) = open_or_skip() else {
-        return;
-    };
+    let (dev, fs) = open_fixture();
     let ino = resolve(dev.as_ref(), &fs, "/plain.txt");
     let inode = read_parsed(&fs, ino);
     let raw = read_inode_raw_bytes(&fs, ino);

@@ -26,7 +26,8 @@ test-disks/test-run/
 **/.vagrant/
 .claude/
 
-# VM harness scratch (images exchanged with the oracle VM).
+# fs-linux-test-harness shared directory (the fixture builder's images on
+# their way out of the VM).
 .vm-share/
 
 # chore fingerprint cache (sources:/generates: checksums). Derived data.

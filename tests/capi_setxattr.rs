@@ -11,16 +11,16 @@ use std::io::Write;
 use std::path::PathBuf;
 use std::sync::atomic::{AtomicU32, Ordering};
 
-const SRC: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-xattr.img");
-
+#[track_caller]
 fn scratch(tag: &str) -> PathBuf {
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-xattr.img");
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let dst = PathBuf::from(fs_ext4_test_support::temp_path!(
         "fs_ext4_capi_setxattr_{tag}_{}_{n}.img",
         std::process::id()
     ));
-    let bytes = fs::read(SRC).expect("read src");
+    let bytes = fs::read(&src).expect("read src");
     let mut out = fs::File::create(&dst).expect("create");
     out.write_all(&bytes).expect("write");
     out.flush().expect("flush");

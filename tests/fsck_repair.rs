@@ -30,23 +30,16 @@ use std::fs;
 use std::sync::atomic::{AtomicU32, Ordering};
 use std::sync::Arc;
 
-fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
-}
-
-fn copy_to_tmp(name: &str, slot: &str) -> Option<String> {
+fn copy_to_tmp(name: &str, slot: &str) -> String {
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
-    let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
+    let src = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name);
     let dst = fs_ext4_test_support::temp_path!(
         "fs_ext4_fsck_repair_{}_{slot}_{n}.img",
         std::process::id()
     );
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 /// Read every entry in a directory inode's data blocks. Used by the
@@ -178,8 +171,8 @@ fn fix_dir_csum_after_poke(image_path: &str, fs: &Filesystem, dir_ino: u32, phys
 
 /// Set up a corrupted image that has duplicate dirents pointing at
 /// one directory inode. Returns (image_path, kept_ino, alias_names).
-fn make_duplicate_dir_inode_corruption() -> Option<(String, u32, Vec<String>)> {
-    let path = copy_to_tmp("ext4-basic.img", "dup")?;
+fn make_duplicate_dir_inode_corruption() -> (String, u32, Vec<String>) {
+    let path = copy_to_tmp("ext4-basic.img", "dup");
 
     // Create three subdirs so we have real targets to alias around.
     let alias_target_ino;
@@ -241,15 +234,12 @@ fn make_duplicate_dir_inode_corruption() -> Option<(String, u32, Vec<String>)> {
     }
 
     let _ = kept_name;
-    Some((path, alias_target_ino, alias_names))
+    (path, alias_target_ino, alias_names)
 }
 
 #[test]
 fn repair_fixes_duplicate_dirent_for_dir_inode() {
-    let Some((path, kept_ino, alias_names)) = make_duplicate_dir_inode_corruption() else {
-        eprintln!("skip: ext4-basic.img not present");
-        return;
-    };
+    let (path, kept_ino, alias_names) = make_duplicate_dir_inode_corruption();
 
     // Sanity: pre-repair audit must see the duplicate.
     {
@@ -338,10 +328,7 @@ fn repair_fixes_duplicate_dirent_for_dir_inode() {
 
 #[test]
 fn audit_without_repair_leaves_corruption_intact() {
-    let Some((path, kept_ino, _)) = make_duplicate_dir_inode_corruption() else {
-        eprintln!("skip: ext4-basic.img not present");
-        return;
-    };
+    let (path, kept_ino, _) = make_duplicate_dir_inode_corruption();
 
     // First pass: repair = false. Anomaly reported, no mutation.
     {
@@ -378,10 +365,7 @@ fn audit_without_repair_leaves_corruption_intact() {
 
 #[test]
 fn repair_fixes_link_count_drift() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "linkfix") else {
-        eprintln!("skip: ext4-basic.img not present");
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "linkfix");
 
     // Create one regular file so we have an inode whose observed
     // link count (== 1) is stable. We then clobber its on-disk
@@ -475,8 +459,8 @@ fn repair_fixes_link_count_drift() {
 /// Fabricate the WrongDotDot scenario: create /subdir, then patch
 /// subdir's ".." dirent to claim a fake parent inode. Returns
 /// (image_path, subdir_ino, fake_parent_ino).
-fn make_wrong_dotdot_corruption() -> Option<(String, u32, u32)> {
-    let path = copy_to_tmp("ext4-basic.img", "wrongdotdot")?;
+fn make_wrong_dotdot_corruption() -> (String, u32, u32) {
+    let path = copy_to_tmp("ext4-basic.img", "wrongdotdot");
 
     let subdir_ino;
     {
@@ -518,15 +502,12 @@ fn make_wrong_dotdot_corruption() -> Option<(String, u32, u32)> {
         fix_dir_csum_after_poke(&path, &fs, subdir_ino, dotdot_slot.0);
     }
 
-    Some((path, subdir_ino, fake_parent))
+    (path, subdir_ino, fake_parent)
 }
 
 #[test]
 fn repair_fixes_wrong_dotdot() {
-    let Some((path, subdir_ino, fake_parent)) = make_wrong_dotdot_corruption() else {
-        eprintln!("skip: ext4-basic.img not present");
-        return;
-    };
+    let (path, subdir_ino, fake_parent) = make_wrong_dotdot_corruption();
 
     // Phase 1: audit-only confirms WrongDotDot is detected.
     {
@@ -617,8 +598,8 @@ fn poke_byte_raw(image_path: &str, block_size: u32, phys_block: u64, off: usize,
 /// rewrite its dirent's file_type byte (offset+7) to claim Directory
 /// (=2). Returns (image_path, file_ino) — the file_ino is the child
 /// the audit will report in BogusEntry.child_ino.
-fn make_bogus_entry_corruption() -> Option<(String, u32)> {
-    let path = copy_to_tmp("ext4-basic.img", "bogus")?;
+fn make_bogus_entry_corruption() -> (String, u32) {
+    let path = copy_to_tmp("ext4-basic.img", "bogus");
 
     let file_ino;
     {
@@ -648,15 +629,12 @@ fn make_bogus_entry_corruption() -> Option<(String, u32)> {
         fix_dir_csum_after_poke(&path, &fs, fs_ext4::path::EXT4_ROOT_INODE, slot.0);
     }
 
-    Some((path, file_ino))
+    (path, file_ino)
 }
 
 #[test]
 fn repair_fixes_bogus_entry() {
-    let Some((path, file_ino)) = make_bogus_entry_corruption() else {
-        eprintln!("skip: ext4-basic.img not present");
-        return;
-    };
+    let (path, file_ino) = make_bogus_entry_corruption();
 
     // Phase 1: audit detects BogusEntry with our injected child_ino.
     {
@@ -756,10 +734,7 @@ fn poke_sb_free_blocks_count_lo(image_path: &str, new_lo: u32) {
 
 #[test]
 fn repair_fixes_superblock_free_count_drift() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "freecount") else {
-        eprintln!("skip: ext4-basic.img not present");
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "freecount");
 
     // Read the current SB free_blocks_count, then clobber with a
     // bogus value so the bitmap-derived sum disagrees.

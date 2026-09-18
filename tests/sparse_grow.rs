@@ -17,22 +17,21 @@ use fs_ext4::Filesystem;
 use std::fs;
 use std::sync::Arc;
 
+#[track_caller]
 fn image_path(name: &str) -> String {
-    format!("{}/test-disks/{}", env!("CARGO_MANIFEST_DIR"), name)
+    fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), name)
 }
 
-fn copy_to_tmp(name: &str, tag: &str) -> Option<String> {
+#[track_caller]
+fn copy_to_tmp(name: &str, tag: &str) -> String {
     use std::sync::atomic::{AtomicU32, Ordering};
     static COUNTER: AtomicU32 = AtomicU32::new(0);
     let n = COUNTER.fetch_add(1, Ordering::Relaxed);
     let src = image_path(name);
-    if !std::path::Path::new(&src).exists() {
-        return None;
-    }
     let dst =
         fs_ext4_test_support::temp_path!("fs_ext4_sparse_{}_{tag}_{n}.img", std::process::id());
-    fs::copy(&src, &dst).ok()?;
-    Some(dst)
+    fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} -> {dst}: {e}"));
+    dst
 }
 
 fn resolve(fs: &Filesystem, path: &str) -> u32 {
@@ -42,9 +41,7 @@ fn resolve(fs: &Filesystem, path: &str) -> u32 {
 
 #[test]
 fn truncate_grow_preserves_existing_bytes() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "preserve") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "preserve");
 
     // /test.txt is "hello from ext4.\n" (17 bytes) in the fixture.
     let original_bytes: Vec<u8> = {
@@ -86,9 +83,7 @@ fn truncate_grow_preserves_existing_bytes() {
 
 #[test]
 fn truncate_grow_hole_reads_as_zeros() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "zeros") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "zeros");
 
     let new_size = 1024 * 1024u64;
     {
@@ -119,9 +114,7 @@ fn truncate_grow_hole_reads_as_zeros() {
 
 #[test]
 fn truncate_grow_keeps_i_blocks_constant() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "i_blocks") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "i_blocks");
 
     let blocks_before = {
         let dev = FileDevice::open(&path).expect("open ro");
@@ -152,9 +145,7 @@ fn truncate_grow_keeps_i_blocks_constant() {
 
 #[test]
 fn truncate_grow_persists_across_remount() {
-    let Some(path) = copy_to_tmp("ext4-basic.img", "remount") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img", "remount");
 
     let new_size = 1024 * 1024u64;
     {

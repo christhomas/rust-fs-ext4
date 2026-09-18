@@ -13,11 +13,10 @@
 # - Pure C, no kernel deps — runs anywhere `cc` runs.
 # - Handles ext2, ext3, AND ext4 — exercises every flavor we ship.
 #
-# This script is *opt-in*. The default `cargo test` pipeline does NOT
-# require lwext4 to be present; the matching Rust harness
-# (`tests/lwext4_cross_validate.rs`) skips itself when the env var
-# below is unset. Run this script manually before each release or in
-# a dedicated CI lane.
+# The comparison is NOT IMPLEMENTED yet (#99). The matching Rust test
+# (`tests/lwext4_cross_validate.rs`) is #[ignore]d, so it shows as
+# ignored in every `cargo test`; this script builds lwext4 and runs it
+# with --ignored, where it fails until the comparison exists.
 #
 # Usage:
 #   scripts/cross-validate-lwext4.sh                # build + run all
@@ -96,11 +95,11 @@ if [[ "$BUILD_ONLY" -eq 1 ]]; then
 fi
 
 # --- Step 2: run the gated Rust harness --------------------------------
-# The harness reads `LWEXT4_DIR` env var to discover the build artifacts.
-# When it's set + the lib exists, the harness runs; otherwise it skips
-# (so casual `cargo test` doesn't fail on machines without lwext4).
+# The harness reads `LWEXT4_DIR` to find the build. Its one test is
+# #[ignore]d (the comparison is not implemented, #99), so it is asked for
+# explicitly -- and fails, rather than reporting a comparison it did not make.
 cd "$CRATE_DIR"
 if [[ -n "$SINGLE_IMAGE" ]]; then
     export LWEXT4_VALIDATE_IMAGE="$SINGLE_IMAGE"
 fi
-cargo test --test lwext4_cross_validate -- --nocapture
+cargo test --test lwext4_cross_validate -- --ignored --nocapture

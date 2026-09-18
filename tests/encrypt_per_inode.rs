@@ -5,27 +5,17 @@
 //! file encrypted needs an fscrypt policy from a kernel, so `debugfs` sets
 //! `EXT4_ENCRYPT_FL` on them instead: what this driver must do with such an
 //! inode depends only on the flag, never on the ciphertext. The plain files'
-//! reference is `debugfs cat`. Skips when e2fsprogs is not installed.
+//! reference is `debugfs cat`. Fails when e2fsprogs is not installed
+//! (they run in the harness VM).
 
 #![cfg(unix)]
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::Filesystem;
-use std::process::Command;
 use std::sync::Arc;
 
-fn tool(name: &str) -> Option<String> {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-}
-
-fn run(program: &str, args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
-    let out = Command::new(program)
-        .args(args)
-        .output()
-        .unwrap_or_else(|e| panic!("{program}: {e}"));
+fn run(tool: &str, args: &[&str]) -> (Option<i32>, Vec<u8>, String) {
+    let out = fs_ext4_test_support::oracle(tool).args(args).output();
     (
         out.status.code(),
         out.stdout,
@@ -54,10 +44,8 @@ fn names_encryption(e: &fs_ext4::Error) -> bool {
 
 #[test]
 fn plain_files_read_and_encrypted_ones_are_refused() {
-    let (Some(mkfs), Some(debugfs)) = (tool("mkfs.ext4"), tool("debugfs")) else {
-        eprintln!("skip: e2fsprogs not installed");
-        return;
-    };
+    let mkfs = "mkfs.ext4";
+    let debugfs = "debugfs";
     let root = fs_ext4_test_support::temp_path!("fs_ext4_encrypt_{}", std::process::id());
     std::fs::create_dir_all(format!("{root}/plain")).unwrap();
     std::fs::create_dir_all(format!("{root}/secret")).unwrap();
@@ -71,7 +59,7 @@ fn plain_files_read_and_encrypted_ones_are_refused() {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(32 * 1024 * 1024))
         .unwrap();
-    let (code, _, log) = run(&mkfs, &["-q", "-F", "-O", "encrypt", "-d", &root, &image]);
+    let (code, _, log) = run(mkfs, &["-q", "-F", "-O", "encrypt", "-d", &root, &image]);
     assert_eq!(code, Some(0), "{log}");
     // EXTENTS | ENCRYPT on the directory, the file beside plain ones, and the
     // fast symlink (whose target lives in i_block).
@@ -81,7 +69,7 @@ fn plain_files_read_and_encrypted_ones_are_refused() {
         ("/plain/link", "0x800"),
     ] {
         let (code, _, log) = run(
-            &debugfs,
+            debugfs,
             &[
                 "-w",
                 "-R",
@@ -96,7 +84,7 @@ fn plain_files_read_and_encrypted_ones_are_refused() {
         .expect("a volume with the ENCRYPT feature mounts");
 
     for path in ["/plain/big.bin", "/plain/small.txt"] {
-        let (code, reference, log) = run(&debugfs, &["-R", &format!("cat {path}"), &image]);
+        let (code, reference, log) = run(debugfs, &["-R", &format!("cat {path}"), &image]);
         assert_eq!(code, Some(0), "{log}");
         assert!(
             read(&fs, path).unwrap() == reference,

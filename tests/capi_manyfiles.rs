@@ -6,22 +6,19 @@
 
 use fs_ext4::capi::*;
 use std::ffi::{CStr, CString};
-use std::path::Path;
 
-const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-manyfiles.img");
+const IMAGE: &str = "ext4-manyfiles.img";
 
-fn mount_or_skip() -> Option<*mut fs_ext4_fs_t> {
-    if !Path::new(IMAGE).exists() {
-        eprintln!("skip: {IMAGE} not built");
-        return None;
-    }
-    let p = CString::new(IMAGE).unwrap();
+fn mount_fixture() -> *mut fs_ext4_fs_t {
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), IMAGE);
+    let p = CString::new(path.as_str()).unwrap();
     let fs = unsafe { fs_ext4_mount(p.as_ptr()) };
-    if fs.is_null() {
-        eprintln!("skip: mount failed on {IMAGE}");
-        return None;
-    }
-    Some(fs)
+    assert!(
+        !fs.is_null(),
+        "fs_ext4_mount({path}) failed: {}",
+        unsafe { std::ffi::CStr::from_ptr(fs_ext4_last_error()) }.to_string_lossy()
+    );
+    fs
 }
 
 fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
@@ -48,9 +45,7 @@ fn list_dir(fs: *mut fs_ext4_fs_t, path: &str) -> Vec<String> {
 
 #[test]
 fn mount_and_umount_manyfiles() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let mut info: fs_ext4_volume_info_t = unsafe { std::mem::zeroed() };
     let rc = unsafe { fs_ext4_get_volume_info(fs, &mut info) };
     assert_eq!(rc, 0, "get_volume_info failed");
@@ -60,9 +55,7 @@ fn mount_and_umount_manyfiles() {
 
 #[test]
 fn root_listing_includes_dot_and_dotdot() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let entries = list_dir(fs, "/");
     assert!(entries.iter().any(|n| n == "."), "missing . in root");
     assert!(entries.iter().any(|n| n == ".."), "missing .. in root");
@@ -72,9 +65,7 @@ fn root_listing_includes_dot_and_dotdot() {
 
 #[test]
 fn stat_works_on_every_root_entry() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     let entries = list_dir(fs, "/");
     let mut errors = 0;
     for name in &entries {
@@ -103,9 +94,7 @@ fn stat_works_on_every_root_entry() {
 
 #[test]
 fn listing_does_not_panic_on_large_dir() {
-    let Some(fs) = mount_or_skip() else {
-        return;
-    };
+    let fs = mount_fixture();
     // Whatever the biggest directory turns out to be, opening + draining it
     // must not panic or OOM. 64MB image caps this at a reasonable size.
     let entries = list_dir(fs, "/");

@@ -14,10 +14,9 @@ use fs_ext4::capi::*;
 use std::ffi::CString;
 use std::fs;
 use std::os::raw::{c_int, c_void};
-use std::path::Path;
 use std::sync::{Arc, Mutex};
 
-const IMAGE: &str = concat!(env!("CARGO_MANIFEST_DIR"), "/test-disks/ext4-basic.img");
+const IMAGE: &str = "ext4-basic.img";
 
 struct DevCtx {
     bytes: Mutex<Vec<u8>>,
@@ -77,12 +76,9 @@ extern "C" fn flush_cb(ctx: *mut c_void) -> c_int {
     0
 }
 
-fn fixture_available() -> bool {
-    Path::new(IMAGE).exists()
-}
-
 fn fresh_dev() -> Arc<DevCtx> {
-    let bytes = fs::read(IMAGE).expect("read fixture image");
+    let path = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), IMAGE);
+    let bytes = fs::read(&path).unwrap_or_else(|e| panic!("read fixture image {path}: {e}"));
     Arc::new(DevCtx {
         bytes: Mutex::new(bytes),
         writes: Mutex::new(0),
@@ -104,10 +100,6 @@ fn make_cfg(dev: &Arc<DevCtx>, with_write: bool, with_flush: bool) -> fs_ext4_bl
 
 #[test]
 fn lazy_mount_does_not_write_during_mount() {
-    if !fixture_available() {
-        eprintln!("skipping: fixture {IMAGE} missing");
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true);
 
@@ -125,10 +117,6 @@ fn lazy_mount_does_not_write_during_mount() {
 
 #[test]
 fn replay_journal_if_dirty_when_clean_returns_zero_no_writes() {
-    if !fixture_available() {
-        eprintln!("skipping: fixture {IMAGE} missing");
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true);
 
@@ -151,10 +139,6 @@ fn replay_journal_if_dirty_when_dirty_replays() {
     // "_if_dirty", so a clean fixture is the same external observation
     // (returns 0, no error). This test guards the success-path return
     // value when called against a real handle.
-    if !fixture_available() {
-        eprintln!("skipping: fixture {IMAGE} missing");
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true);
 
@@ -168,10 +152,6 @@ fn replay_journal_if_dirty_when_dirty_replays() {
 
 #[test]
 fn lazy_then_replay_then_create_write_unlink_round_trip() {
-    if !fixture_available() {
-        eprintln!("skipping: fixture {IMAGE} missing");
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true);
 
@@ -220,10 +200,6 @@ fn lazy_then_replay_then_create_write_unlink_round_trip() {
 
 #[test]
 fn lazy_mount_eager_replay_on_existing_handle_is_idempotent() {
-    if !fixture_available() {
-        eprintln!("skipping: fixture {IMAGE} missing");
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, true, true);
 
@@ -257,10 +233,6 @@ fn lazy_mount_null_cfg_returns_null() {
 
 #[test]
 fn lazy_mount_null_write_returns_einval() {
-    if !fixture_available() {
-        eprintln!("skipping: fixture {IMAGE} missing");
-        return;
-    }
     let dev = fresh_dev();
     let cfg = make_cfg(&dev, false, false);
     let fs_h = unsafe { fs_ext4_mount_rw_with_callbacks_lazy(&cfg) };
