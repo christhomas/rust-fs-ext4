@@ -12,30 +12,20 @@
 //! leave a volume `e2fsck -fn` accepts, whose surviving blocks still read
 //! back their own bytes and whose punched ones read as zeros, and the blocks
 //! must go back: `i_blocks` falls by what was freed. Writing the holes again
-//! must then work. e2fsprogs is required.
+//! must then work. `mkfs.ext4` and `e2fsck` judge it, from the harness VM
+//! they live in.
 
 use fs_ext4::block_io::FileDevice;
 use fs_ext4::file_io;
 use fs_ext4::fs::Filesystem;
-use std::process::Command;
+use fs_ext4_test_support::oracle;
 use std::sync::Arc;
 
 /// Blocks in the file, one every `STRIDE` bytes.
 const EXTENTS: u64 = 800;
 
-fn tool(name: &str) -> String {
-    ["/usr/sbin", "/sbin", "/usr/bin", "/bin"]
-        .iter()
-        .map(|dir| format!("{dir}/{name}"))
-        .find(|p| std::path::Path::new(p).exists())
-        .unwrap_or_else(|| panic!("{name} is not installed; install e2fsprogs"))
-}
-
 fn e2fsck_clean(image: &str, what: &str) {
-    let out = Command::new(tool("e2fsck"))
-        .args(["-fn", image])
-        .output()
-        .unwrap();
+    let out = oracle("e2fsck").args(["-fn", image]).output();
     assert!(
         out.status.success(),
         "[{what}] e2fsck rejected the volume:\n{}",
@@ -58,11 +48,10 @@ fn punch_a_striped_file(tag: &str, block_size: u64) {
     std::fs::File::create(&image)
         .and_then(|f| f.set_len(256 * 1024 * 1024))
         .unwrap();
-    let mkfs = Command::new(tool("mkfs.ext4"))
+    let mkfs = oracle("mkfs.ext4")
         .args(["-q", "-F", "-b", &block_size.to_string()])
         .arg(&image)
-        .output()
-        .unwrap();
+        .output();
     assert!(
         mkfs.status.success(),
         "{}",
