@@ -138,11 +138,11 @@ Independent tools can:
   fast path, for a VM that is already up), `chore vm:put <file>` (lands in
   `/share`), `chore vm:down`. One VM runs at a time across every repository
   on the machine; `chore vm:slot:status` says who has it.
-- `scripts/cross-validate-lwext4.sh` + `tests/lwext4_cross_validate.rs` —
-  an independent C implementation; **not implemented yet** (#99), so its one
-  test is `#[ignore]`d and fails when run.
-- `tests/{qemu,vagrant}/freebsd/` — a real kernel, but FreeBSD's ext4 validates
-  JBD2 differently from Linux; not pre-built.
+- `tests/lwext4_cross_validate.rs` + `tests/lwext4/report.c` — A THIRD
+  IMPLEMENTATION. lwext4 (BSD-2-Clause, pure C) is built in the same guest
+  by `scripts/vm-setup.sh` at a pinned commit, and the two read each
+  other's images: every fixture it can mount, a tree this crate wrote, and
+  a tree it wrote itself. `chore test:lwext4`.
 
 To check a driver-mutated image by hand, ask the guest — the tools are
 there, and it sees this repository at the same path the host does:
