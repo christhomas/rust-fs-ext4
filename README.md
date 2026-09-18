@@ -547,6 +547,7 @@ chore test:unit     # the tests that need no tool, no fixture and no VM
 chore test:images   # the tests that read a fixture but need no VM
 chore test:oracle   # the driver writes, e2fsprogs reads back — in the VM
 chore test:kernel   # the driver writes, the real kernel reads back — in the VM
+chore test:lwext4   # a third implementation reads ours, and we read its — in the VM
 chore test:vm       # the whole suite, compiled and run INSIDE the VM
 chore test          # everything, as CI runs it
 ```
@@ -563,7 +564,10 @@ not an oracle. So a single Debian guest, provisioned by
 `tests/test_contract.rs` fails the suite if anything runs one here. **A
 Mac needs no e2fsprogs installed at all.**
 
-The same guest is the only place a filesystem is ever mounted: the kernel
+The same guest builds lwext4 — a third ext4 implementation, at the commit
+`scripts/vm-setup.sh` pins — so `chore test:lwext4` can cross-validate
+against something with no code lineage in common with either us or the
+kernel. And it is the only place a filesystem is ever mounted: the kernel
 oracles (`chore test:kernel`) loop-mount our images there, and
 `chore fixtures` builds the kernel-made fixtures under `test-disks/`
 (gitignored: loop mounts, xattrs, ACLs, inline data, htree directories —

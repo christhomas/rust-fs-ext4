@@ -32,6 +32,7 @@ chore test:unit       # no tools, no fixtures, no VM (debug; traps overflows)
 chore test:images     # reads a fixture, needs no VM
 chore test:oracle     # e2fsck / debugfs / mke2fs — run INSIDE the VM
 chore test:kernel     # the real kernel loop-mounts our images and reads them back
+chore test:lwext4     # lwext4, a third implementation, built in the VM — both ways
 chore test:vm         # the whole suite, compiled and run INSIDE the VM
 chore test            # everything, as CI runs it
 chore lint            # fmt + clippy -D warnings
