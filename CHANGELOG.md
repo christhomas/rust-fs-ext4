@@ -37,7 +37,10 @@
   leaves and index levels over the blocks the file already holds: a punch's
   survivors are a subset of its entries, so the layout never needs more
   blocks than the tree has, and nothing is allocated inside an operation
-  whose job is to free. The nodes the layout no longer needs go back with the
+  whose job is to free — except for the one case that needs it: a punch inside
+  a single extent leaves a head and a tail where there was one record, so on a
+  tree already packed full the layout is one block short and allocates it, in
+  the same transaction. The nodes the layout no longer needs go back with the
   data blocks (#258).
 - **A hole below the first entry of a deep extent tree reads as zeros.** The
   index descent kept the last entry at or below the block it was mapping and

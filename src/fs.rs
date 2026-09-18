@@ -1555,7 +1555,11 @@ impl Filesystem {
         // to do: every file with more than four surviving extents — that is,
         // every large file, which is what a punch is for — was refused.
         let gen = u32::from_le_bytes(inode.block[8..12].try_into().unwrap());
-        let repacked = crate::extent_mut::plan_repack_tree(gen, &new_entries, bs_u32, &tree_nodes)?;
+        let repacked = {
+            let mut alloc = || self.buffer_allocate_block(&mut buf, ino);
+            crate::extent_mut::plan_repack_tree(gen, &new_entries, bs_u32, &tree_nodes, &mut alloc)?
+        };
+        let allocated_blocks = repacked.allocated_blocks.len() as u64;
         for (block, mut bytes) in repacked.block_writes {
             if self.csum.enabled {
                 self.csum
@@ -1576,7 +1580,8 @@ impl Filesystem {
         let sectors_per_block = bs / 512;
         let new_i_blocks = inode
             .blocks
-            .saturating_sub(freed_blocks * sectors_per_block);
+            .saturating_sub(freed_blocks * sectors_per_block)
+            + allocated_blocks * sectors_per_block;
         Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_i_blocks)?;
         let now = now_unix_seconds();
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
