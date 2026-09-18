@@ -73,7 +73,7 @@ vars:
   # A COMMIT, NOT A TAG, and only for now: the family pins siblings by
   # tag, and fs-linux-test-harness has no release yet. Replace this with
   # its tag (v0.1.0) once one is cut.
-  LINUX_HARNESS_REF: 0ea55c6b33563d0383ac4044595904c6779492c3
+  LINUX_HARNESS_REF: fbda03bf02ddb500cd0e66a10fb064e4d70b5320
 
 # The harness's consumer tasks, as `chore vm:<task>`. OPTIONAL because the
 # harness is a sibling that `chore siblings` itself checks out: without
