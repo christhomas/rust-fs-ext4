@@ -59,6 +59,49 @@ chore_min_version: 0.6.0
 #
 # NOTHING SKIPS: a missing tool, fixture or VM fails the test that needed
 # it, naming the task that provides it.
+#
+# QUIET BY DEFAULT, --verbose ON REQUEST, AND THE BUDGET IS A NUMBER.
+#
+#   A task prints a VERDICT: one line per tier, a final count, and the path
+#   of the log holding everything else. A failure prints the excerpt.
+#   `chore test -- --verbose` (or FLTH_VERBOSE=1) streams the whole run.
+#
+#   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
+#   in full, including the per-call `[oracle vm]` evidence that `--show-output`
+#   produces. What changed is where it is read from.
+#
+#   Each tier carries an OUTPUT BUDGET -- a line and a byte count that fails
+#   the run (exit 65) when the tier prints more than it is allowed to, told
+#   apart from a failing suite by its status. The budgets below are MEASURED,
+#   on this arm64 KVM host, from the run recorded in pull request #257:
+#
+#     tier      measured          budget            headroom, and why
+#     unit        530 /  31,331      700 /  42,000   ~30%: tests get added
+#     images    1,065 /  44,731    1,400 /  60,000   ~30%
+#     oracle    1,523 / 107,656    1,950 / 140,000   ~28%. --show-output is
+#                                                    most of it, and it is
+#                                                    the evidence, so it
+#                                                    stays -- in the log
+#     kernel       52 /   2,855       80 /   4,000   ~50%: four tests, so
+#                                                    one more is a big step
+#     suite     1,989 /  93,373    2,500 / 125,000   ~25%
+#     scripts      28 /   1,427       50 /   3,000   ~75%: three tests
+#     vm        2,090 /  99,544    2,700 / 135,000   ~30%. Measured in CI
+#                                                    (suite-in-vm), which is
+#                                                    a FIRST run: the guest
+#                                                    build's per-crate lines
+#                                                    are already in it
+#
+#   Raise one DELIBERATELY when a tier grows, the way the executed-test
+#   floors are raised. A budget nobody can breach measures nothing, and
+#   tests/scripts/test-output-budget.sh fails a tier that has none.
+#
+#   Why it is worth a task's while: a passing run that prints three thousand
+#   lines hides the twenty that matter, and every reader pays for it --
+#   a person scrolling, a CI log viewer, and an agent working here, which
+#   re-reads its transcript on every step and so pays for one loud run many
+#   times over. See the fs-linux-test-harness README, "Output: quiet by
+#   default, --verbose on request".
 vars:
   TRIPLE: aarch64-apple-darwin
   LIBNAME: fs_ext4
@@ -175,7 +218,7 @@ tasks:
     # rather than listed here. CI runs this job with no fixtures present,
     # which is what proves the split.
     cmds:
-      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/test.sh --locked $(scripts/test-targets.sh unit)'
+      - 'EXPECT_OVERFLOW_CHECKS=1 scripts/tier.sh test:unit unit 700 42000 -- scripts/test.sh --locked $(scripts/test-targets.sh unit)'
 
   test:images:
     desc: 'The tests that read a fixture but need no VM — what a host without KVM can still run'
@@ -185,13 +228,16 @@ tasks:
     # rather than skipped inside the tests, so what does not run there is
     # visible in the workflow rather than hidden in a green log.
     cmds:
-      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
+      - 'scripts/tier.sh test:images images 1400 60000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh images)'
 
   test:oracle:
     desc: 'The driver writes, e2fsprogs reads back — every tool call made inside the harness VM'
-    # --show-output prints what each passing oracle test checked (the
+    # --show-output keeps what each passing oracle test checked (the
     # `[oracle vm]` lines: every tool invocation, where it ran and its
     # verdict), so a green run carries its evidence rather than a count.
+    # It goes to tmp/logs/oracle.log, not the terminal -- the evidence is
+    # kept, and reading it is a choice rather than a toll. `--verbose`
+    # streams it live.
     #
     # NO `vm:up` HERE, deliberately. The first oracle call in each test
     # process brings the VM up (idempotent, milliseconds when it is
@@ -201,7 +247,7 @@ tasks:
     # behind by a run that was interrupted.
     cmds:
       - scripts/tools.sh --check
-      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
+      - 'scripts/tier.sh test:oracle oracle 1950 140000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh oracle) -- --show-output'
 
   test:kernel:
     desc: 'The driver writes, THE KERNEL reads back: our images loop-mounted by Linux in the guest'
@@ -212,7 +258,7 @@ tasks:
     # written — plus the reverse direction, and a deliberate corruption
     # that must fail.
     cmds:
-      - 'scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
+      - 'scripts/tier.sh test:kernel kernel 80 4000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
@@ -247,7 +293,17 @@ tasks:
           mkdir -p "$dest"
           git -C "../$sibling" archive --format=tar HEAD | tar -x -C "$dest"
         done
-        ../fs-linux-test-harness/scripts/vm.sh guest-test $CLI_ARGS
+        # --verbose is ours, not cargo's: tier.sh reads it out of CLI_ARGS
+        # and streams, and it must not also reach the in-guest `cargo test`,
+        # where it would mean something else entirely.
+        guest_args=""
+        for arg in ${CLI_ARGS:-}; do
+          case "$arg" in --verbose|-v) continue ;; esac
+          guest_args="$guest_args $arg"
+        done
+        # shellcheck disable=SC2086  # the words are the point
+        scripts/tier.sh test:vm vm 2700 135000 -- \
+          ../fs-linux-test-harness/scripts/vm.sh guest-test $guest_args
 
   test:
     desc: 'Everything, exactly as CI runs it — natively on Linux, inside the VM anywhere else'
@@ -259,6 +315,12 @@ tasks:
     cmds:
       - |
         set -eu
+        # --verbose belongs to the whole run, and test:native's tiers are
+        # separate chore invocations: an exported variable is what reaches
+        # them, which is why tier.sh reads FLTH_VERBOSE as well as the flag.
+        case " ${CLI_ARGS:-} " in
+          *" --verbose "*|*" -v "*) export FLTH_VERBOSE=1 ;;
+        esac
         if [ "$(uname -s)" != Linux ]; then
           echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."
           exec "{{.CHORE_EXE}}" test:vm
@@ -280,8 +342,10 @@ tasks:
       - test-disks/build-fixtures.sh --check
       - task: test:oracle
       - task: test:kernel
-      - scripts/test.sh --locked --release
+      - 'scripts/tier.sh "test:native (whole suite, release)" suite 2500 125000 -- scripts/test.sh --locked --release'
       - task: test:scripts
+      # THE LAST LINE: one number across the tiers, and where the detail is.
+      - scripts/test-verdict.sh unit oracle kernel suite
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
@@ -291,10 +355,13 @@ tasks:
     cmds:
       - |
         set -eu
-        for t in tests/scripts/*.sh; do
-          echo "== $t"
-          bash "$t"
-        done
+        scripts/tier.sh test:scripts scripts 50 3000 -- bash -c '
+          set -eu
+          for t in tests/scripts/*.sh; do
+            echo "== $t"
+            bash "$t"
+          done
+        '
 
   staticlib:
     desc: Build the static library and its headers into this crate's dist/

@@ -30,6 +30,21 @@ name: CI
 #                and this job is what keeps that path working.
 #   ci-ok        the one required check: green only when every job above
 #                ran and succeeded (failed, cancelled OR skipped fails it).
+#
+# THE OUTPUT BUDGET IS IN THE TASKS, so it is in this workflow too. Each
+# tier writes its full output to tmp/logs/<tier>.log and prints a verdict;
+# a tier that prints more than its measured budget FAILS (exit 65), which
+# is how a job that starts emitting thousands of lines turns red here
+# rather than being noticed by whoever scrolls it next. See the budget
+# table at the top of chores.yml, and the harness README's "Output: quiet
+# by default, --verbose on request". Nothing extra is needed in this file:
+# every job already runs chore tasks, which is the whole point of them.
+#
+# The logs themselves are NOT uploaded as artefacts yet, though the
+# harness contract asks for it: tests/ci_profile.rs refuses any step-level
+# `if:` in these jobs, and an upload worth having is `if: always()`. A
+# failure still prints the tail of its log into this log. #264 tracks
+# narrowing that guard so the whole file can be kept.
 
 on:
   push:
