@@ -17,6 +17,16 @@
 #   fdisk       sfdisk, for the whole-disk fixture's GPT
 #   util-linux  losetup and mount: the kernel oracle's loop mounts, which
 #               happen here and nowhere else
+#   lwext4      A THIRD IMPLEMENTATION OF EXT4, built here from source at
+#               a pinned commit. e2fsprogs and this crate read the same
+#               specification and inherit the same ambiguities; Linux is
+#               the thing the images are for. lwext4 (BSD-2-Clause, pure
+#               C, github.com/gkostka/lwext4) shares a lineage with
+#               neither, so where it disagrees with us one of the two has
+#               the format wrong -- which is what
+#               tests/lwext4_cross_validate.rs is for. It is a portable C
+#               library, so it needs a machine and not a BSD: this guest
+#               already is that machine (#269)
 #
 # AND A RUST TOOLCHAIN, for `chore test:vm` — the whole suite compiled
 # and run in here, which is how a macOS host runs a Linux test suite at
@@ -31,8 +41,22 @@ RUST_ROOT=/var/lib/fs-ext4-rust
 export RUSTUP_HOME="$RUST_ROOT/rustup"
 export CARGO_HOME="$RUST_ROOT/cargo"
 
+# THE lwext4 PIN. A commit, not a branch: the family pins every sibling,
+# every box and every toolchain, and an oracle that moves on its own is
+# an oracle whose verdict cannot be compared with yesterday's. Bump it
+# deliberately, and expect to re-measure the tier when you do.
+#
+# 58bcf89 is master as of 2022-09-22, the newest revision upstream has.
+# tests/support/src/lwext4.rs holds the same string and refuses to run
+# against a guest built from another one, so the two cannot drift.
+LWEXT4_PIN=58bcf89a121b72d4fb66334f1693d3b30e4cb9c5
+LWEXT4_REPO=https://github.com/gkostka/lwext4.git
+LWEXT4_SRC=/var/lib/fs-ext4-lwext4
+LWEXT4_PREFIX=/usr/local
+
 apt-get update -qq
-apt-get install -y -qq e2fsprogs attr acl fdisk util-linux curl gcc libc6-dev pkg-config >/dev/null
+apt-get install -y -qq e2fsprogs attr acl fdisk util-linux curl gcc libc6-dev pkg-config \
+    git cmake make >/dev/null
 modprobe loop
 
 # sed, not head: head exits after one line, mke2fs gets SIGPIPE writing
@@ -48,6 +72,63 @@ if [ -z "$version" ] ||
     echo "vm-setup: e2fsprogs ${version:-of unknown version} is older than 1.47.0" >&2
     exit 1
 fi
+
+# lwext4, at the pinned commit. Idempotent by the stamp, which holds the
+# commit that was built: a changed pin rebuilds, an unchanged one costs a
+# `test`. The harness re-runs this whole script whenever it changes
+# (it stamps the script's own sha256 in the guest), so bumping the pin
+# above is all it takes for the next boot to rebuild.
+#
+# A shallow fetch OF THE COMMIT, not a clone of the branch it is on: the
+# pin may name a revision no branch tip points at, which `git clone
+# --branch` cannot express.
+lwext4_stamp="$LWEXT4_PREFIX/lib/lwext4.pin"
+if [ "$(cat "$lwext4_stamp" 2>/dev/null || true)" != "$LWEXT4_PIN" ]; then
+    echo "vm-setup: building lwext4 $LWEXT4_PIN"
+    if [ ! -d "$LWEXT4_SRC/.git" ]; then
+        rm -rf "$LWEXT4_SRC"
+        git init --quiet "$LWEXT4_SRC"
+        git -C "$LWEXT4_SRC" remote add origin "$LWEXT4_REPO"
+    fi
+    git -C "$LWEXT4_SRC" fetch --quiet --depth 1 origin "$LWEXT4_PIN"
+    git -C "$LWEXT4_SRC" checkout --quiet FETCH_HEAD
+    [ "$(git -C "$LWEXT4_SRC" rev-parse HEAD)" = "$LWEXT4_PIN" ] || {
+        echo "vm-setup: lwext4 is not at $LWEXT4_PIN" >&2
+        exit 1
+    }
+
+    # The `generic` flavour: host tooling, no embedded target. It is the
+    # branch of lwext4's CMakeLists that sets BLOCKDEV_TYPE=linux, which
+    # is what builds the file-backed block device the reporter opens an
+    # image through.
+    rm -rf "$LWEXT4_SRC/build"
+    mkdir -p "$LWEXT4_SRC/build"
+    (cd "$LWEXT4_SRC/build" && cmake -G "Unix Makefiles" \
+        -DCMAKE_BUILD_TYPE=Release \
+        -DVERSION_MAJOR=1 -DVERSION_MINOR=0 -DVERSION_PATCH=0 -DVERSION=1.0.0 \
+        -DCMAKE_TOOLCHAIN_FILE=../toolchain/generic.cmake ..) >/dev/null
+    make -C "$LWEXT4_SRC/build" -j"$(nproc)" >/dev/null
+
+    # Installed by hand rather than by `make install`: lwext4's install
+    # rules ship the generated config and the libraries but not the
+    # public headers or the block device's, and the reporter needs all
+    # four. include/ext4_config.h #includes generated/ext4_config.h
+    # unconditionally, so the generated one must travel with it or the
+    # program would compile against a different configuration than the
+    # library was built with -- same structs, different layout.
+    rm -rf "$LWEXT4_PREFIX/include/lwext4"
+    mkdir -p "$LWEXT4_PREFIX/include/lwext4/generated" "$LWEXT4_PREFIX/lib"
+    cp "$LWEXT4_SRC"/include/*.h "$LWEXT4_PREFIX/include/lwext4/"
+    cp -r "$LWEXT4_SRC/include/misc" "$LWEXT4_PREFIX/include/lwext4/"
+    cp "$LWEXT4_SRC/build/include/generated/ext4_config.h" \
+        "$LWEXT4_PREFIX/include/lwext4/generated/"
+    cp "$LWEXT4_SRC/blockdev/linux/file_dev.h" "$LWEXT4_PREFIX/include/lwext4/"
+    cp "$LWEXT4_SRC/build/src/liblwext4.a" "$LWEXT4_SRC/build/blockdev/libblockdev.a" \
+        "$LWEXT4_PREFIX/lib/"
+    # LAST, so an interrupted build is not mistaken for a finished one.
+    printf '%s\n' "$LWEXT4_PIN" > "$lwext4_stamp"
+fi
+echo "vm-setup: lwext4 $(cat "$lwext4_stamp")"
 
 # The toolchain the repository pins, and only that one: a guest that
 # silently built with a different compiler than CI is a guest whose
@@ -65,4 +146,4 @@ fi
 "$CARGO_HOME/bin/rustup" default "$toolchain" >/dev/null
 "$CARGO_HOME/bin/cargo" --version
 
-echo "vm-setup: oracle tools and the pinned toolchain are installed in the guest"
+echo "vm-setup: the oracle tools, lwext4 and the pinned toolchain are installed in the guest"

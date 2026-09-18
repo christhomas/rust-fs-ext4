@@ -13,18 +13,21 @@ name: CI
 #                to the other jobs as an artifact (they are disk images,
 #                the same for every architecture).
 #   test         x86_64, where GitHub gives us KVM: `chore lint` and
-#                `chore test` — the whole gate, with EVERY e2fsprogs call
-#                and every kernel mount happening inside the harness VM.
-#                Nothing installs e2fsprogs on the runner, and the log
-#                shows `[oracle vm]` / `[kernel vm]` for each one.
+#                `chore test` — the whole gate, with EVERY e2fsprogs call,
+#                every kernel mount and every lwext4 call happening inside
+#                the harness VM. Nothing installs e2fsprogs on the runner,
+#                and the log shows `[oracle vm]` / `[kernel vm]` for each
+#                one. The guest also builds lwext4 (a third ext4
+#                implementation, at the commit scripts/vm-setup.sh pins)
+#                so `chore test:lwext4` can cross-validate against it.
 #   test-arm64   aarch64 matters on its own (c_char is unsigned there, and
 #                it is what DiskJockey ships on) but GitHub's arm64
 #                runners have NO KVM, so no VM can run: this job runs the
 #                tiers that need none — lint, the unit tier, and the
-#                fixture-reading tests. The tool and kernel oracles are
-#                architecture-independent (they read the same images) and
-#                are covered by `test`; so are the script tests, which
-#                check the tree rather than the machine.
+#                fixture-reading tests. The tool, kernel and lwext4
+#                oracles are architecture-independent (they read the same
+#                images) and are covered by `test`; so are the script
+#                tests, which check the tree rather than the machine.
 #   suite-in-vm  `chore test:vm`: the whole suite COMPILED AND RUN INSIDE
 #                the guest. That is how a macOS host runs a Linux suite,
 #                and this job is what keeps that path working.

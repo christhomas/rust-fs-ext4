@@ -1,10 +1,14 @@
 //! Shared helpers for the ext4 test suite: where scratch files live,
-//! where fixtures come from, and the oracle tools (see [`oracle`]).
+//! where fixtures come from, and the three outside opinions this suite
+//! holds itself to — e2fsprogs (see [`oracle`]), the Linux kernel (see
+//! [`kernel`]) and lwext4, a third implementation (see [`lwext4`]).
 
 mod kernel;
+mod lwext4;
 mod oracle;
 
 pub use kernel::{guest_kernel_report, guest_kernel_write, sha256_hex};
+pub use lwext4::{lwext4_refusal, lwext4_report, lwext4_write, Report, PIN as LWEXT4_PIN};
 pub use oracle::{guest_base64, guest_quote, oracle, Oracle};
 
 use std::ffi::OsStr;

@@ -36,6 +36,8 @@ chore_min_version: 0.6.0
 #                      for consistency, debugfs for content and metadata)
 #   chore test:kernel  the driver writes, THE REAL KERNEL reads back: our
 #                      images loop-mounted by Linux in the guest
+#   chore test:lwext4  A THIRD IMPLEMENTATION reads what we wrote, and we
+#                      read what it wrote: lwext4, built in the guest
 #   chore test:vm      the whole suite compiled and run INSIDE the guest
 #   chore test         everything, exactly as CI runs it
 #
@@ -84,6 +86,11 @@ chore_min_version: 0.6.0
 #                                                    stays -- in the log
 #     kernel       52 /   2,855       80 /   4,000   ~50%: four tests, so
 #                                                    one more is a big step
+#     lwext4       57 /   4,366       80 /   6,000   ~40% / ~37%: eight tests
+#                                                    and sixteen [oracle vm]
+#                                                    lines, so one more
+#                                                    compared fixture is a
+#                                                    visible step
 #     suite     1,989 /  93,373    2,500 / 125,000   ~25%
 #     scripts      28 /   1,427       50 /   3,000   ~75%: three tests
 #     vm        2,090 /  99,544    2,700 / 135,000   ~30%. Measured in CI
@@ -257,6 +264,30 @@ tasks:
     cmds:
       - 'scripts/tier.sh test:kernel kernel 80 4000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh kernel) -- --show-output'
 
+  test:lwext4:
+    desc: 'CROSS-VALIDATION: lwext4 — a third implementation, built in the guest — reads what we wrote, and we read what it wrote'
+    # WHY IT IS ITS OWN TIER AND NOT PART OF test:oracle. `oracle` means
+    # e2fsprogs: one tool suite, one failure mode, one budget. lwext4 is a
+    # different oracle with a different failure mode -- a whole ext4
+    # implementation that can refuse a volume outright for a feature it
+    # does not have -- and folding it in would put its verdict, its count
+    # and its output inside a number that is supposed to mean "e2fsprogs
+    # agreed". It is separate for the same reason `kernel` is.
+    #
+    # AND IT CARRIES A FLOOR. A budget fails a tier that prints too much;
+    # nothing fails a tier that prints too little because it RAN too
+    # little. This tier is one test binary: if scripts/test-targets.sh
+    # stops selecting it, `cargo test` matches nothing, exits 0 and prints
+    # a green `0 passed`. The floor is what turns that red. MEASURED, like
+    # the budgets, and raised rather than lowered: eight tests ran on this
+    # arm64 KVM host and in the pull request that added the tier, and the
+    # floor is one below that -- what it has to catch is the collapse to
+    # zero, not a refactor that merges two tests into one.
+    cmds:
+      - scripts/tools.sh --check
+      - 'scripts/tier.sh test:lwext4 lwext4 80 6000 -- scripts/test.sh --locked --release $(scripts/test-targets.sh lwext4) -- --show-output'
+      - 'scripts/test-floor.sh lwext4 7'
+
   test:vm:
     desc: 'The whole suite, compiled and run INSIDE the harness VM (how a Mac runs the Linux tests)'
     # scripts/guest-suite.sh, through the harness's [test] guest_command.
@@ -339,10 +370,11 @@ tasks:
       - test-disks/build-fixtures.sh --check
       - task: test:oracle
       - task: test:kernel
+      - task: test:lwext4
       - 'scripts/tier.sh "test:native (whole suite, release)" suite 2500 125000 -- scripts/test.sh --locked --release'
       - task: test:scripts
       # THE LAST LINE: one number across the tiers, and where the detail is.
-      - scripts/test-verdict.sh unit oracle kernel suite
+      - scripts/test-verdict.sh unit oracle kernel lwext4 suite
 
   test:scripts:
     desc: The shell tests (tests/scripts/*.sh), every one by glob
