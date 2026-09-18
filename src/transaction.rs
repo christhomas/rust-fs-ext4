@@ -119,7 +119,14 @@ impl Transaction {
     /// `Vec<Vec<u8>>` where each inner Vec is one `block_size` byte journal
     /// block, in the order they should be written to the journal log:
     ///
-    ///   [descriptor, data_0, data_1, ..., data_N, optional_revoke, commit]
+    ///   [descriptor, data..., descriptor, data..., revoke..., commit]
+    ///
+    /// A descriptor block tags at most `tags_per_descriptor()` data blocks, so
+    /// a write set larger than that is split across several descriptor blocks,
+    /// each immediately followed by the data blocks it tags and each ending in
+    /// a tag with `TAG_LAST` set. Revoke records are chunked the same way, at
+    /// `revokes_per_block()` per block. A small transaction therefore still
+    /// produces the familiar `[descriptor, data_0 ..= data_N, revoke, commit]`.
     ///
     /// Empty transactions (no writes, no revokes) return a single commit
     /// block — matches kernel's "empty transaction" handling.
@@ -373,6 +380,71 @@ mod tests {
             TAG_SAME_UUID,
             "same_uuid expected"
         );
+    }
+
+    #[test]
+    fn writes_beyond_one_descriptor_spill_into_a_second_descriptor_block() {
+        // 1 KiB blocks, classic 8-byte tags: (1024 - 12) / 8 = 126 tags fit.
+        let mut tx = Transaction::begin(9, 1024, false, false);
+        let per = 126;
+        for i in 0..(per + 1) {
+            tx.add_write(1000 + i as u64, vec![i as u8; 1024]).unwrap();
+        }
+        let blocks = tx.commit().unwrap();
+        // desc + 126 data + desc + 1 data + commit
+        assert_eq!(blocks.len(), 1 + per + 1 + 1 + 1);
+
+        let block_type = |b: &Vec<u8>| u32::from_be_bytes(b[4..8].try_into().unwrap());
+        assert_eq!(block_type(&blocks[0]), JBD2_DESCRIPTOR_BLOCK);
+        assert_eq!(block_type(&blocks[per + 1]), JBD2_DESCRIPTOR_BLOCK);
+        assert_eq!(block_type(&blocks[per + 3]), JBD2_COMMIT_BLOCK);
+        // data blocks sit directly after their own descriptor
+        assert_eq!(blocks[1][0], 0);
+        assert_eq!(blocks[per][0], (per - 1) as u8);
+        assert_eq!(blocks[per + 2][0], per as u8);
+
+        // both descriptors end in a LAST tag; the first one is full
+        let last_tag_flags = |desc: &Vec<u8>, idx: usize| {
+            u16::from_be_bytes(desc[12 + idx * 8 + 6..12 + idx * 8 + 8].try_into().unwrap()) as u32
+        };
+        assert_eq!(last_tag_flags(&blocks[0], per - 1) & TAG_LAST, TAG_LAST);
+        assert_eq!(
+            last_tag_flags(&blocks[0], 0) & TAG_LAST,
+            0,
+            "only the final tag is LAST"
+        );
+        assert_eq!(last_tag_flags(&blocks[per + 1], 0) & TAG_LAST, TAG_LAST);
+    }
+
+    #[test]
+    fn exactly_one_descriptor_worth_of_writes_stays_in_one_block() {
+        let mut tx = Transaction::begin(10, 1024, false, false);
+        let per = 126;
+        for i in 0..per {
+            tx.add_write(2000 + i as u64, vec![0u8; 1024]).unwrap();
+        }
+        let blocks = tx.commit().unwrap();
+        assert_eq!(blocks.len(), 1 + per + 1); // desc + data + commit, no spill
+    }
+
+    #[test]
+    fn revokes_beyond_one_block_spill_into_a_second_revoke_block() {
+        // 1 KiB blocks, 4-byte records: (1024 - 16) / 4 = 252 fit.
+        let mut tx = Transaction::begin(11, 1024, false, false);
+        let per = 252;
+        for i in 0..(per + 1) {
+            tx.add_revoke(5000 + i as u64);
+        }
+        let blocks = tx.commit().unwrap();
+        assert_eq!(blocks.len(), 3); // revoke + revoke + commit
+        let block_type = |b: &Vec<u8>| u32::from_be_bytes(b[4..8].try_into().unwrap());
+        assert_eq!(block_type(&blocks[0]), JBD2_REVOKE_BLOCK);
+        assert_eq!(block_type(&blocks[1]), JBD2_REVOKE_BLOCK);
+        assert_eq!(block_type(&blocks[2]), JBD2_COMMIT_BLOCK);
+        let count0 = u32::from_be_bytes(blocks[0][12..16].try_into().unwrap());
+        let count1 = u32::from_be_bytes(blocks[1][12..16].try_into().unwrap());
+        assert_eq!(count0, (16 + per * 4) as u32);
+        assert_eq!(count1, 16 + 4);
     }
 
     #[test]
