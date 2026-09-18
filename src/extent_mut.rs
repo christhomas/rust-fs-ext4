@@ -495,6 +495,109 @@ fn build_inline_leaf_root(generation: u32, extents: &[Extent]) -> Vec<u8> {
     build_root(&header, extents, 60)
 }
 
+/// An extent tree laid out again over blocks the file already owns.
+pub struct RepackedTree {
+    /// The 60 bytes for the inode's `i_block`.
+    pub new_root: Vec<u8>,
+    /// Blocks to write, and what to write into them. The tail checksum is
+    /// the caller's, as everywhere else here.
+    pub block_writes: Vec<(u64, Vec<u8>)>,
+    /// The blocks from `nodes` that the layout used, in the order it used
+    /// them. Everything else in `nodes` is now unreferenced.
+    pub used_nodes: Vec<u64>,
+    /// Blocks `alloc` handed out, when the file's own were not enough. The
+    /// caller accounts for them as it does for any allocation.
+    pub allocated_blocks: Vec<u64>,
+}
+
+/// Lay `entries` out again as a tree over `nodes`, packing every node full.
+///
+/// This is what a punch needs. The survivors of a punch are a subset of the
+/// entries the tree already held, so packing them takes no more nodes than
+/// the tree already has, and the blocks it does not use go back to free
+/// space. Nothing is allocated: a punch frees, and an allocation inside it
+/// would be a second thing that can fail.
+///
+/// Four or fewer entries need no nodes at all — they go in the inode, which
+/// is the case the punch path handled before (#258).
+///
+/// `alloc` covers the case where they are not enough. A punch inside one
+/// extent leaves a head and a tail where there was one record, so the
+/// survivors can outnumber the entries by one — and since this packs every
+/// node full, a tree it laid out before has no spare room for that one. It is
+/// called only then, and only for as many blocks as the layout is short.
+///
+/// # Errors
+///
+/// Whatever `alloc` returns when the layout needs a block the file does not
+/// already hold.
+pub fn plan_repack_tree(
+    generation: u32,
+    entries: &[Extent],
+    block_size: u32,
+    nodes: &[u64],
+    alloc: &mut dyn FnMut() -> Result<u64>,
+) -> Result<RepackedTree> {
+    let bs = block_size as usize;
+    let mut used_nodes: Vec<u64> = Vec::new();
+    let mut allocated_blocks: Vec<u64> = Vec::new();
+    let mut block_writes: Vec<(u64, Vec<u8>)> = Vec::new();
+
+    if entries.len() <= 4 {
+        return Ok(RepackedTree {
+            new_root: build_inline_leaf_root(generation, entries),
+            block_writes,
+            used_nodes,
+            allocated_blocks,
+        });
+    }
+
+    let mut supply = nodes.iter().copied();
+    let mut take = |used: &mut Vec<u64>, fresh: &mut Vec<u64>| -> Result<u64> {
+        match supply.next() {
+            Some(block) => {
+                used.push(block);
+                Ok(block)
+            }
+            None => {
+                let block = alloc()?;
+                fresh.push(block);
+                Ok(block)
+            }
+        }
+    };
+
+    let cap = node_max_entries(bs) as usize;
+
+    // The leaves, each packed full, and the index entries naming them.
+    let mut indices: Vec<(u32, u64)> = Vec::new();
+    for chunk in entries.chunks(cap) {
+        let block = take(&mut used_nodes, &mut allocated_blocks)?;
+        block_writes.push((block, build_full_leaf_block(generation, chunk, bs)));
+        indices.push((chunk[0].logical_block, block));
+    }
+
+    // Index levels, until what is left fits the inode's four entries.
+    let mut depth = 1u16;
+    while indices.len() > 4 {
+        let mut above: Vec<(u32, u64)> = Vec::new();
+        for chunk in indices.chunks(cap) {
+            let block = take(&mut used_nodes, &mut allocated_blocks)?;
+            block_writes.push((block, build_full_index_block(generation, depth, chunk, bs)));
+            above.push((chunk[0].0, block));
+        }
+        indices = above;
+        depth += 1;
+    }
+
+    Ok(RepackedTree {
+        new_root: build_inline_index_root(generation, depth, &indices),
+        block_writes,
+        used_nodes,
+        allocated_blocks,
+    })
+}
+
 /// Reject any insert whose logical range overlaps an existing leaf entry.
 fn check_no_overlap(entries: &[Extent], new: &Extent) -> Result<()> {
     let n_start = new.logical_block as u64;
@@ -1056,6 +1159,82 @@ mod tests {
             physical_block: phys,
             uninitialized: uninit,
         }
+    }
+
+    /// `n` single-block extents, one every other block.
+    fn striped(n: u32) -> Vec<Extent> {
+        (0..n)
+            .map(|i| ext(i * 2, 1, 1000 + i as u64, false))
+            .collect()
+    }
+
+    /// The layout uses the file's own blocks, and packs every node full.
+    #[test]
+    fn a_repack_uses_the_blocks_the_file_already_holds() {
+        let bs = 1024u32;
+        let cap = node_max_entries(bs as usize) as usize;
+        let entries = striped(3 * cap as u32);
+        let nodes: Vec<u64> = (5000..5100).collect();
+        let mut refused = || {
+            Err(Error::CorruptExtentTree(
+                "a repack of these must not allocate",
+            ))
+        };
+        let plan = plan_repack_tree(7, &entries, bs, &nodes, &mut refused).expect("repack");
+
+        assert_eq!(plan.allocated_blocks, Vec::<u64>::new());
+        assert_eq!(
+            plan.used_nodes,
+            nodes[..3],
+            "three full leaves, nothing more"
+        );
+        assert_eq!(plan.block_writes.len(), 3);
+        let root = ExtentHeader::parse(&plan.new_root).expect("root");
+        assert_eq!((root.depth, root.entries), (1, 3));
+    }
+
+    /// Four or fewer survivors go in the inode, and the file's blocks are
+    /// all left over for the caller to free.
+    #[test]
+    fn a_repack_of_four_entries_needs_no_blocks() {
+        let entries = striped(4);
+        let nodes = [5000u64, 5001];
+        let mut refused = || Err(Error::CorruptExtentTree("must not allocate"));
+        let plan = plan_repack_tree(7, &entries, 1024, &nodes, &mut refused).expect("repack");
+
+        assert!(plan.used_nodes.is_empty() && plan.block_writes.is_empty());
+        let root = ExtentHeader::parse(&plan.new_root).expect("root");
+        assert_eq!((root.depth, root.entries), (0, 4));
+    }
+
+    /// A punch inside one extent leaves a head and a tail where there was one
+    /// record, so the survivors can outnumber the entries — and a tree this
+    /// packed full has no room for the extra. The layout then allocates, and
+    /// only for what it is short (CodeRabbit on #262).
+    #[test]
+    fn a_repack_allocates_only_what_the_file_cannot_cover() {
+        let bs = 1024u32;
+        let cap = node_max_entries(bs as usize) as usize;
+        // A full root over full leaves: four leaves, each packed.
+        let entries = striped((4 * cap + 1) as u32);
+        let nodes: Vec<u64> = (5000..5004).collect();
+        let mut next = 9000u64;
+        let mut alloc = || {
+            next += 1;
+            Ok(next)
+        };
+        let plan = plan_repack_tree(7, &entries, bs, &nodes, &mut alloc).expect("repack");
+
+        // Five leaves for the extra entry, and an index level over them,
+        // because five index entries do not fit the inode's four.
+        assert_eq!(
+            plan.used_nodes, nodes,
+            "every block the file held is reused"
+        );
+        assert_eq!(plan.allocated_blocks, vec![9001, 9002]);
+        assert_eq!(plan.block_writes.len(), 6);
+        let root = ExtentHeader::parse(&plan.new_root).expect("root");
+        assert_eq!((root.depth, root.entries), (2, 1));
     }
 
     fn read_back(bytes: &[u8]) -> Vec<Extent> {

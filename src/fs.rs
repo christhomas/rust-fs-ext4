@@ -1547,49 +1547,41 @@ impl Filesystem {
             }
         }
 
-        if new_entries.len() > 4 {
-            return Err(Error::Corrupt(
-                "punch_hole: surviving entries exceed inline-root capacity (4); needs depth>=1",
-            ));
+        // THE TREE IS LAID OUT AGAIN OVER THE BLOCKS IT ALREADY HELD (#258).
+        // The survivors are a subset of the entries the tree held, so packing
+        // them full needs no more blocks than it has, and the ones left over
+        // go back to free space with the data blocks. Four or fewer survivors
+        // need no blocks at all and go in the inode, which is all this used
+        // to do: every file with more than four surviving extents — that is,
+        // every large file, which is what a punch is for — was refused.
+        let gen = u32::from_le_bytes(inode.block[8..12].try_into().unwrap());
+        let repacked = {
+            let mut alloc = || self.buffer_allocate_block(&mut buf, ino);
+            crate::extent_mut::plan_repack_tree(gen, &new_entries, bs_u32, &tree_nodes, &mut alloc)?
+        };
+        let allocated_blocks = repacked.allocated_blocks.len() as u64;
+        for (block, mut bytes) in repacked.block_writes {
+            if self.csum.enabled {
+                self.csum
+                    .patch_extent_tail(ino, inode.generation, &mut bytes);
+            }
+            buf.put(block, bytes);
         }
-
-        // THE TREE BELOW THE ROOT GOES TOO. What survives is written back
-        // into the inode's inline root, so on a deeper tree the index and
-        // leaf blocks that held these extents are no longer referenced.
-        // They were left allocated and counted in `i_blocks`.
         for &node in &tree_nodes {
+            if repacked.used_nodes.contains(&node) {
+                continue;
+            }
             freed_blocks += self.buffer_free_block_run_and_bgd(&mut buf, node, 1)?;
         }
-
-        // Rebuild the inline root with the surviving entries.
-        let gen = u32::from_le_bytes(inode.block[8..12].try_into().unwrap());
-        let mut root = vec![0u8; 60];
-        root[0..2].copy_from_slice(&crate::extent::EXT4_EXT_MAGIC.to_le_bytes());
-        root[2..4].copy_from_slice(&(new_entries.len() as u16).to_le_bytes());
-        root[4..6].copy_from_slice(&4u16.to_le_bytes());
-        // depth = 0 (zero already)
-        root[8..12].copy_from_slice(&gen.to_le_bytes());
-        for (i, e) in new_entries.iter().enumerate() {
-            let off = 12 + i * 12;
-            root[off..off + 4].copy_from_slice(&e.logical_block.to_le_bytes());
-            let ee_len = if e.uninitialized {
-                e.length + crate::extent::EXT_INIT_MAX_LEN
-            } else {
-                e.length
-            };
-            root[off + 4..off + 6].copy_from_slice(&ee_len.to_le_bytes());
-            let (phys_hi, phys_lo) = crate::extent_mut::split_phys_block(e.physical_block);
-            root[off + 6..off + 8].copy_from_slice(&phys_hi.to_le_bytes());
-            root[off + 8..off + 12].copy_from_slice(&phys_lo.to_le_bytes());
-        }
-        Self::patch_inode_block_area(&mut raw, &root)?;
+        Self::patch_inode_block_area(&mut raw, &repacked.new_root)?;
 
         // i_blocks decreases; i_size unchanged (KEEP_SIZE semantics
         // built in — punch always preserves size).
         let sectors_per_block = bs / 512;
         let new_i_blocks = inode
             .blocks
-            .saturating_sub(freed_blocks * sectors_per_block);
+            .saturating_sub(freed_blocks * sectors_per_block)
+            + allocated_blocks * sectors_per_block;
         Self::patch_inode_size_and_blocks(&mut raw, inode.size, new_i_blocks)?;
         let now = now_unix_seconds();
         raw[0x0C..0x10].copy_from_slice(&now.to_le_bytes());
