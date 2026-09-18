@@ -74,8 +74,9 @@ or `$RUNNER_TEMP` would not exist for the tool asked to read it.
 `FS_EXT4_TEST_TMPDIR` names an exact directory instead, and is refused if
 it is outside the repository.
 
-Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
-`cargo fmt --check` + `cargo clippy -D warnings` on every commit).
+Install the hooks once per clone with github-guard's installer:
+`~/.claude/skills/github-guard/install.sh .` (formats with `cargo fmt` and runs
+`cargo clippy --all-targets -- -D warnings` on every commit).
 
 ## Adding a test (the in-tree pattern)
 

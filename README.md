@@ -591,11 +591,13 @@ directory instead, and is refused if it is outside the repository.
 
 ### Git hooks
 
-One-time setup per clone, so every commit runs the same
-`cargo fmt --check` + `cargo clippy` checks CI does:
+One-time setup per clone, so every commit runs the same `cargo fmt` and
+`cargo clippy` checks CI does. The hooks are
+[github-guard](https://github.com/antimatter-studios/agent-skills)'s, installed
+into `.git/hooks`, where a branch checkout cannot replace them:
 
 ```sh
-./scripts/install-hooks.sh
+~/.claude/skills/github-guard/install.sh .
 ```
 
 Bypass a single commit with `git commit --no-verify`.
