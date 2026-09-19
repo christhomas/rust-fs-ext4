@@ -4,6 +4,30 @@
 
 ### Added
 
+- **The parsers are fuzzed, on two tiers.** ext4 is the widest parser
+  surface in the family — a superblock, group descriptors, an inode
+  table, extent trees, htree indexes and a jbd2 journal, each read from
+  an offset the one before it supplied — and none of it had a fuzz
+  target. `fuzz/` holds `image`, `superblock`, `inode`, `dir_block` and
+  `journal`, nightly on a bounded budget; `tests/fuzz_decoders.rs` is the
+  gate, 23,616 deterministic cases in about four seconds on the stable
+  toolchain.
+
+  The corpus is four filesystems `mke2fs` wrote, populated through `-d`
+  rather than by mounting: ext2, which has neither extents nor a journal;
+  ext4 at 1 KiB blocks, which moves every offset; ext4 at 4 KiB; and ext4
+  with `64bit` and `metadata_csum`, which widens the group descriptors.
+  Each root holds more than 600 entries, which is what pushes ext4 into
+  an htree index — `every_committed_filesystem_mounts_and_reads_its_root`
+  asserts that, so the indexed-directory path cannot quietly stop being
+  seeded.
+
+  The walk calls `replay_journal_if_dirty`, deliberately. A journal is a
+  structure the format expects to be partially written, so it is parsed
+  with a corruption tolerance the other structures do not have, and it
+  runs at mount before anything has been established (#71).
+
+
 - **Cross-validation against lwext4, a third implementation, in the
   harness guest (#99).** `scripts/vm-setup.sh` now builds
   [lwext4](https://github.com/gkostka/lwext4) (BSD-2-Clause, pure C) in
