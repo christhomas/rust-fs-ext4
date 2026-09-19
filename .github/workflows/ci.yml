@@ -53,8 +53,14 @@ on:
   push:
     branches: [main]
     tags: ['v*']
+  # NO BRANCH FILTER ON PULL REQUESTS (#132). With `branches: [main]` a
+  # pull request based on anything else ran no CI at all — and still
+  # collected its review-bot ticks, so it read as verified. This
+  # repository stacks pull requests routinely, a fix branched off a fix
+  # that has not merged yet, which is exactly the case that got nothing:
+  # PR #131 came back with one check, its review bot, against PR #130's
+  # three on the same day.
   pull_request:
-    branches: [main]
 
 concurrency:
   group: ci-${{ github.workflow }}-${{ github.event.pull_request.number || github.ref }}
