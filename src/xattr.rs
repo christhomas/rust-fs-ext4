@@ -73,6 +73,16 @@ pub struct XattrEntry {
     /// buffer-level parsers do not have; [`read_all_resolved`] is the
     /// entry point that follows it.
     pub value_inum: u32,
+    /// `e_value_size` — how long the entry says its value is.
+    ///
+    /// KEPT EVEN THOUGH THE INLINE CASE HAS ALREADY USED IT, because
+    /// the EA-inode case has not: the value then comes from another
+    /// inode's body, and without this there is nothing to compare what
+    /// was read against. The kernel's `ext4_xattr_inode_iget` makes
+    /// exactly that comparison and returns `-EFSCORRUPTED` when the two
+    /// disagree; this driver returned the EA inode's whole body and
+    /// reported success (#121).
+    pub value_size: u32,
 }
 
 /// Read all extended attributes attached to an inode.
@@ -184,6 +194,7 @@ fn parse_entries(entries_buf: &[u8], _region_len: usize, out: &mut Vec<XattrEntr
             name: full_name,
             value,
             value_inum,
+            value_size: value_size as u32,
         });
 
         pos += entry_padded;
@@ -242,6 +253,7 @@ fn parse_entries_block(block: &[u8], out: &mut Vec<XattrEntry>) -> Result<()> {
             name: full_name,
             value,
             value_inum,
+            value_size: value_size as u32,
         });
 
         pos += entry_padded;
@@ -844,7 +856,7 @@ pub fn read_all_resolved(
     )?;
     for e in entries.iter_mut() {
         if e.value_inum != 0 {
-            e.value = crate::ea_inode::read_value_inode(fs, e.value_inum)?;
+            e.value = crate::ea_inode::read_value_inode(fs, e.value_inum, e.value_size)?;
         }
     }
     Ok(entries)
@@ -893,6 +905,7 @@ pub fn get_resolved(
         return Ok(Some(crate::ea_inode::read_value_inode(
             fs,
             entry.value_inum,
+            entry.value_size,
         )?));
     }
     Ok(Some(entry.value))
