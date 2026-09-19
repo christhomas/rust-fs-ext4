@@ -908,9 +908,36 @@ fn assert_unconditional(job: &Yaml, name: &str, workflow: &str) {
         "{workflow} jobs.{name} must not be conditional or allowed to fail"
     );
     for (at, step) in steps_of(job, name).iter().enumerate() {
+        let keys = keys_of(step);
+        // A STEP THAT RUNS NO COMMAND CANNOT GATE, AND MAY BE
+        // CONDITIONAL (#264).
+        //
+        // The rule is right about `run:` steps: a conditional command is
+        // a command that may not run, and the gate is the commands. It
+        // was wrong about the others. `actions/upload-artifact` has no
+        // `run:` — it cannot pass, cannot mask a failure and cannot make
+        // a red job green — and without `if: always()` GitHub skips it
+        // whenever an earlier step failed, which is the only time it is
+        // worth having. The blanket ban therefore made the quiet suite's
+        // logs unkeepable on exactly the runs that need them.
+        //
+        // `continue-on-error:` is still refused everywhere: on a `uses:`
+        // step it says an upload that failed does not matter, which is a
+        // different claim and not one this workflow makes.
+        let commands = !run_of(step).is_empty();
+        let offending: Vec<&str> = keys
+            .iter()
+            .map(String::as_str)
+            .filter(|k| match *k {
+                "if" => commands,
+                "continue-on-error" => true,
+                _ => false,
+            })
+            .collect();
         assert!(
-            !carries_a_non_gating_key(&keys_of(step)),
-            "{workflow} jobs.{name} step {at} ({:?}) must not be conditional or allowed to fail",
+            offending.is_empty(),
+            "{workflow} jobs.{name} step {at} ({:?}) carries {offending:?}: a step that \
+             runs a command must not be conditional or allowed to fail",
             field(step, "name")
                 .and_then(Yaml::as_str)
                 .unwrap_or(run_of(step))
@@ -2197,6 +2224,45 @@ jobs:
             checking_debug_runs(yaml),
             vec!["- run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib".to_string()],
         );
+    }
+
+    /// A STEP THAT RUNS NO COMMAND MAY BE CONDITIONAL (#264).
+    ///
+    /// `actions/upload-artifact` has no `run:`. It cannot pass, cannot
+    /// mask a failure and cannot make a red job green — and without
+    /// `if: always()` GitHub skips it whenever an earlier step failed,
+    /// which is the only time keeping the log is worth anything. The
+    /// blanket ban made the quiet suite's logs unkeepable on exactly
+    /// the runs that need them.
+    fn check_job(steps: &str) {
+        let text = format!(
+            "on:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+        );
+        let document = super::load_document(&text, std::path::Path::new("synthetic.yml"));
+        let job = super::job(&document, "test", std::path::Path::new("synthetic.yml"));
+        super::assert_unconditional(job, "test", "ci.yml");
+    }
+
+    #[test]
+    fn a_step_that_runs_nothing_may_carry_a_condition() {
+        check_job(
+            "      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: logs\n",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be conditional")]
+    fn a_step_that_runs_a_command_may_not() {
+        check_job("      - run: cargo test --locked --release\n        if: always()\n");
+    }
+
+    /// And `continue-on-error:` stays refused whatever the step is: on
+    /// an upload it says a failed upload does not matter, which is a
+    /// different claim from "run this even after a failure".
+    #[test]
+    #[should_panic(expected = "continue-on-error")]
+    fn a_step_that_runs_nothing_may_still_not_be_allowed_to_fail() {
+        check_job("      - uses: actions/upload-artifact@v4\n        continue-on-error: true\n");
     }
 
     /// A profile named another way still disqualifies the run.
