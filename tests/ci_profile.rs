@@ -498,6 +498,34 @@ fn runs_on_pull_request(wf: &Workflow) -> bool {
     wf.triggers.iter().any(|t| t == "pull_request")
 }
 
+/// The branch names a `pull_request:` trigger is restricted to, if any
+/// (#132).
+///
+/// `on: pull_request: branches: [main]` means a pull request based on
+/// anything else runs **no** CI — and still collects its review-bot
+/// ticks, so it reads as verified. This repository stacks pull requests
+/// routinely, which is exactly the case that got nothing: one check
+/// against another PR's three on the same day.
+fn pull_request_branch_filter(document: &Yaml) -> Vec<String> {
+    let Some(on) = field(document, "on").or_else(|| field(document, "true")) else {
+        return Vec::new();
+    };
+    let Some(pr) = field(on, "pull_request") else {
+        return Vec::new();
+    };
+    let Some(branches) = field(pr, "branches") else {
+        return Vec::new();
+    };
+    branches
+        .as_sequence()
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|b| b.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Why `workflow` gates no pull request at all, or `None` if it does.
 ///
 /// The real-file assertions ask this FIRST. Without it, a workflow whose
@@ -972,6 +1000,21 @@ fn runs_chore(steps: &[Yaml], task: &str) -> bool {
 /// `chore test` is unit, the tool and fixture checks, the whole suite in
 /// release, and the script tests; `chore lint` is clippy with warnings
 /// denied.
+/// A pull request gets CI whatever it is based on (#132).
+#[test]
+fn ci_runs_on_a_pull_request_against_any_base() {
+    let path = workflow_path("ci.yml");
+    let text = read_or_panic(&path);
+    let document = load_document(&text, &path);
+    let filter = pull_request_branch_filter(&document);
+    assert!(
+        filter.is_empty(),
+        "ci.yml runs on pull requests only against {filter:?}. A pull request based on \
+         anything else — a stacked one, which this repository uses routinely — runs no \
+         CI at all, and still collects its review-bot ticks, so it reads as verified."
+    );
+}
+
 #[test]
 fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectures_through_chore() {
     let path = workflow_path("ci.yml");
