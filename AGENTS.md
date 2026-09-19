@@ -78,6 +78,32 @@ it is outside the repository.
 Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
 `cargo fmt --check` + `cargo clippy -D warnings` on every commit).
 
+## What gates a merge
+
+**One required check, and it is `ci-ok`.** Branch protection on `main`
+requires that context and nothing else:
+
+```sh
+gh api repos/christhomas/rust-fs-ext4/branches/main/protection/required_status_checks
+# {"strict":true,"contexts":["ci-ok"], ...}
+```
+
+`ci-ok` in `ci.yml` `needs:` every other job and fails when any of them
+failed, was cancelled **or was skipped**, so a job that is renamed,
+split or dropped turns the gate red in the same diff that does it. That
+is the point of naming one: the list in a settings page nobody re-reads
+cannot drift away from the workflow.
+
+Do not add job names to the required list. A required context nothing
+reports reads as "Expected — waiting for status to be reported" for
+ever, which blocks every pull request while telling nobody why — this
+repository sat that way with three stale names (#263), one of them from
+a workflow that no longer existed.
+
+Nothing in the tree can check this: protection is not a file. If a
+merge is blocked with every check green, read the required contexts
+first.
+
 ## Adding a test (the in-tree pattern)
 
 Integration tests copy a fixture, drive the driver via `apply_*`, then reopen
