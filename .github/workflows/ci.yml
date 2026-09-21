@@ -109,6 +109,17 @@ jobs:
           fi
       - name: chore test:unit
         run: chore test:unit
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-unit
+          path: tmp/logs/*.log
+          if-no-files-found: error
 
   fixtures:
     name: fixtures (harness VM, x86_64 KVM)
@@ -198,6 +209,17 @@ jobs:
         run: chore lint
       - name: chore test
         run: chore test
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-x86_64
+          path: tmp/logs/*.log
+          if-no-files-found: error
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
 
@@ -238,6 +260,17 @@ jobs:
       # same bytes the x86_64 job's guest reads.
       - name: chore test:images
         run: chore test:images
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-aarch64
+          path: tmp/logs/*.log
+          if-no-files-found: error
 
   suite-in-vm:
     name: suite in the guest (the macOS path)
@@ -268,6 +301,17 @@ jobs:
       # either.
       - name: chore test:vm
         run: chore test:vm
+      - name: Keep the tier logs
+        # A quiet tier writes its detail to tmp/logs/<tier>.log and prints a
+        # verdict; without this the detail dies with the runner and the only
+        # record left is the one line the terminal got. `if: always()` because
+        # the run worth reading is the one that failed.
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: tier-logs-suite-in-vm
+          path: tmp/logs/*.log
+          if-no-files-found: error
       - name: chore vm:status (the VM is down again)
         run: '! chore vm:status'
 
