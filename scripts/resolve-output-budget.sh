@@ -73,7 +73,13 @@ fi
 metadata="$(mktemp)"
 metadata_err="$(mktemp)"
 trap 'rm -f "$metadata" "$metadata_err"' EXIT
-if cargo metadata --format-version 1 --locked >"$metadata" 2>"$metadata_err"; then
+# --manifest-path, not the working directory. `cargo metadata` otherwise
+# searches upward from wherever the caller happened to be standing, so the
+# same script resolved a different workspace -- or none -- depending on cwd,
+# while the sibling branch above is derived from BASH_SOURCE and does not.
+# One of the two being cwd-dependent is a trap; now neither is.
+if cargo metadata --format-version 1 --locked --manifest-path "$REPO/Cargo.toml" \
+        >"$metadata" 2>"$metadata_err"; then
     package_root="$(python3 - "$metadata" "$CORE_PACKAGE" <<'PY'
 import json
 import pathlib
