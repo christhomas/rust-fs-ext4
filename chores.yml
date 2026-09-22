@@ -164,7 +164,7 @@ tasks:
               echo "siblings: cloning $name at $ref"
               git init --quiet "$dir"
               git -C "$dir" remote add origin "$url"
-              git -C "$dir" fetch --quiet --depth 1 origin "$ref"
+              git -C "$dir" fetch --quiet origin "$ref"   # not --depth 1: merge-base needs history
               git -C "$dir" checkout --quiet FETCH_HEAD
               continue
             fi
@@ -172,13 +172,36 @@ tasks:
               echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
               exit 1
             fi
-            git -C "$dir" fetch --quiet origin "$ref"
-            if [ "$(git -C "$dir" rev-parse HEAD)" = "$(git -C "$dir" rev-parse FETCH_HEAD)" ]; then
-              echo "siblings: $name already at $ref"
-              continue
+            git -C "$dir" fetch --quiet origin main "$ref"
+            # THE PIN IS A FLOOR, NOT A TARGET, AND THE SIBLING STAYS ON A BRANCH.
+            #
+            # This used to compare HEAD with the pinned ref and check out the ref
+            # whenever they differed, which had two consequences, both observed.
+            #
+            # It moved the checkout BACKWARDS. One copy of core is shared by every
+            # crate on the machine, so the oldest pin in the family won: a sibling two
+            # commits ahead was silently rewound to satisfy this repository.
+            #
+            # And checking out a tag DETACHES. Core was found detached and 52 commits
+            # stale, four days after a `chore siblings` run put it there, because a
+            # detached HEAD reads as a deliberate state and nothing complains about it.
+            # On a branch, being behind shows up in `git status` the first time anyone
+            # looks -- and a commit made in the sibling belongs to something.
+            #
+            # So: require that main CONTAINS the pinned ref, then fast-forward main.
+            # Ahead is fine and is the normal direction of travel. Behind is corrected.
+            # Backwards never happens.
+            if ! git -C "$dir" merge-base --is-ancestor "$ref" origin/main; then
+              echo "siblings: $name's main does not contain $ref -- the pin names something main has not got." >&2
+              exit 1
             fi
-            echo "siblings: moving $name to $ref"
-            git -C "$dir" checkout --quiet FETCH_HEAD
+            git -C "$dir" checkout --quiet main 2>/dev/null || git -C "$dir" checkout --quiet -b main origin/main
+            if git -C "$dir" merge --ff-only --quiet origin/main 2>/dev/null; then
+              echo "siblings: $name on main at $(git -C "$dir" rev-parse --short HEAD)"
+            else
+              echo "siblings: $name's main could not be fast-forwarded -- it has local commits." >&2
+              exit 1
+            fi
           done
 
           # TELL CARGO TO USE THE CHECKOUT WE JUST MADE.
