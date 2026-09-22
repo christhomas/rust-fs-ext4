@@ -476,6 +476,8 @@ tasks:
     # This exists so the CI gate can be reproduced locally. If the two
     # ever differ, this is the copy that is wrong.
     cmds:
+      - scripts/agents-core-check.sh
+      - scripts/ci-gate.sh
       - cargo fmt --check
       - cargo clippy --locked --all-targets -- -D warnings
 
@@ -512,3 +514,12 @@ tasks:
       - 'cd "{{.OUT}}" && pwd -P'
     vars:
       OUT: 'dist'
+
+  check:ci-gate:
+    desc: The one required check stands for every job in ci.yml
+    # A chore task naming a script, and nothing else. This was
+    # tests/ci_aggregate_gate.rs, which parsed a YAML file and compared
+    # strings, and as a cargo test counted towards the executed-test floor the
+    # gate itself enforces.
+    cmds:
+      - scripts/ci-gate.sh
