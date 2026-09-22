@@ -4,6 +4,45 @@
 
 ### Added
 
+- **The parsers are fuzzed, on two tiers.** ext4 is the widest parser
+  surface in the family — a superblock, group descriptors, an inode
+  table, extent trees, htree indexes and a jbd2 journal, each read from
+  an offset the one before it supplied — and none of it had a fuzz
+  target. `fuzz/` holds `image`, `superblock`, `inode`, `dir_block` and
+  `journal`, nightly on a bounded budget; `tests/fuzz_decoders.rs` is the
+  gate, 23,616 deterministic cases in about four seconds on the stable
+  toolchain.
+
+  The corpus is four filesystems `mke2fs` wrote, populated through `-d`
+  rather than by mounting: ext2, which has neither extents nor a journal;
+  ext4 at 1 KiB blocks, which moves every offset; ext4 at 4 KiB; and ext4
+  with `64bit` and `metadata_csum`, which widens the group descriptors.
+  Each root holds more than 600 entries, which is what pushes ext4 into
+  an htree index — `every_committed_filesystem_mounts_and_reads_its_root`
+  asserts that, so the indexed-directory path cannot quietly stop being
+  seeded.
+
+  The walk calls `replay_journal_if_dirty`, deliberately. A journal is a
+  structure the format expects to be partially written, so it is parsed
+  with a corruption tolerance the other structures do not have, and it
+  runs at mount before anything has been established (#71).
+
+
+- **Cross-validation against lwext4, a third implementation, in the
+  harness guest (#99).** `scripts/vm-setup.sh` now builds
+  [lwext4](https://github.com/gkostka/lwext4) (BSD-2-Clause, pure C) in
+  the guest at a pinned commit, and `tests/lwext4_cross_validate.rs`
+  compares it with this crate in both directions: every kernel-made
+  fixture lwext4's feature set covers, a tree this crate writes, and a
+  tree lwext4 writes — on names, permission bits, sizes, symlink targets
+  and SHA-256 of contents. The fixtures lwext4 does not implement
+  (`inline_data`, `large_dir`, `metadata_csum_seed`, a partition table)
+  are asserted to be REFUSED rather than left out, and a fixture in
+  neither list fails the suite. `chore test:lwext4` is the tier;
+  `scripts/test-floor.sh` gives it an executed-test floor, since a tier
+  of one test binary that stops being selected would otherwise pass
+  having run nothing.
+
 - `META_BG` volumes mount and take writes. Their group descriptors are
   found per meta group (`Superblock::descriptor_location`, the kernel's
   `descriptor_loc`), and waking a `BLOCK_UNINIT` group reserves the
@@ -34,7 +73,8 @@
   kernel-made `test-disks/*.img` in the harness VM, `chore test:unit` runs
   what needs no tool, fixture or VM, `chore test:images` what reads a
   fixture but needs no VM, `chore test:oracle` the e2fsprogs oracles,
-  `chore test:kernel` the kernel oracles, `chore test:vm` the whole suite
+  `chore test:kernel` the kernel oracles, `chore test:lwext4` the lwext4
+  cross-validation, `chore test:vm` the whole suite
   inside the guest, and `chore test` everything exactly as CI does
   (`unit`, `fixtures`, `test`, `test-arm64`, `suite-in-vm`, and the
   `ci-ok` gate). `chore siblings` checks out `../rust-fs-core` and the
@@ -108,6 +148,13 @@
 
 ### Removed
 
+- **The two FreeBSD cross-validation mechanisms (#269).**
+  `tests/vagrant/freebsd/`, `tests/qemu/freebsd/`,
+  `scripts/cross-validate-lwext4.sh` and the shell test that held the
+  first two to failing closed (`tests/scripts/freebsd-manifests-fail-closed.sh`)
+  are gone. Neither mechanism ever ran, and lwext4 is a portable C
+  library: cross-validating against it needs a machine, not a BSD, and
+  this repository already has one — the harness guest (see Added).
 - `scripts/vm.sh`, `scripts/vm-slot.sh`, `scripts/vm-e2fsck.sh` and
   `tests/vagrant/debian/` (the harness replaces them), their shell tests in
   `tests/scripts/`, and the fixture builders

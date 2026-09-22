@@ -32,6 +32,7 @@ chore test:unit       # no tools, no fixtures, no VM (debug; traps overflows)
 chore test:images     # reads a fixture, needs no VM
 chore test:oracle     # e2fsck / debugfs / mke2fs — run INSIDE the VM
 chore test:kernel     # the real kernel loop-mounts our images and reads them back
+chore test:lwext4     # lwext4, a third implementation, built in the VM — both ways
 chore test:vm         # the whole suite, compiled and run INSIDE the VM
 chore test            # everything, as CI runs it
 chore lint            # fmt + clippy -D warnings
@@ -76,6 +77,32 @@ it is outside the repository.
 
 Install the hooks once per clone: `./scripts/install-hooks.sh` (runs
 `cargo fmt --check` + `cargo clippy -D warnings` on every commit).
+
+## What gates a merge
+
+**One required check, and it is `ci-ok`.** Branch protection on `main`
+requires that context and nothing else:
+
+```sh
+gh api repos/christhomas/rust-fs-ext4/branches/main/protection/required_status_checks
+# {"strict":true,"contexts":["ci-ok"], ...}
+```
+
+`ci-ok` in `ci.yml` `needs:` every other job and fails when any of them
+failed, was cancelled **or was skipped**, so a job that is renamed,
+split or dropped turns the gate red in the same diff that does it. That
+is the point of naming one: the list in a settings page nobody re-reads
+cannot drift away from the workflow.
+
+Do not add job names to the required list. A required context nothing
+reports reads as "Expected — waiting for status to be reported" for
+ever, which blocks every pull request while telling nobody why — this
+repository sat that way with three stale names (#263), one of them from
+a workflow that no longer existed.
+
+Nothing in the tree can check this: protection is not a file. If a
+merge is blocked with every check green, read the required contexts
+first.
 
 ## Adding a test (the in-tree pattern)
 
@@ -138,11 +165,11 @@ Independent tools can:
   fast path, for a VM that is already up), `chore vm:put <file>` (lands in
   `/share`), `chore vm:down`. One VM runs at a time across every repository
   on the machine; `chore vm:slot:status` says who has it.
-- `scripts/cross-validate-lwext4.sh` + `tests/lwext4_cross_validate.rs` —
-  an independent C implementation; **not implemented yet** (#99), so its one
-  test is `#[ignore]`d and fails when run.
-- `tests/{qemu,vagrant}/freebsd/` — a real kernel, but FreeBSD's ext4 validates
-  JBD2 differently from Linux; not pre-built.
+- `tests/lwext4_cross_validate.rs` + `tests/lwext4/report.c` — A THIRD
+  IMPLEMENTATION. lwext4 (BSD-2-Clause, pure C) is built in the same guest
+  by `scripts/vm-setup.sh` at a pinned commit, and the two read each
+  other's images: every fixture it can mount, a tree this crate wrote, and
+  a tree it wrote itself. `chore test:lwext4`.
 
 To check a driver-mutated image by hand, ask the guest — the tools are
 there, and it sees this repository at the same path the host does:

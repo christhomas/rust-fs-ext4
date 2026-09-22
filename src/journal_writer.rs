@@ -403,6 +403,123 @@ mod tests {
         assert!(journal_len_fits(u32::MAX, u64::MAX, 4096, 64 << 20).is_err());
     }
 
+    /// Whether a volume has a journal decides what `open` returns, and
+    /// the answer is checked in both directions on volumes this crate
+    /// formats itself (#265).
+    ///
+    /// The test this replaces copied `ext4-no-csum.img`, called `open`,
+    /// and threw the answer away — `Some` and `None` both passed, and
+    /// the comment above it said the image "is built without a journal
+    /// *in some configs*", which nothing checked either. So the one
+    /// behaviour its name claimed was untested: a `JournalWriter` handed
+    /// back for a volume with no journal would have kept it green while
+    /// every write through it went to blocks that are not a journal.
+    ///
+    /// Formatting here rather than reading a fixture is what makes the
+    /// case certain, and it runs everywhere — no fixtures, no VM, no
+    /// tools.
+    mod journal_presence {
+        use super::*;
+        use crate::features::{Compat, FsFlavor};
+        use std::sync::{Arc, Mutex};
+
+        const BS: u32 = 1024;
+        /// Room for the 1024-block journal an ext3 format lays down,
+        /// plus its metadata.
+        const VOL: u64 = 8 * 1024 * 1024;
+
+        struct MemDev {
+            bytes: Mutex<Vec<u8>>,
+        }
+
+        impl MemDev {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    bytes: Mutex::new(vec![0u8; VOL as usize]),
+                })
+            }
+        }
+
+        impl crate::block_io::BlockDevice for MemDev {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+                let b = self.bytes.lock().unwrap();
+                let (start, end) = (offset as usize, offset as usize + buf.len());
+                if end > b.len() {
+                    return Err(Error::Corrupt("MemDev: read past end"));
+                }
+                buf.copy_from_slice(&b[start..end]);
+                Ok(())
+            }
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+                let mut b = self.bytes.lock().unwrap();
+                let (start, end) = (offset as usize, offset as usize + buf.len());
+                if end > b.len() {
+                    return Err(Error::Corrupt("MemDev: write past end"));
+                }
+                b[start..end].copy_from_slice(buf);
+                Ok(())
+            }
+            fn size_bytes(&self) -> u64 {
+                VOL
+            }
+            fn flush(&self) -> Result<()> {
+                Ok(())
+            }
+            fn is_writable(&self) -> bool {
+                true
+            }
+        }
+
+        fn formatted(flavor: FsFlavor) -> Filesystem {
+            let dev = MemDev::new();
+            crate::mkfs::format_filesystem_with_flavor(dev.as_ref(), None, None, VOL, BS, flavor)
+                .expect("format");
+            Filesystem::mount(dev).expect("mount")
+        }
+
+        /// A volume with no journal has no journal writer.
+        #[test]
+        fn open_returns_none_when_the_volume_has_no_journal() {
+            let fs = formatted(FsFlavor::Ext4);
+            // THE FIXTURE'S OWN SHAPE FIRST. A test that asserts `None`
+            // against a volume that turned out to have a journal is
+            // asserting nothing about the case it names.
+            assert_eq!(
+                fs.sb.feature_compat & Compat::HAS_JOURNAL.bits(),
+                0,
+                "this volume was formatted without a journal and says it has one"
+            );
+            assert_eq!(fs.sb.journal_inode, 0, "and names no journal inode");
+
+            let writer = JournalWriter::open(&fs).expect("open");
+            assert!(
+                writer.is_none(),
+                "a volume with no journal handed back a journal writer, so every write \
+                 through it would go to blocks that are not a journal"
+            );
+        }
+
+        /// And one with a journal has one — or the test above would pass
+        /// on an `open` that never returns anything.
+        #[test]
+        fn open_returns_a_writer_when_the_volume_has_one() {
+            let fs = formatted(FsFlavor::Ext3);
+            assert_ne!(
+                fs.sb.feature_compat & Compat::HAS_JOURNAL.bits(),
+                0,
+                "this volume was formatted with a journal and says it has none"
+            );
+            assert_ne!(fs.sb.journal_inode, 0, "and it names the journal inode");
+
+            let writer = JournalWriter::open(&fs).expect("open");
+            assert!(
+                writer.is_some(),
+                "a volume with a journal handed back nothing, so a caller would fall \
+                 back to unjournaled writes on a filesystem that has a log"
+            );
+        }
+    }
+
     /// Tests that copy a fixture from `test-disks/` (`chore fixtures`).
     mod needs_host {
         use super::*;
@@ -419,21 +536,6 @@ mod tests {
                 fs_ext4_test_support::temp_path!("fs_ext4_jw_{}_{tag}_{n}.img", std::process::id());
             fs::copy(&src, &dst).unwrap_or_else(|e| panic!("copy {src} to {dst}: {e}"));
             dst
-        }
-
-        #[test]
-        fn open_returns_none_when_no_journal() {
-            // ext4-no-csum.img is built without a journal in some configs; if it
-            // happens to have one, this test is a no-op (we just exercise the
-            // open path). The point of the test is that open() itself doesn't
-            // panic on an unjournaled image.
-            let path = copy_to_tmp("ext4-no-csum.img", "no_journal");
-            let dev = FileDevice::open(&path).expect("open ro");
-            let fs = Filesystem::mount(Arc::new(dev)).expect("mount");
-            // Just exercise — either Some or None is fine; we're checking
-            // structural correctness of the open path.
-            let _ = JournalWriter::open(&fs).expect("open journal_writer");
-            fs::remove_file(path).ok();
         }
 
         #[test]

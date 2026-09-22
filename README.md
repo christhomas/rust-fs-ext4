@@ -259,10 +259,18 @@ credited in the License section.
   was written. A third test goes the other way (the kernel writes, the C
   ABI reads), and a fourth flips one data byte and proves `e2fsck` still
   calls the volume clean while the readback catches it. `chore test:kernel`.
-- **Cross-validators:** `tests/lwext4_cross_validate.rs` (BSD-2-Clause
-  reference; not implemented yet, so its test is `#[ignore]`d and fails
-  when run); a FreeBSD-VM cross-validator (`tests/vagrant/freebsd/`,
-  `tests/qemu/`) is in flight.
+- **A third implementation:** `tests/lwext4_cross_validate.rs` compares
+  this crate against [lwext4](https://github.com/gkostka/lwext4)
+  (BSD-2-Clause, pure C), which shares a code lineage with neither the
+  kernel nor us — so an ambiguity we and e2fsprogs read the same way
+  still has somebody to disagree. It is built in the harness guest at a
+  pinned commit by `scripts/vm-setup.sh`; `tests/lwext4/report.c` walks a
+  volume through it. Compared in both directions — every fixture lwext4's
+  feature set covers, a tree this crate wrote, and a tree lwext4 wrote —
+  on names, permission bits, sizes, symlink targets and SHA-256 of
+  contents. The fixtures it cannot read (`inline_data`, `large_dir`,
+  `metadata_csum_seed`, a partition table) are asserted to be REFUSED
+  rather than left out. `chore test:lwext4`.
 - **Structural verifier:** `crate::verify::verify` reconciles
   the on-disk bitmap against every block claimed by the inode
   tree; pinned by `tests/verify_basic.rs`, also runnable as a
@@ -459,8 +467,9 @@ Research references credited under their own licenses:
 
 - [`yuoo655/ext4_rs`](https://github.com/yuoo655/ext4_rs) — MIT.
 - [`lwext4`](https://github.com/gkostka/lwext4) — BSD-2-Clause.
-  Used opt-in as a cross-validator (`tests/lwext4_cross_validate.rs`),
-  never linked into the shipping binary.
+  Built in the harness guest at a pinned commit and used as a
+  cross-validator (`tests/lwext4_cross_validate.rs`), never linked into
+  the shipping binary.
 
 Spec sources: kernel.org ext4 wiki documentation; Carrier, *File
 System Forensic Analysis* (Addison-Wesley, 2005). The driver does
@@ -538,6 +547,7 @@ chore test:unit     # the tests that need no tool, no fixture and no VM
 chore test:images   # the tests that read a fixture but need no VM
 chore test:oracle   # the driver writes, e2fsprogs reads back — in the VM
 chore test:kernel   # the driver writes, the real kernel reads back — in the VM
+chore test:lwext4   # a third implementation reads ours, and we read its — in the VM
 chore test:vm       # the whole suite, compiled and run INSIDE the VM
 chore test          # everything, as CI runs it
 ```
@@ -554,7 +564,10 @@ not an oracle. So a single Debian guest, provisioned by
 `tests/test_contract.rs` fails the suite if anything runs one here. **A
 Mac needs no e2fsprogs installed at all.**
 
-The same guest is the only place a filesystem is ever mounted: the kernel
+The same guest builds lwext4 — a third ext4 implementation, at the commit
+`scripts/vm-setup.sh` pins — so `chore test:lwext4` can cross-validate
+against something with no code lineage in common with either us or the
+kernel. And it is the only place a filesystem is ever mounted: the kernel
 oracles (`chore test:kernel`) loop-mount our images there, and
 `chore fixtures` builds the kernel-made fixtures under `test-disks/`
 (gitignored: loop mounts, xattrs, ACLs, inline data, htree directories —

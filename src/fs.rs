@@ -2875,7 +2875,12 @@ impl Filesystem {
 
     /// Recompute the inode checksum (when enabled) and splice both halves
     /// back into the inode image. No-op when csum disabled.
-    fn finalize_inode_raw(&self, ino: u32, generation: u32, raw: &mut [u8]) -> Result<()> {
+    pub(crate) fn finalize_inode_raw(
+        &self,
+        ino: u32,
+        generation: u32,
+        raw: &mut [u8],
+    ) -> Result<()> {
         if self.csum.enabled {
             if let Some((lo, hi)) = self.csum.compute_inode_checksum(ino, generation, raw) {
                 raw[0x7C..0x7E].copy_from_slice(&lo.to_le_bytes());

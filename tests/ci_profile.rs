@@ -498,6 +498,34 @@ fn runs_on_pull_request(wf: &Workflow) -> bool {
     wf.triggers.iter().any(|t| t == "pull_request")
 }
 
+/// The branch names a `pull_request:` trigger is restricted to, if any
+/// (#132).
+///
+/// `on: pull_request: branches: [main]` means a pull request based on
+/// anything else runs **no** CI — and still collects its review-bot
+/// ticks, so it reads as verified. This repository stacks pull requests
+/// routinely, which is exactly the case that got nothing: one check
+/// against another PR's three on the same day.
+fn pull_request_branch_filter(document: &Yaml) -> Vec<String> {
+    let Some(on) = field(document, "on").or_else(|| field(document, "true")) else {
+        return Vec::new();
+    };
+    let Some(pr) = field(on, "pull_request") else {
+        return Vec::new();
+    };
+    let Some(branches) = field(pr, "branches") else {
+        return Vec::new();
+    };
+    branches
+        .as_sequence()
+        .map(|seq| {
+            seq.iter()
+                .filter_map(|b| b.as_str().map(str::to_string))
+                .collect()
+        })
+        .unwrap_or_default()
+}
+
 /// Why `workflow` gates no pull request at all, or `None` if it does.
 ///
 /// The real-file assertions ask this FIRST. Without it, a workflow whose
@@ -908,9 +936,36 @@ fn assert_unconditional(job: &Yaml, name: &str, workflow: &str) {
         "{workflow} jobs.{name} must not be conditional or allowed to fail"
     );
     for (at, step) in steps_of(job, name).iter().enumerate() {
+        let keys = keys_of(step);
+        // A STEP THAT RUNS NO COMMAND CANNOT GATE, AND MAY BE
+        // CONDITIONAL (#264).
+        //
+        // The rule is right about `run:` steps: a conditional command is
+        // a command that may not run, and the gate is the commands. It
+        // was wrong about the others. `actions/upload-artifact` has no
+        // `run:` — it cannot pass, cannot mask a failure and cannot make
+        // a red job green — and without `if: always()` GitHub skips it
+        // whenever an earlier step failed, which is the only time it is
+        // worth having. The blanket ban therefore made the quiet suite's
+        // logs unkeepable on exactly the runs that need them.
+        //
+        // `continue-on-error:` is still refused everywhere: on a `uses:`
+        // step it says an upload that failed does not matter, which is a
+        // different claim and not one this workflow makes.
+        let commands = !run_of(step).is_empty();
+        let offending: Vec<&str> = keys
+            .iter()
+            .map(String::as_str)
+            .filter(|k| match *k {
+                "if" => commands,
+                "continue-on-error" => true,
+                _ => false,
+            })
+            .collect();
         assert!(
-            !carries_a_non_gating_key(&keys_of(step)),
-            "{workflow} jobs.{name} step {at} ({:?}) must not be conditional or allowed to fail",
+            offending.is_empty(),
+            "{workflow} jobs.{name} step {at} ({:?}) carries {offending:?}: a step that \
+             runs a command must not be conditional or allowed to fail",
             field(step, "name")
                 .and_then(Yaml::as_str)
                 .unwrap_or(run_of(step))
@@ -945,6 +1000,21 @@ fn runs_chore(steps: &[Yaml], task: &str) -> bool {
 /// `chore test` is unit, the tool and fixture checks, the whole suite in
 /// release, and the script tests; `chore lint` is clippy with warnings
 /// denied.
+/// A pull request gets CI whatever it is based on (#132).
+#[test]
+fn ci_runs_on_a_pull_request_against_any_base() {
+    let path = workflow_path("ci.yml");
+    let text = read_or_panic(&path);
+    let document = load_document(&text, &path);
+    let filter = pull_request_branch_filter(&document);
+    assert!(
+        filter.is_empty(),
+        "ci.yml runs on pull requests only against {filter:?}. A pull request based on \
+         anything else — a stacked one, which this repository uses routinely — runs no \
+         CI at all, and still collects its review-bot ticks, so it reads as verified."
+    );
+}
+
 #[test]
 fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectures_through_chore() {
     let path = workflow_path("ci.yml");
@@ -1158,7 +1228,13 @@ fn the_pr_gate_builds_fixtures_once_in_the_harness_vm_and_tests_both_architectur
             _ => None,
         })
         .collect();
-    for subtask in ["test:unit", "test:oracle", "test:kernel", "test:scripts"] {
+    for subtask in [
+        "test:unit",
+        "test:oracle",
+        "test:kernel",
+        "test:lwext4",
+        "test:scripts",
+    ] {
         assert!(
             subtasks.contains(&subtask),
             "chores.yml `test:native` must run `task: {subtask}`; it runs {subtasks:?}"
@@ -2191,6 +2267,45 @@ jobs:
             checking_debug_runs(yaml),
             vec!["- run: EXPECT_OVERFLOW_CHECKS=1 cargo test --locked --lib".to_string()],
         );
+    }
+
+    /// A STEP THAT RUNS NO COMMAND MAY BE CONDITIONAL (#264).
+    ///
+    /// `actions/upload-artifact` has no `run:`. It cannot pass, cannot
+    /// mask a failure and cannot make a red job green — and without
+    /// `if: always()` GitHub skips it whenever an earlier step failed,
+    /// which is the only time keeping the log is worth anything. The
+    /// blanket ban made the quiet suite's logs unkeepable on exactly
+    /// the runs that need them.
+    fn check_job(steps: &str) {
+        let text = format!(
+            "on:\n  pull_request:\njobs:\n  test:\n    runs-on: ubuntu-latest\n    steps:\n{steps}"
+        );
+        let document = super::load_document(&text, std::path::Path::new("synthetic.yml"));
+        let job = super::job(&document, "test", std::path::Path::new("synthetic.yml"));
+        super::assert_unconditional(job, "test", "ci.yml");
+    }
+
+    #[test]
+    fn a_step_that_runs_nothing_may_carry_a_condition() {
+        check_job(
+            "      - uses: actions/upload-artifact@v4\n        if: always()\n        with:\n          name: logs\n",
+        );
+    }
+
+    #[test]
+    #[should_panic(expected = "must not be conditional")]
+    fn a_step_that_runs_a_command_may_not() {
+        check_job("      - run: cargo test --locked --release\n        if: always()\n");
+    }
+
+    /// And `continue-on-error:` stays refused whatever the step is: on
+    /// an upload it says a failed upload does not matter, which is a
+    /// different claim from "run this even after a failure".
+    #[test]
+    #[should_panic(expected = "continue-on-error")]
+    fn a_step_that_runs_nothing_may_still_not_be_allowed_to_fail() {
+        check_job("      - uses: actions/upload-artifact@v4\n        continue-on-error: true\n");
     }
 
     /// A profile named another way still disqualifies the run.

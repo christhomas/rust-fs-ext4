@@ -23,9 +23,12 @@ The same VM is where the ORACLE TOOLS live (`e2fsck`, `debugfs`,
 `dumpe2fs`, `tune2fs`, `mke2fs` — `scripts/vm-setup.sh` installs them) and
 where the KERNEL ORACLES mount: `chore test:kernel` loop-mounts an image
 this driver wrote and compares what Linux reads back with what was
-written. Nothing of the sort happens on the host, on any platform. A test
-reaches a tool only through `fs_ext4_test_support::oracle` and the kernel
-only through the guest-kernel helpers in the same crate; a scratch image
+written. It is also where lwext4 is built (`scripts/vm-setup.sh`, at a
+pinned commit), which `chore test:lwext4` reads these same images with as
+a third opinion. Nothing of the sort happens on the host, on any
+platform. A test reaches a tool only through
+`fs_ext4_test_support::oracle`, the kernel only through the guest-kernel
+helpers and lwext4 only through the lwext4 helpers in the same crate; a scratch image
 therefore lives inside the repository (`./tmp`), which is the one part of
 the host the guest can see.
 
