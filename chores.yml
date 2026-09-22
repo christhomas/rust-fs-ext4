@@ -155,11 +155,31 @@ tasks:
     cmds:
       - |
         set -eu
+        # SIBLINGS LIVE BESIDE THE MAIN TREE, NOT BESIDE THIS CHECKOUT.
+        #
+        # `../$name` was resolved from wherever the task ran, and a thread worktree
+        # is not next to the main checkout -- it lives under the agent's own
+        # directory. Measured on 2026-09-22 the same family resolved
+        # ../rust-fs-core to THREE different places: beside the main checkouts,
+        # beside the ntfs worktrees, and beside the diskjockey ones. One of those
+        # was a day out of date and was winning silently for anything resolving
+        # relatively.
+        #
+        # A sibling set is a property of the machine, not of a checkout. One copy
+        # on disk is the whole point of siblings over submodules, and it holds only
+        # if every checkout of every crate agrees where that copy is.
+        # --git-common-dir names the main tree from a worktree AND from the main
+        # checkout, so this answers the same from anywhere.
+        #
+        # --path-format=absolute is required, not tidiness: without it a main
+        # checkout reports a bare `.git` and this resolves to `//$name`.
+        common="$(git rev-parse --path-format=absolute --git-common-dir)"
+        siblings_root="$(cd "$common/../.." && pwd)"
         printf '%s\t%s\t%s\n' \
           rust-fs-core          '{{.FS_CORE_URL}}'       '{{.FS_CORE_REF}}' \
           fs-linux-test-harness '{{.LINUX_HARNESS_URL}}' '{{.LINUX_HARNESS_REF}}' \
         | while IFS="$(printf '\t')" read -r name url ref; do
-            dir="../$name"
+            dir="$siblings_root/$name"
             if [ ! -d "$dir/.git" ]; then
               echo "siblings: cloning $name at $ref"
               git init --quiet "$dir"
