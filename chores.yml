@@ -66,7 +66,7 @@ chore_min_version: 0.6.0
 #
 #   A task prints a VERDICT: one line per tier, a final count, and the path
 #   of the log holding everything else. A failure prints the excerpt.
-#   `chore test -- --verbose` (or FLTH_VERBOSE=1) streams the whole run.
+#   `chore test -- --verbose` (or OUTPUT_BUDGET_VERBOSE=1) streams the whole run.
 #
 #   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
 #   in full, including the per-call `[oracle vm]` evidence that `--show-output`
@@ -118,7 +118,11 @@ vars:
   # org, and a URL rebuilt from a repo name points at a repository that
   # does not exist for exactly the ones that are not.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
-  FS_CORE_REF: v0.2.10
+  # v0.2.11 is the release that packages scripts/output-budget.sh, which
+  # scripts/resolve-output-budget.sh resolves and verifies. v0.2.10 does not
+  # contain it, so this pin cannot go back below v0.2.11 while the tiers read
+  # the wrapper from core.
+  FS_CORE_REF: v0.2.11
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.1.0
 
@@ -370,9 +374,9 @@ tasks:
         set -eu
         # --verbose belongs to the whole run, and test:native's tiers are
         # separate chore invocations: an exported variable is what reaches
-        # them, which is why tier.sh reads FLTH_VERBOSE as well as the flag.
+        # them, which is why tier.sh reads OUTPUT_BUDGET_VERBOSE as well as the flag.
         case " ${CLI_ARGS:-} " in
-          *" --verbose "*|*" -v "*) export FLTH_VERBOSE=1 ;;
+          *" --verbose "*|*" -v "*) export OUTPUT_BUDGET_VERBOSE=1 ;;
         esac
         if [ "$(uname -s)" != Linux ]; then
           echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."

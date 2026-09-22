@@ -47,9 +47,12 @@ for tier in test:unit test:images test:oracle test:kernel test:lwext4 test:vm; d
 done
 
 # --- 2. A budget that is breached fails the run. ---------------------------
-budget="$REPO/../fs-linux-test-harness/scripts/output-budget.sh"
-if [ ! -x "$budget" ]; then
-    note "../fs-linux-test-harness/scripts/output-budget.sh is missing -- run 'chore siblings'"
+# The wrapper is rust-fs-core's, resolved the same way tier.sh resolves it, so
+# this test exercises the script the tiers actually run rather than a copy that
+# happens to sit nearby.
+budget="$(bash "$REPO/scripts/resolve-output-budget.sh" 2>/dev/null || true)"
+if [ -z "$budget" ] || [ ! -f "$budget" ]; then
+    note "the canonical output-budget.sh could not be resolved -- run 'chore siblings'"
 else
     work="$(mktemp -d "$REPO/tmp/output-budget-test.XXXXXX")"
     trap 'rm -rf "$work"' EXIT
@@ -77,7 +80,7 @@ else
     case "$out" in *"the reason"*) ;; *) note "a failure printed no excerpt: $out" ;; esac
 
     # Verbose streams, and is still budgeted.
-    out="$(FLTH_VERBOSE=1 "$budget" --log "$work/v.log" --max-lines 5 --label v -- echo hello 2>&1)"
+    out="$(OUTPUT_BUDGET_VERBOSE=1 "$budget" --log "$work/v.log" --max-lines 5 --label v -- echo hello 2>&1)"
     case "$out" in *hello*) ;; *) note "--verbose did not stream the output: $out" ;; esac
 fi
 
