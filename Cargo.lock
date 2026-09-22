@@ -5,6 +5,8 @@ version = 4
 [[package]]
 name = "am-fs-core"
 version = "0.2.11"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "c93db810a800622b11ed8e551351be9aa072551fb1682689d1be2ffe756d89af"
 
 [[package]]
 name = "am-fs-ext4"

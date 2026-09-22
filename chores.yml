@@ -181,6 +181,31 @@ tasks:
             git -C "$dir" checkout --quiet FETCH_HEAD
           done
 
+          # TELL CARGO TO USE THE CHECKOUT WE JUST MADE.
+          #
+          # The manifest declares am-fs-core by VERSION only. A `path` in
+          # Cargo.toml is a developer's machine layout committed to the
+          # repository: it forces every consumer to have a sibling beside
+          # them, and it is published metadata that is wrong for everyone
+          # else. The dependency is the released crate; a developer who wants
+          # their own core exercised says so HERE, locally.
+          #
+          # .cargo/config.toml is gitignored, so this cannot be committed by
+          # accident, and a `paths` override is not recorded in Cargo.lock, so
+          # it cannot leak that way either. Remove the file to go back to the
+          # published crate.
+          #
+          # THE PATH IS ABSOLUTE, DELIBERATELY. A relative one means a
+          # different directory depending on whether you are in the main
+          # checkout or a thread worktree, and both can exist at once: a
+          # worktree resolving `../rust-fs-core` was found pointing at a
+          # SECOND core checkout a day out of date, which is the drift this
+          # arrangement exists to prevent.
+          core_abs="$(cd ../rust-fs-core && pwd)"
+          mkdir -p .cargo
+          printf 'paths = ["%s"]\n' "$core_abs" > .cargo/config.toml
+          echo "siblings: cargo will use $core_abs (.cargo/config.toml, gitignored)"
+
   tools:
     desc: "Install and verify what the HOST needs: ripgrep, and the VM the oracle tools live in"
     cmds: ['scripts/tools.sh']

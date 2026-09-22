@@ -36,3 +36,7 @@ test-disks/test-run/
 # Build output. `chore staticlib` writes the archive and headers here for a
 # consumer to copy out of (`chore artifact` prints this directory).
 /dist/
+
+# A local cargo override pointing at a sibling checkout, written by
+# `chore siblings`. It is a development setting, never a committed one.
+.cargo/config.toml
