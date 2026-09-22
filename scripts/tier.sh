@@ -30,29 +30,38 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
 # THE WRAPPER IS COPIED FROM rust-fs-core FOR THIS RUN, AND DELETED AFTER IT.
 #
-# It belongs to core -- core is the one crate every driver already depends on
-# -- and it is deliberately not committed here. A committed copy is a copy
-# that drifts: measured on 2026-09-22 the family had three of them, reached
-# four different ways, each repository internally consistent and nothing
-# comparing them.
+# It belongs to core, and it is deliberately NOT committed here. A committed
+# copy is a copy that drifts: measured on 2026-09-22 the family had three of
+# them, reached four different ways, each repository internally consistent
+# and nothing comparing them.
 #
-# So the run takes a fresh copy of whatever core currently says, uses it, and
-# removes it. That means a developer part-way through changing core's wrapper
-# gets their change exercised here on the very next run, with nothing to
-# re-pin, re-vendor or re-sync, and nothing left behind to go stale.
+# CARGO IS ASKED WHERE CORE IS, rather than this script guessing. Cargo has
+# already resolved the dependency, and its answer is right in both shapes
+# this family uses: with `path = "../rust-fs-core"` it reports the developer's
+# own checkout, so work in progress on the wrapper is exercised here on the
+# next run; with a plain version requirement it reports the registry copy of
+# the pinned release. There is no sibling-versus-crate decision to make,
+# because cargo made it.
 #
 # tmp/ is gitignored and is where the tier logs already live.
-CORE_WRAPPER="$REPO/../rust-fs-core/scripts/output-budget.sh"
-if [ ! -f "$CORE_WRAPPER" ]; then
-    echo "tier.sh: ../rust-fs-core/scripts/output-budget.sh is missing." >&2
-    echo "         rust-fs-core is a path dependency of this crate, so the" >&2
-    echo "         sibling must be present -- run 'chore siblings'." >&2
+CORE_DIR="$(cargo metadata --format-version 1 --locked --manifest-path "$REPO/Cargo.toml" \
+    2>/dev/null | python3 -c '
+import json, sys
+packages = json.load(sys.stdin)["packages"]
+print(next((p["manifest_path"].rsplit("/", 1)[0]
+            for p in packages if p["name"] == "am-fs-core"), ""))
+')"
+if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/scripts/output-budget.sh" ]; then
+    echo "tier.sh: cargo could not say where am-fs-core is, or its copy has no" >&2
+    echo "         scripts/output-budget.sh. The wrapper lives in rust-fs-core;" >&2
+    echo "         check the am-fs-core dependency resolves and is at a version" >&2
+    echo "         that ships it (v0.2.11 or later)." >&2
     exit 1
 fi
 
 BUDGET="$REPO/tmp/output-budget.$$.sh"
 mkdir -p "$REPO/tmp"
-cp "$CORE_WRAPPER" "$BUDGET"
+cp "$CORE_DIR/scripts/output-budget.sh" "$BUDGET"
 trap 'rm -f "$BUDGET"' EXIT
 
 [ $# -ge 5 ] || { echo "tier.sh: usage: tier.sh LABEL LOG MAX-LINES MAX-BYTES -- CMD..." >&2; exit 2; }
