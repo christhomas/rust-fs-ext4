@@ -207,3 +207,12 @@ a real `e2fsck` and the full baseline:
 The pattern to copy: `metadata_csum` writes must recompute **every** affected
 checksum (superblock, group descriptor, bitmaps, inode, journal) — and the only
 reliable proof is a real `e2fsck`, not the driver's own readers.
+
+## Project rules
+
+- **Never grow a shared tool to solve a problem in this repository.** `chore` is a
+  general-purpose task runner this project merely consumes; the same goes for
+  `github-guard` and the agent-skills hooks. If something needed here looks like it
+  belongs inside one of them, it does not. Solve it here, or ask first. The tell is a
+  release: if a shared tool needs a new version cut whose only purpose is to unblock
+  this project, the code is in the wrong repository.
