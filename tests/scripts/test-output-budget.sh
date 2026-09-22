@@ -47,12 +47,13 @@ for tier in test:unit test:images test:oracle test:kernel test:lwext4 test:vm; d
 done
 
 # --- 2. A budget that is breached fails the run. ---------------------------
-# The wrapper is rust-fs-core's, resolved the same way tier.sh resolves it, so
-# this test exercises the script the tiers actually run rather than a copy that
-# happens to sit nearby.
-budget="$(bash "$REPO/scripts/resolve-output-budget.sh" 2>/dev/null || true)"
-if [ -z "$budget" ] || [ ! -f "$budget" ]; then
-    note "the canonical output-budget.sh could not be resolved -- run 'chore siblings'"
+# The wrapper is rust-fs-core's. This reads it straight from the sibling
+# rather than taking a copy the way tier.sh does: the copy exists so a run is
+# not disturbed mid-flight, and has nothing to do with the behaviour under
+# test here.
+budget="$REPO/../rust-fs-core/scripts/output-budget.sh"
+if [ ! -f "$budget" ]; then
+    note "../rust-fs-core/scripts/output-budget.sh is missing -- run 'chore siblings'"
 else
     work="$(mktemp -d "$REPO/tmp/output-budget-test.XXXXXX")"
     trap 'rm -rf "$work"' EXIT

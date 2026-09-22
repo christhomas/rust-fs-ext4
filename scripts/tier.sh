@@ -28,14 +28,32 @@ set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 
-# THE WRAPPER BELONGS TO rust-fs-core, not to this repository and not to the
-# test harness. It used to be read straight out of ../fs-linux-test-harness,
-# which put a second copy of it one sibling away from core's; measured on
-# 2026-09-22 the family had drifted to three copies reached four ways, and
-# the harness held the stalest of them. resolve-output-budget.sh finds core's
-# copy -- sibling first, then the packaged Cargo dependency -- and verifies it
-# by checksum and API version before handing back a path.
-BUDGET="$(bash "$REPO/scripts/resolve-output-budget.sh")"
+# THE WRAPPER IS COPIED FROM rust-fs-core FOR THIS RUN, AND DELETED AFTER IT.
+#
+# It belongs to core -- core is the one crate every driver already depends on
+# -- and it is deliberately not committed here. A committed copy is a copy
+# that drifts: measured on 2026-09-22 the family had three of them, reached
+# four different ways, each repository internally consistent and nothing
+# comparing them.
+#
+# So the run takes a fresh copy of whatever core currently says, uses it, and
+# removes it. That means a developer part-way through changing core's wrapper
+# gets their change exercised here on the very next run, with nothing to
+# re-pin, re-vendor or re-sync, and nothing left behind to go stale.
+#
+# tmp/ is gitignored and is where the tier logs already live.
+CORE_WRAPPER="$REPO/../rust-fs-core/scripts/output-budget.sh"
+if [ ! -f "$CORE_WRAPPER" ]; then
+    echo "tier.sh: ../rust-fs-core/scripts/output-budget.sh is missing." >&2
+    echo "         rust-fs-core is a path dependency of this crate, so the" >&2
+    echo "         sibling must be present -- run 'chore siblings'." >&2
+    exit 1
+fi
+
+BUDGET="$REPO/tmp/output-budget.$$.sh"
+mkdir -p "$REPO/tmp"
+cp "$CORE_WRAPPER" "$BUDGET"
+trap 'rm -f "$BUDGET"' EXIT
 
 [ $# -ge 5 ] || { echo "tier.sh: usage: tier.sh LABEL LOG MAX-LINES MAX-BYTES -- CMD..." >&2; exit 2; }
 LABEL="$1"; LOG_NAME="$2"; MAX_LINES="$3"; MAX_BYTES="$4"; shift 4
@@ -49,7 +67,7 @@ case " ${CLI_ARGS:-} " in
     *" --verbose "*|*" -v "*) export OUTPUT_BUDGET_VERBOSE=1 ;;
 esac
 
-exec "$BUDGET" \
+bash "$BUDGET" \
     --log "$REPO/tmp/logs/$LOG_NAME.log" \
     --max-lines "$MAX_LINES" \
     --max-bytes "$MAX_BYTES" \
