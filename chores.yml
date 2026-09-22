@@ -145,7 +145,7 @@ lifecycle:
 tasks:
   siblings:
     desc: Check out the sibling repos this crate builds and tests against, at their pinned refs
-    # init + fetch-by-ref rather than clone: LINUX_HARNESS_REF is a bare
+    # init + fetch-by-ref rather than clone: a ref here may be a bare
     # commit, which `git clone --branch` cannot name. REFUSES TO MOVE A
     # DIRTY SIBLING — a checkout is destructive to uncommitted work.
     cmds:
