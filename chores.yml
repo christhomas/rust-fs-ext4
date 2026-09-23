@@ -208,18 +208,28 @@ tasks:
             # On a branch, being behind shows up in `git status` the first time anyone
             # looks -- and a commit made in the sibling belongs to something.
             #
-            # So: require that main CONTAINS the pinned ref, then fast-forward main.
-            # Ahead is fine and is the normal direction of travel. Behind is corrected.
-            # Backwards never happens.
-            if ! git -C "$dir" merge-base --is-ancestor "$ref" origin/main; then
-              echo "siblings: $name's main does not contain $ref -- the pin names something main has not got." >&2
-              exit 1
-            fi
-            git -C "$dir" checkout --quiet main 2>/dev/null || git -C "$dir" checkout --quiet -b main origin/main
-            if git -C "$dir" merge --ff-only --quiet origin/main 2>/dev/null; then
-              echo "siblings: $name on main at $(git -C "$dir" rev-parse --short HEAD)"
+            # So: guarantee a FLOOR, and never move anyone off their branch.
+            #
+            # An earlier cut of this checked out main unconditionally, which is only a
+            # little better than the detach it replaced. rust-fs-core was found on
+            # release/v0.2.12 with an unpushed commit while a release was being cut;
+            # checking out main would have taken it away mid-cut. The previous
+            # revision of this task did worse to that same checkout on 2026-09-22 --
+            # it rewound a shared core three weeks, to a September 6th commit.
+            #
+            # If the checkout already contains the pinned ref it is left exactly as it
+            # is, on whatever branch that is. Only a checkout genuinely below the floor
+            # is moved, and only by fast-forwarding a main that is already checked out.
+            # Anything else is reported for a human, because this is one checkout
+            # shared by every crate on the machine and not this task's to hijack.
+            current="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+            if git -C "$dir" merge-base --is-ancestor "$ref" HEAD; then
+              echo "siblings: $name at or ahead of $ref (on $current)"
+            elif [ "$current" = "main" ] && git -C "$dir" merge --ff-only --quiet origin/main 2>/dev/null; then
+              echo "siblings: $name fast-forwarded to $(git -C "$dir" rev-parse --short HEAD)"
             else
-              echo "siblings: $name's main could not be fast-forwarded -- it has local commits." >&2
+              echo "siblings: $name is on '$current' and below $ref; this task will not move it." >&2
+              echo "          It is one checkout shared by every crate here -- move it yourself." >&2
               exit 1
             fi
           done
