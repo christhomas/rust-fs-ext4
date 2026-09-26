@@ -21,39 +21,31 @@ impl fs_ext4::block_io::BlockDevice for Memory {
     }
 }
 
-fn scratch(label: &str) -> Option<PathBuf> {
-    let source = PathBuf::from(env!("CARGO_MANIFEST_DIR")).join("test-disks/ext4-deep-extents.img");
-    if !source.exists() {
-        eprintln!("skip: build test-disks/ext4-deep-extents.img to run this oracle");
-        return None;
-    }
-    let path = std::env::temp_dir().join(format!("ext4-deep-{label}-{}.img", std::process::id()));
+/// A scratch copy of the deep-extents fixture. A missing fixture fails the
+/// test, naming the task that builds it; it never skips.
+#[track_caller]
+fn scratch(label: &str) -> PathBuf {
+    let source = fs_ext4_test_support::fixture(env!("CARGO_MANIFEST_DIR"), "ext4-deep-extents.img");
+    let path = PathBuf::from(fs_ext4_test_support::temp_path!(
+        "ext4-deep-{label}-{}.img",
+        std::process::id()
+    ));
     std::fs::copy(source, &path).unwrap();
-    Some(path)
+    path
 }
 fn inode(fs: &Filesystem, name: &str) -> u32 {
     let mut read = |ino| fs.read_inode_verified(ino).map(|(inode, _)| inode);
     fs_ext4::path::lookup(fs.dev.as_ref(), &fs.sb, &mut read, name).unwrap()
 }
+/// `e2fsck -fn` must accept the image. It runs in the harness VM, and a
+/// test that cannot reach it fails.
+#[track_caller]
 fn oracle(path: &std::path::Path) {
-    if let Ok(output) = std::process::Command::new("e2fsck")
-        .args(["-fn"])
-        .arg(path)
-        .output()
-    {
-        assert!(
-            output.status.success(),
-            "{}{}",
-            String::from_utf8_lossy(&output.stdout),
-            String::from_utf8_lossy(&output.stderr)
-        );
-    }
+    fs_ext4_test_support::assert_e2fsck_clean(path.to_str().unwrap(), "truncate_multilevel");
 }
 #[test]
 fn equal_size_deep_truncate_leaves_image_unchanged() {
-    let Some(path) = scratch("equal") else {
-        return;
-    };
+    let path = scratch("equal");
     let fs = Filesystem::mount(Arc::new(
         FileDevice::open_rw(path.to_str().unwrap()).unwrap(),
     ))
@@ -70,9 +62,7 @@ fn equal_size_deep_truncate_leaves_image_unchanged() {
 }
 #[test]
 fn deep_shrink_and_unlink_free_tree_blocks() {
-    let Some(path) = scratch("shrink") else {
-        return;
-    };
+    let path = scratch("shrink");
     let fs = Filesystem::mount(Arc::new(
         FileDevice::open_rw(path.to_str().unwrap()).unwrap(),
     ))
@@ -95,9 +85,7 @@ fn deep_shrink_and_unlink_free_tree_blocks() {
 
 #[test]
 fn depth_two_shrink_preserves_bytes_and_reclaims_every_tree_node() {
-    let Some(path) = scratch("depth2") else {
-        return;
-    };
+    let path = scratch("depth2");
     let device = Arc::new(Memory(std::sync::Mutex::new(std::fs::read(&path).unwrap())));
     let fs = Filesystem::mount(device.clone()).unwrap();
     let ino = fs.apply_create("/fragmented", 0o600).unwrap();
@@ -129,9 +117,7 @@ fn depth_two_shrink_preserves_bytes_and_reclaims_every_tree_node() {
 
 #[test]
 fn densely_written_fragmented_file_finishes_and_can_be_removed() {
-    let Some(path) = scratch("dense-fragmented") else {
-        return;
-    };
+    let path = scratch("dense-fragmented");
     let memory = Arc::new(Memory(std::sync::Mutex::new(std::fs::read(&path).unwrap())));
     let fs = Filesystem::mount(memory.clone()).unwrap();
     let ino = fs.apply_create("/efisp.fat", 0o600).unwrap();
@@ -160,9 +146,7 @@ fn densely_written_fragmented_file_finishes_and_can_be_removed() {
 
 #[test]
 fn invalid_deep_checksum_refuses_shrink_and_unlink_without_writing() {
-    let Some(path) = scratch("corrupt") else {
-        return;
-    };
+    let path = scratch("corrupt");
     let device = Arc::new(Memory(std::sync::Mutex::new(std::fs::read(&path).unwrap())));
     let fs = Filesystem::mount(device.clone()).unwrap();
     let ino = inode(&fs, "/sparse.bin");
@@ -214,9 +198,7 @@ impl fs_ext4::block_io::BlockDevice for Interrupted {
 #[test]
 fn deep_shrink_interrupted_at_each_write_recovers_original_or_complete() {
     use std::sync::atomic::{AtomicUsize, Ordering::Relaxed};
-    let Some(path) = scratch("interrupt") else {
-        return;
-    };
+    let path = scratch("interrupt");
     let baseline = std::fs::read(&path).unwrap();
     let mut writes = usize::MAX;
     // The first successful pass discovers the real transaction write count.
