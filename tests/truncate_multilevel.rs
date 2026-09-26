@@ -43,6 +43,15 @@ fn inode(fs: &Filesystem, name: &str) -> u32 {
 fn oracle(path: &std::path::Path) {
     fs_ext4_test_support::assert_e2fsck_clean(path.to_str().unwrap(), "truncate_multilevel");
 }
+/// `image` with the superblock's `s_state` and checksum zeroed. The first
+/// write call on a mount marks the volume not clean (and a drop puts it
+/// back), so a refused or no-op call is allowed to have touched those
+/// bytes and nothing else.
+fn outside_state(mut image: Vec<u8>) -> Vec<u8> {
+    image[1024 + 0x3A..1024 + 0x3C].fill(0);
+    image[1024 + 0x3FC..1024 + 0x400].fill(0);
+    image
+}
 #[test]
 fn equal_size_deep_truncate_leaves_image_unchanged() {
     let path = scratch("equal");
@@ -55,8 +64,12 @@ fn equal_size_deep_truncate_leaves_image_unchanged() {
     assert!(ExtentHeader::parse(&before.block).unwrap().depth > 0);
     let bytes = std::fs::read(&path).unwrap();
     fs.apply_truncate_shrink(ino, before.size).unwrap();
-    assert_eq!(std::fs::read(&path).unwrap(), bytes);
+    assert_eq!(
+        outside_state(std::fs::read(&path).unwrap()),
+        outside_state(bytes.clone())
+    );
     drop(fs);
+    assert_eq!(std::fs::read(&path).unwrap(), bytes);
     oracle(&path);
     std::fs::remove_file(path).unwrap();
 }
@@ -158,16 +171,20 @@ fn invalid_deep_checksum_refuses_shrink_and_unlink_without_writing() {
     device.0.lock().unwrap()[child as usize * 4096 + 4095] ^= 1;
     let fs = Filesystem::mount(device.clone()).unwrap();
     let before = device.0.lock().unwrap().clone();
+    let now = || device.0.lock().unwrap().clone();
     assert!(matches!(
         fs.apply_truncate_shrink(ino, 0),
         Err(fs_ext4::Error::BadChecksum { .. })
     ));
-    assert_eq!(*device.0.lock().unwrap(), before);
-    assert!(matches!(
-        fs.apply_unlink("/sparse.bin"),
-        Err(fs_ext4::Error::BadChecksum { .. })
-    ));
-    assert_eq!(*device.0.lock().unwrap(), before);
+    assert_eq!(outside_state(now()), outside_state(before.clone()));
+    let unlinked = fs.apply_unlink("/sparse.bin");
+    assert!(
+        matches!(unlinked, Err(fs_ext4::Error::BadChecksum { .. })),
+        "{unlinked:?}"
+    );
+    assert_eq!(outside_state(now()), outside_state(before.clone()));
+    drop(fs);
+    assert_eq!(now(), before, "the drop puts s_state back as it was");
     std::fs::remove_file(path).unwrap();
 }
 
