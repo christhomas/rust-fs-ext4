@@ -906,7 +906,7 @@ impl Filesystem {
             }
         }
         if parsed.has_extents() {
-            let Ok(runs) = self.extent_tree_runs(&parsed.block) else {
+            let Ok(runs) = self.extent_tree_runs(orphan_ino, &parsed) else {
                 return Ok(None);
             };
             freed += self.buffer_free_runs(buf, &runs)?;
@@ -1738,9 +1738,25 @@ impl Filesystem {
     /// Read from the tree, not from `i_size`. A file of size zero can hold
     /// blocks (a `KEEP_SIZE` preallocation), and blocks can lie past the
     /// size of any file. A caller that frees a whole file frees these.
-    pub(crate) fn extent_tree_runs(&self, block: &[u8]) -> Result<Vec<(u64, u64)>> {
-        let (extents, nodes) =
-            crate::extent::collect_all_with_nodes(block, self.dev.as_ref(), self.sb.block_size())?;
+    ///
+    /// Every index and leaf block must pass its checksum first, or this
+    /// is [`Error::BadChecksum`] and nothing is returned to free: a node
+    /// that does not verify may name blocks that belong to another file,
+    /// and the kernel refuses the removal the same way.
+    pub(crate) fn extent_tree_runs(&self, ino: u32, inode: &Inode) -> Result<Vec<(u64, u64)>> {
+        let (extents, nodes) = crate::extent::collect_all_with_nodes(
+            &inode.block,
+            self.dev.as_ref(),
+            self.sb.block_size(),
+        )?;
+        for &node in &nodes {
+            let bytes = self.read_block(node)?;
+            if !self.csum.verify_extent_tail(ino, inode.generation, &bytes) {
+                return Err(Error::BadChecksum {
+                    what: "extent block",
+                });
+            }
+        }
         Ok(extents
             .iter()
             .map(|e| (e.physical_block, e.length as u64))
@@ -3351,7 +3367,7 @@ impl Filesystem {
         let mut freed_sectors: u64 = 0;
         let sectors_per_block = bs as u64 / 512;
         if target_inode.has_extents() {
-            let runs = self.extent_tree_runs(&target_inode.block)?;
+            let runs = self.extent_tree_runs(target_ino, &target_inode)?;
             freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
         } else {
             // A BLOCK-MAPPED FILE HAS BLOCKS TOO. Only extents were freed,
@@ -3909,7 +3925,7 @@ impl Filesystem {
 
         // Phase 1: free existing data blocks. Each freed run credits its
         // own group's BGD via `buffer_free_block_run_and_bgd`.
-        let runs = self.extent_tree_runs(&inode.block)?;
+        let runs = self.extent_tree_runs(ino, &inode)?;
         let freed_fs_blocks = self.buffer_free_runs(&mut buf, &runs)?;
 
         // Reset the inode's extent root to an empty leaf.
@@ -5359,7 +5375,7 @@ impl Filesystem {
             // growth can commit part of the rename.
             let destination_runs =
                 if (dst_is_dir || dst_old_inode.links_count <= 1) && dst_old_inode.has_extents() {
-                    self.extent_tree_runs(&dst_old_inode.block)?
+                    self.extent_tree_runs(dst_old_ino, &dst_old_inode)?
                 } else {
                     Vec::new()
                 };
@@ -6403,7 +6419,7 @@ impl Filesystem {
         // Free target's data blocks. Each freed run credits its own group's
         // BGD; SB credit accumulates and lands once below.
         let mut freed_blocks = if target_inode.has_extents() {
-            let runs = self.extent_tree_runs(&target_inode.block)?;
+            let runs = self.extent_tree_runs(target_ino, &target_inode)?;
             self.buffer_free_runs(&mut buf, &runs)?
         } else {
             // A block-mapped directory: read as an extent header, it was
@@ -8101,6 +8117,45 @@ mod tests {
         assert_eq!(inode.links_count, 1, "the file is still named");
         assert_eq!(inode.size, BS as u64, "its lowered size is kept");
         assert_ne!(size_before, inode.size, "fixture: the size was lowered");
+    }
+
+    /// A FILE WHOSE EXTENT LEAF FAILS ITS CHECKSUM IS NOT FREED AROUND.
+    /// Freeing walks the tree to learn which blocks to release; a node that
+    /// does not verify may name blocks that belong to something else. The
+    /// kernel refuses the removal (EFSBADCRC); so does this, before any
+    /// bitmap is touched.
+    #[test]
+    fn unlinking_a_file_whose_extent_leaf_fails_its_checksum_is_refused() {
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            fs.apply_create("/deep.bin", 0o644).expect("create");
+            for i in 0..12u64 {
+                fs.apply_pwrite("/deep.bin", i * 2 * BS as u64, &[0x5a; BS as usize])
+                    .expect("write");
+            }
+        }
+        let leaf = {
+            let fs = mount(&dev);
+            let ino = resolve(&fs, "/deep.bin").expect("resolve");
+            let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+            crate::extent::ExtentIdx::parse(&inode.block[12..24])
+                .expect("index")
+                .leaf_block
+        };
+        dev.bytes.lock().unwrap()[(leaf * BS as u64 + BS as u64 - 1) as usize] ^= 1;
+
+        let fs = mount(&dev);
+        let free_before = fs.sb.free_blocks_count;
+        let got = fs.apply_unlink("/deep.bin");
+        assert!(
+            matches!(got, Err(Error::BadChecksum { .. })),
+            "unlink over an unverified extent leaf: {got:?}"
+        );
+        drop(fs);
+        let fs = mount(&dev);
+        assert!(resolve(&fs, "/deep.bin").is_ok(), "the file is still named");
+        assert_eq!(fs.sb.free_blocks_count, free_before, "nothing was freed");
     }
 
     // --- i_file_acl: written where it is read -------------------------
