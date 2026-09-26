@@ -15,9 +15,9 @@ The checked lifecycle currently accepts an internal JBD2 v2 journal with matchin
 block size, first log block 1, one user, no compatibility/read-only flags and only
 REVOKE/64BIT incompatibility flags. Outstanding journal/filesystem errors are
 reported. Checksummed, async-commit, fast-commit and unknown journal formats remain
-unsupported in this API. The older `mount` interface remains available for
-compatibility; its checksummed transaction encoding/recovery is not qualified by
-these tests. Ext4 metadata checksums are distinct from JBD2 transaction checksums.
+unsupported in this API. The older `mount` interface remains available and
+replays checksummed journals too; that path is qualified by its own tests, not by
+these. Ext4 metadata checksums are distinct from JBD2 transaction checksums.
 
 Recovery collects descriptor writes and revoke records only after their commit
 block. Incomplete final transactions, including their revokes, are discarded.
@@ -36,9 +36,9 @@ Qualification uses Linux `mkfs.ext4`/`debugfs` and independently encoded plain
 JBD2 records. `e2fsck` agrees on a committed inode/superblock update followed by
 an uncommitted overwrite or revoke. The first mount observes refreshed metadata,
 finished images pass `e2fsck -fn` without skipping recovery, and repeat mount/
-finish is byte-stable. Every one of nine write/flush boundaries is interrupted
-under both immediate-durability and volatile-until-flush models (18 cases), then
-independently recovered by `e2fsck`. These tests do not model torn sectors, lying
+finish is byte-stable. Every write/flush boundary of the checked mount and finish
+is interrupted under both immediate-durability and volatile-until-flush models,
+then independently recovered by `e2fsck`. These tests do not model torn sectors, lying
 flush acknowledgements, concurrent writers or real USB transports.
 
 References: [Linux JBD2 recovery](https://github.com/torvalds/linux/blob/master/fs/jbd2/recovery.c)
