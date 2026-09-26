@@ -119,7 +119,14 @@ impl Transaction {
     /// `Vec<Vec<u8>>` where each inner Vec is one `block_size` byte journal
     /// block, in the order they should be written to the journal log:
     ///
-    ///   [descriptor, data_0, data_1, ..., data_N, optional_revoke, commit]
+    ///   [descriptor, data..., descriptor, data..., revoke..., commit]
+    ///
+    /// A descriptor block tags at most `tags_per_descriptor()` data blocks, so
+    /// a write set larger than that is split across several descriptor blocks,
+    /// each immediately followed by the data blocks it tags and each ending in
+    /// a tag with `TAG_LAST` set. Revoke records are chunked the same way, at
+    /// `revokes_per_block()` per block. A small transaction therefore still
+    /// produces the familiar `[descriptor, data_0 ..= data_N, revoke, commit]`.
     ///
     /// Empty transactions (no writes, no revokes) return a single commit
     /// block — matches kernel's "empty transaction" handling.
@@ -181,29 +188,51 @@ impl Transaction {
     fn serialize(&self, layout: Layout) -> Result<Vec<Vec<u8>>> {
         let mut out = Vec::new();
 
+        // A transaction may touch more blocks than a single descriptor can tag.
+        // JBD2 permits several descriptor blocks per transaction, each followed
+        // by its own data blocks and each ending in a LAST_TAG. Emit as many as
+        // the write set needs instead of failing the whole write.
         if !self.writes.is_empty() {
-            // Descriptor block + data blocks.
-            out.push(self.build_descriptor_block(layout)?);
-            for w in &self.writes {
-                out.push(w.bytes.clone());
+            for chunk in self.writes.chunks(self.tags_per_descriptor(layout)) {
+                out.push(self.build_descriptor_block(chunk, layout)?);
+                for w in chunk {
+                    out.push(w.bytes.clone());
+                }
             }
         }
         if !self.revokes.is_empty() {
-            out.push(self.build_revoke_block(layout)?);
+            for chunk in self.revokes.chunks(self.revokes_per_block(layout)) {
+                out.push(self.build_revoke_block(chunk, layout)?);
+            }
         }
         out.push(self.build_commit_block(layout)?);
         Ok(out)
     }
 
-    fn build_descriptor_block(&self, layout: Layout) -> Result<Vec<u8>> {
+    /// How many tags fit in one descriptor block: after its 12-byte header,
+    /// and before the checksum tail a checksummed journal reserves.
+    fn tags_per_descriptor(&self, layout: Layout) -> usize {
+        let usable = self.block_size as usize - 12 - layout.tail_bytes;
+        (usable / layout.tag_bytes).max(1)
+    }
+
+    /// How many revoke records fit in one revoke block: after its header and
+    /// byte count, and before the checksum tail.
+    fn revokes_per_block(&self, layout: Layout) -> usize {
+        let record_size = if layout.uses_64bit { 8 } else { 4 };
+        let usable = self.block_size as usize - 16 - layout.tail_bytes;
+        (usable / record_size).max(1)
+    }
+
+    fn build_descriptor_block(&self, writes: &[JournaledBlock], layout: Layout) -> Result<Vec<u8>> {
         let mut blk = vec![0u8; self.block_size as usize];
         self.write_header(&mut blk, JBD2_DESCRIPTOR_BLOCK);
 
         let tag_size = layout.tag_bytes;
         let usable = blk.len() - layout.tail_bytes;
         let mut pos = 12usize;
-        let last_idx = self.writes.len().saturating_sub(1);
-        for (i, w) in self.writes.iter().enumerate() {
+        let last_idx = writes.len().saturating_sub(1);
+        for (i, w) in writes.iter().enumerate() {
             let mut flags: u32 = if i == last_idx { TAG_LAST } else { 0 };
             // Always set SAME_UUID so we don't have to carry a per-tag UUID
             // (journal's own s_uuid is used implicitly).
@@ -255,19 +284,19 @@ impl Transaction {
         }
     }
 
-    fn build_revoke_block(&self, layout: Layout) -> Result<Vec<u8>> {
+    fn build_revoke_block(&self, revokes: &[u64], layout: Layout) -> Result<Vec<u8>> {
         let mut blk = vec![0u8; self.block_size as usize];
         self.write_header(&mut blk, JBD2_REVOKE_BLOCK);
 
         let record_size = if layout.uses_64bit { 8 } else { 4 };
-        let records_bytes = self.revokes.len() * record_size;
+        let records_bytes = revokes.len() * record_size;
         let total_bytes = 16 + records_bytes; // header(12) + count(4) + records
         if total_bytes > blk.len() - layout.tail_bytes {
             return Err(Error::Corrupt("revoke block overflow"));
         }
         blk[12..16].copy_from_slice(&(total_bytes as u32).to_be_bytes());
         let mut pos = 16usize;
-        for &b in &self.revokes {
+        for &b in revokes {
             if layout.uses_64bit {
                 blk[pos..pos + 8].copy_from_slice(&b.to_be_bytes());
             } else {
@@ -351,6 +380,71 @@ mod tests {
             TAG_SAME_UUID,
             "same_uuid expected"
         );
+    }
+
+    #[test]
+    fn writes_beyond_one_descriptor_spill_into_a_second_descriptor_block() {
+        // 1 KiB blocks, classic 8-byte tags: (1024 - 12) / 8 = 126 tags fit.
+        let mut tx = Transaction::begin(9, 1024, false, false);
+        let per = 126;
+        for i in 0..(per + 1) {
+            tx.add_write(1000 + i as u64, vec![i as u8; 1024]).unwrap();
+        }
+        let blocks = tx.commit().unwrap();
+        // desc + 126 data + desc + 1 data + commit
+        assert_eq!(blocks.len(), 1 + per + 1 + 1 + 1);
+
+        let block_type = |b: &Vec<u8>| u32::from_be_bytes(b[4..8].try_into().unwrap());
+        assert_eq!(block_type(&blocks[0]), JBD2_DESCRIPTOR_BLOCK);
+        assert_eq!(block_type(&blocks[per + 1]), JBD2_DESCRIPTOR_BLOCK);
+        assert_eq!(block_type(&blocks[per + 3]), JBD2_COMMIT_BLOCK);
+        // data blocks sit directly after their own descriptor
+        assert_eq!(blocks[1][0], 0);
+        assert_eq!(blocks[per][0], (per - 1) as u8);
+        assert_eq!(blocks[per + 2][0], per as u8);
+
+        // both descriptors end in a LAST tag; the first one is full
+        let last_tag_flags = |desc: &Vec<u8>, idx: usize| {
+            u16::from_be_bytes(desc[12 + idx * 8 + 6..12 + idx * 8 + 8].try_into().unwrap()) as u32
+        };
+        assert_eq!(last_tag_flags(&blocks[0], per - 1) & TAG_LAST, TAG_LAST);
+        assert_eq!(
+            last_tag_flags(&blocks[0], 0) & TAG_LAST,
+            0,
+            "only the final tag is LAST"
+        );
+        assert_eq!(last_tag_flags(&blocks[per + 1], 0) & TAG_LAST, TAG_LAST);
+    }
+
+    #[test]
+    fn exactly_one_descriptor_worth_of_writes_stays_in_one_block() {
+        let mut tx = Transaction::begin(10, 1024, false, false);
+        let per = 126;
+        for i in 0..per {
+            tx.add_write(2000 + i as u64, vec![0u8; 1024]).unwrap();
+        }
+        let blocks = tx.commit().unwrap();
+        assert_eq!(blocks.len(), 1 + per + 1); // desc + data + commit, no spill
+    }
+
+    #[test]
+    fn revokes_beyond_one_block_spill_into_a_second_revoke_block() {
+        // 1 KiB blocks, 4-byte records: (1024 - 16) / 4 = 252 fit.
+        let mut tx = Transaction::begin(11, 1024, false, false);
+        let per = 252;
+        for i in 0..(per + 1) {
+            tx.add_revoke(5000 + i as u64);
+        }
+        let blocks = tx.commit().unwrap();
+        assert_eq!(blocks.len(), 3); // revoke + revoke + commit
+        let block_type = |b: &Vec<u8>| u32::from_be_bytes(b[4..8].try_into().unwrap());
+        assert_eq!(block_type(&blocks[0]), JBD2_REVOKE_BLOCK);
+        assert_eq!(block_type(&blocks[1]), JBD2_REVOKE_BLOCK);
+        assert_eq!(block_type(&blocks[2]), JBD2_COMMIT_BLOCK);
+        let count0 = u32::from_be_bytes(blocks[0][12..16].try_into().unwrap());
+        let count1 = u32::from_be_bytes(blocks[1][12..16].try_into().unwrap());
+        assert_eq!(count0, (16 + per * 4) as u32);
+        assert_eq!(count1, 16 + 4);
     }
 
     #[test]
@@ -518,21 +612,80 @@ mod tests {
         }
     }
 
+    /// The tail is not tag space either, and it is where a descriptor's
+    /// capacity changes: at 1 KiB with CSUM_V2 32-bit tags (10 bytes),
+    /// (1024 - 12) / 10 = 101 fit without a tail and (1024 - 12 - 4) / 10 =
+    /// 100 with it. The 101st write must start a second descriptor, each
+    /// descriptor sealed with its own tail and each tag checksummed against
+    /// the data block that follows its own descriptor.
+    #[test]
+    fn a_split_transaction_checksums_every_descriptor() {
+        let jsb = JournalSuperblock {
+            block_size: 1024,
+            ..csum_jsb(JbdIncompat::CSUM_V2.bits())
+        };
+        let seed = jsb.csum_seed();
+        let mut tx = Transaction::begin(9, 1024, false, false);
+        for i in 0..101u64 {
+            tx.add_write(3000 + i, vec![i as u8 + 1; 1024]).unwrap();
+        }
+        let blocks = tx.commit_for(&jsb).unwrap();
+        // desc + 100 data + desc + 1 data + commit
+        assert_eq!(blocks.len(), 104);
+        let (first, second) = (&blocks[0], &blocks[101]);
+        for desc in [first, second] {
+            assert_eq!(be32(desc, 4), JBD2_DESCRIPTOR_BLOCK);
+            assert_eq!(be32(desc, 1020), jbd2::block_tail_checksum(seed, desc));
+        }
+        let flags = |desc: &[u8], idx: usize| {
+            u16::from_be_bytes(
+                desc[12 + idx * 10 + 6..12 + idx * 10 + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as u32
+        };
+        assert_eq!(flags(first, 99) & TAG_LAST, TAG_LAST);
+        assert_eq!(flags(first, 98) & TAG_LAST, 0);
+        assert_eq!(flags(second, 0) & TAG_LAST, TAG_LAST);
+        assert_eq!(
+            be32(second, 12),
+            3100,
+            "the spilled tag names the 101st block"
+        );
+        let c16 = u16::from_be_bytes(second[16..18].try_into().unwrap());
+        assert_eq!(c16, jbd2::tag_checksum(seed, 9, &blocks[102]) as u16);
+        assert_eq!(be32(&blocks[103], 4), JBD2_COMMIT_BLOCK);
+    }
+
     /// The tail is not record space: a revoke block of 64-bit records holds
-    /// (4096 - 16) / 8 = 510 without one and 509 with it.
+    /// (4096 - 16) / 8 = 510 without one and 509 with it, so the 510th
+    /// record starts a second revoke block rather than overwriting the tail.
     #[test]
     fn revoke_tail_is_reserved() {
         let b64 = JbdIncompat::BIT64.bits();
+        let jsb = csum_jsb(JbdIncompat::CSUM_V3.bits() | b64);
+        let seed = jsb.csum_seed();
         let mut tx = Transaction::begin(9, 4096, true, true);
         for b in 0..509 {
             tx.add_revoke(1000 + b);
         }
-        tx.commit_for(&csum_jsb(JbdIncompat::CSUM_V3.bits() | b64))
-            .unwrap();
+        let blocks = tx.commit_for(&jsb).unwrap();
+        assert_eq!(blocks.len(), 2, "509 records: one revoke block + commit");
+        assert_eq!(be32(&blocks[0], 12), 16 + 509 * 8);
+
         tx.add_revoke(2000);
-        assert!(tx
-            .commit_for(&csum_jsb(JbdIncompat::CSUM_V3.bits() | b64))
-            .is_err());
+        let blocks = tx.commit_for(&jsb).unwrap();
+        assert_eq!(blocks.len(), 3, "510 records: two revoke blocks + commit");
+        assert_eq!(be32(&blocks[0], 12), 16 + 509 * 8);
+        assert_eq!(be32(&blocks[1], 12), 16 + 8);
+        assert_eq!(
+            u64::from_be_bytes(blocks[1][16..24].try_into().unwrap()),
+            2000
+        );
+        for blk in &blocks[..2] {
+            assert_eq!(be32(blk, 4), JBD2_REVOKE_BLOCK);
+            assert_eq!(be32(blk, 4092), jbd2::block_tail_checksum(seed, blk));
+        }
     }
 
     #[test]
