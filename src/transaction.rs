@@ -612,6 +612,51 @@ mod tests {
         }
     }
 
+    /// The tail is not tag space either, and it is where a descriptor's
+    /// capacity changes: at 1 KiB with CSUM_V2 32-bit tags (10 bytes),
+    /// (1024 - 12) / 10 = 101 fit without a tail and (1024 - 12 - 4) / 10 =
+    /// 100 with it. The 101st write must start a second descriptor, each
+    /// descriptor sealed with its own tail and each tag checksummed against
+    /// the data block that follows its own descriptor.
+    #[test]
+    fn a_split_transaction_checksums_every_descriptor() {
+        let jsb = JournalSuperblock {
+            block_size: 1024,
+            ..csum_jsb(JbdIncompat::CSUM_V2.bits())
+        };
+        let seed = jsb.csum_seed();
+        let mut tx = Transaction::begin(9, 1024, false, false);
+        for i in 0..101u64 {
+            tx.add_write(3000 + i, vec![i as u8 + 1; 1024]).unwrap();
+        }
+        let blocks = tx.commit_for(&jsb).unwrap();
+        // desc + 100 data + desc + 1 data + commit
+        assert_eq!(blocks.len(), 104);
+        let (first, second) = (&blocks[0], &blocks[101]);
+        for desc in [first, second] {
+            assert_eq!(be32(desc, 4), JBD2_DESCRIPTOR_BLOCK);
+            assert_eq!(be32(desc, 1020), jbd2::block_tail_checksum(seed, desc));
+        }
+        let flags = |desc: &[u8], idx: usize| {
+            u16::from_be_bytes(
+                desc[12 + idx * 10 + 6..12 + idx * 10 + 8]
+                    .try_into()
+                    .unwrap(),
+            ) as u32
+        };
+        assert_eq!(flags(first, 99) & TAG_LAST, TAG_LAST);
+        assert_eq!(flags(first, 98) & TAG_LAST, 0);
+        assert_eq!(flags(second, 0) & TAG_LAST, TAG_LAST);
+        assert_eq!(
+            be32(second, 12),
+            3100,
+            "the spilled tag names the 101st block"
+        );
+        let c16 = u16::from_be_bytes(second[16..18].try_into().unwrap());
+        assert_eq!(c16, jbd2::tag_checksum(seed, 9, &blocks[102]) as u16);
+        assert_eq!(be32(&blocks[103], 4), JBD2_COMMIT_BLOCK);
+    }
+
     /// The tail is not record space: a revoke block of 64-bit records holds
     /// (4096 - 16) / 8 = 510 without one and 509 with it, so the 510th
     /// record starts a second revoke block rather than overwriting the tail.
