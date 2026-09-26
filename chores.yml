@@ -66,7 +66,7 @@ chore_min_version: 0.6.0
 #
 #   A task prints a VERDICT: one line per tier, a final count, and the path
 #   of the log holding everything else. A failure prints the excerpt.
-#   `chore test -- --verbose` (or FLTH_VERBOSE=1) streams the whole run.
+#   `chore test -- --verbose` (or OUTPUT_BUDGET_VERBOSE=1) streams the whole run.
 #
 #   Nothing is thrown away: every tier's output goes to tmp/logs/<tier>.log
 #   in full, including the per-call `[oracle vm]` evidence that `--show-output`
@@ -118,7 +118,11 @@ vars:
   # org, and a URL rebuilt from a repo name points at a repository that
   # does not exist for exactly the ones that are not.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
-  FS_CORE_REF: v0.2.10
+  # scripts/tier.sh reads scripts/output-budget.sh out of core. v0.2.11 is the
+  # first release that packages it and v0.2.13 is the first that carries the
+  # quiet-failure behaviour, so this pin cannot go back below v0.2.13 while
+  # the tiers read the wrapper from core.
+  FS_CORE_REF: v0.2.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.1.0
 
@@ -151,16 +155,36 @@ tasks:
     cmds:
       - |
         set -eu
+        # SIBLINGS LIVE BESIDE THE MAIN TREE, NOT BESIDE THIS CHECKOUT.
+        #
+        # `../$name` was resolved from wherever the task ran, and a thread worktree
+        # is not next to the main checkout -- it lives under the agent's own
+        # directory. Measured on 2026-09-22 the same family resolved
+        # ../rust-fs-core to THREE different places: beside the main checkouts,
+        # beside the ntfs worktrees, and beside the diskjockey ones. One of those
+        # was a day out of date and was winning silently for anything resolving
+        # relatively.
+        #
+        # A sibling set is a property of the machine, not of a checkout. One copy
+        # on disk is the whole point of siblings over submodules, and it holds only
+        # if every checkout of every crate agrees where that copy is.
+        # --git-common-dir names the main tree from a worktree AND from the main
+        # checkout, so this answers the same from anywhere.
+        #
+        # --path-format=absolute is required, not tidiness: without it a main
+        # checkout reports a bare `.git` and this resolves to `//$name`.
+        common="$(git rev-parse --path-format=absolute --git-common-dir)"
+        siblings_root="$(cd "$common/../.." && pwd)"
         printf '%s\t%s\t%s\n' \
           rust-fs-core          '{{.FS_CORE_URL}}'       '{{.FS_CORE_REF}}' \
           fs-linux-test-harness '{{.LINUX_HARNESS_URL}}' '{{.LINUX_HARNESS_REF}}' \
         | while IFS="$(printf '\t')" read -r name url ref; do
-            dir="../$name"
+            dir="$siblings_root/$name"
             if [ ! -d "$dir/.git" ]; then
               echo "siblings: cloning $name at $ref"
               git init --quiet "$dir"
               git -C "$dir" remote add origin "$url"
-              git -C "$dir" fetch --quiet --depth 1 origin "$ref"
+              git -C "$dir" fetch --quiet origin "$ref"   # not --depth 1: merge-base needs history
               git -C "$dir" checkout --quiet FETCH_HEAD
               continue
             fi
@@ -168,14 +192,72 @@ tasks:
               echo "siblings: $name has uncommitted changes -- refusing to move it." >&2
               exit 1
             fi
-            git -C "$dir" fetch --quiet origin "$ref"
-            if [ "$(git -C "$dir" rev-parse HEAD)" = "$(git -C "$dir" rev-parse FETCH_HEAD)" ]; then
-              echo "siblings: $name already at $ref"
-              continue
+            git -C "$dir" fetch --quiet origin main "$ref"
+            # THE PIN IS A FLOOR, NOT A TARGET, AND THE SIBLING STAYS ON A BRANCH.
+            #
+            # This used to compare HEAD with the pinned ref and check out the ref
+            # whenever they differed, which had two consequences, both observed.
+            #
+            # It moved the checkout BACKWARDS. One copy of core is shared by every
+            # crate on the machine, so the oldest pin in the family won: a sibling two
+            # commits ahead was silently rewound to satisfy this repository.
+            #
+            # And checking out a tag DETACHES. Core was found detached and 52 commits
+            # stale, four days after a `chore siblings` run put it there, because a
+            # detached HEAD reads as a deliberate state and nothing complains about it.
+            # On a branch, being behind shows up in `git status` the first time anyone
+            # looks -- and a commit made in the sibling belongs to something.
+            #
+            # So: guarantee a FLOOR, and never move anyone off their branch.
+            #
+            # An earlier cut of this checked out main unconditionally, which is only a
+            # little better than the detach it replaced. rust-fs-core was found on
+            # release/v0.2.12 with an unpushed commit while a release was being cut;
+            # checking out main would have taken it away mid-cut. The previous
+            # revision of this task did worse to that same checkout on 2026-09-22 --
+            # it rewound a shared core three weeks, to a September 6th commit.
+            #
+            # If the checkout already contains the pinned ref it is left exactly as it
+            # is, on whatever branch that is. Only a checkout genuinely below the floor
+            # is moved, and only by fast-forwarding a main that is already checked out.
+            # Anything else is reported for a human, because this is one checkout
+            # shared by every crate on the machine and not this task's to hijack.
+            current="$(git -C "$dir" rev-parse --abbrev-ref HEAD)"
+            if git -C "$dir" merge-base --is-ancestor "$ref" HEAD; then
+              echo "siblings: $name at or ahead of $ref (on $current)"
+            elif [ "$current" = "main" ] && git -C "$dir" merge --ff-only --quiet origin/main 2>/dev/null; then
+              echo "siblings: $name fast-forwarded to $(git -C "$dir" rev-parse --short HEAD)"
+            else
+              echo "siblings: $name is on '$current' and below $ref; this task will not move it." >&2
+              echo "          It is one checkout shared by every crate here -- move it yourself." >&2
+              exit 1
             fi
-            echo "siblings: moving $name to $ref"
-            git -C "$dir" checkout --quiet FETCH_HEAD
           done
+
+          # CARGO IS TOLD ABOUT THE CHECKOUT BY Cargo.toml, NOT BY A CONFIG
+          # FILE WRITTEN HERE.
+          #
+          # An earlier cut of this task wrote a `paths` override into
+          # .cargo/config.toml holding an ABSOLUTE path to the sibling, so the
+          # manifest could name am-fs-core by version alone. It failed in the
+          # one place this repository cannot afford to fail: `chore test:vm`
+          # mounts this working tree into the guest at /repo, the override went
+          # with it, and the host path it names does not exist inside the VM.
+          #   error: failed to update path override
+          #          `/home/runner/work/rust-fs-ext4/rust-fs-core`
+          #          (defined in `/repo/.cargo/config.toml`)
+          # -- run 35852463970, job 107154016599.
+          #
+          # A path INSIDE the repository is a path two machines have to agree
+          # on, and these two do not. `path = "../rust-fs-core"` in Cargo.toml
+          # is the answer both of them already have: on the host it is the
+          # sibling this task pins, and in the guest it is /rust-fs-core, which
+          # test:vm stages there for exactly this reason. It is also what every
+          # other crate in this family declares.
+          #
+          # `version` beside the `path` is what gets published: cargo drops the
+          # path when it packages, so the released crate depends on the
+          # registry version and nobody downstream inherits our layout.
 
   tools:
     desc: "Install and verify what the HOST needs: ripgrep, and the VM the oracle tools live in"
@@ -370,9 +452,9 @@ tasks:
         set -eu
         # --verbose belongs to the whole run, and test:native's tiers are
         # separate chore invocations: an exported variable is what reaches
-        # them, which is why tier.sh reads FLTH_VERBOSE as well as the flag.
+        # them, which is why tier.sh reads OUTPUT_BUDGET_VERBOSE as well as the flag.
         case " ${CLI_ARGS:-} " in
-          *" --verbose "*|*" -v "*) export FLTH_VERBOSE=1 ;;
+          *" --verbose "*|*" -v "*) export OUTPUT_BUDGET_VERBOSE=1 ;;
         esac
         if [ "$(uname -s)" != Linux ]; then
           echo "test: this host is $(uname -s) -- running the Linux suite in the harness VM."
