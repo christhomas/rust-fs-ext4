@@ -354,14 +354,26 @@ impl Filesystem {
     /// After any I/O failure, release ownership and reopen rather than reusing it.
     pub fn finish(mut self) -> Result<()> {
         self.flush()?;
-        if !self.managed_recovery {
+        if self.managed_recovery {
+            self.refresh_metadata()?;
+            if self.sb.last_orphan != 0 {
+                return Err(Error::Corrupt("orphan recovery remains incomplete"));
+            }
+            self.set_recovery_marker(false)?;
+        }
+        self.restore_state_found()
+    }
+
+    /// Put back the `s_state` this mount found, as [`Drop`] would, but with
+    /// its error reported: `finish` is a release that says whether it
+    /// happened, and the drop that follows it then has nothing left to write.
+    fn restore_state_found(&self) -> Result<()> {
+        use std::sync::atomic::Ordering;
+        if !self.marked_not_clean.load(Ordering::SeqCst) {
             return Ok(());
         }
-        self.refresh_metadata()?;
-        if self.sb.last_orphan != 0 {
-            return Err(Error::Corrupt("orphan recovery remains incomplete"));
-        }
-        self.set_recovery_marker(false)?;
+        self.write_superblock_state(self.state_found.load(Ordering::SeqCst))?;
+        self.marked_not_clean.store(false, Ordering::SeqCst);
         Ok(())
     }
 
@@ -6834,6 +6846,32 @@ mod tests {
             }
             fn is_writable(&self) -> bool {
                 true
+            }
+        }
+
+        /// Every device write and flush of a checked mount, create and
+        /// finish, the drop included, is one `finish` answers for: a failure
+        /// at any of them must not be reported as a clean release.
+        #[test]
+        fn a_failure_at_any_release_write_is_not_a_clean_finish() {
+            let run = |fail_at: usize| {
+                let dev = std::sync::Arc::new(Failing {
+                    inner: journalled(),
+                    events: AtomicUsize::new(0),
+                    fail_at: AtomicUsize::new(fail_at),
+                });
+                let finished = Filesystem::mount_recovering(dev.clone())
+                    .and_then(|fs| fs.apply_create("/a", 0o644).map(|_| fs))
+                    .and_then(|fs| fs.finish());
+                (finished.is_ok(), dev.events.load(Ordering::SeqCst))
+            };
+            let (ok, events) = run(usize::MAX);
+            assert!(ok, "the uninterrupted run must finish");
+            for fail_at in 0..events {
+                assert!(
+                    !run(fail_at).0,
+                    "a failure at device event {fail_at} of {events} was reported as a clean finish"
+                );
             }
         }
 
