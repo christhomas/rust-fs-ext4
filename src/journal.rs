@@ -100,6 +100,8 @@ pub struct ReplayPlan {
     pub revokes: Vec<RevokeEntry>,
     /// Last committed transaction sequence seen.
     pub last_commit: u32,
+    /// Sequence to allocate after the last complete transaction (None if none).
+    pub next_sequence: Option<u32>,
     /// Number of journal blocks walked (for sanity / tests).
     pub blocks_walked: u64,
 }
@@ -115,16 +117,22 @@ impl ReplayPlan {
         // For each fs_block, track the highest transaction seen in a revoke.
         let mut highest: std::collections::HashMap<u64, u32> = std::collections::HashMap::new();
         for r in &self.revokes {
-            let e = highest.entry(r.fs_block).or_insert(0);
-            if r.transaction > *e {
+            let e = highest.entry(r.fs_block).or_insert(r.transaction);
+            if sequence_after(r.transaction, *e) {
                 *e = r.transaction;
             }
         }
         self.writes.retain(|w| match highest.get(&w.fs_block) {
-            Some(&t) => w.transaction > t,
+            Some(&t) => sequence_after(w.transaction, t),
             None => true,
         });
     }
+}
+
+/// JBD2 transaction IDs wrap at u32, so they are ordered the way the kernel's
+/// `tid_gt` orders them: by the sign of their wrapping difference.
+fn sequence_after(a: u32, b: u32) -> bool {
+    (a.wrapping_sub(b) as i32) > 0
 }
 
 /// Walk the journal from `jsb.start` and build a [`ReplayPlan`].
@@ -152,6 +160,13 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
             "journal block size differs from the filesystem's",
         ));
     }
+    if jsb.first == 0
+        || jsb.first >= jsb.max_len
+        || jsb.start < jsb.first
+        || jsb.start >= jsb.max_len
+    {
+        return Err(Error::Corrupt("invalid journal geometry"));
+    }
 
     let raw = fs.read_inode_raw(fs.sb.journal_inode)?;
     let jinode = Inode::parse(&raw)?;
@@ -166,10 +181,11 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
     let mut pending = ReplayPlan::default();
     let mut pending_corrupt: Option<&'static str> = None;
 
-    // Upper bound: never scan more than the whole journal once. A real
+    // Upper bound: never scan more than the whole ring once, counting the
+    // descriptor payload blocks as well as the metadata blocks. A real
     // replay follows a circular log; here we stop when a block header does
     // not match the expected pattern or when we hit the sb block (0).
-    let limit = jsb.max_len as u64;
+    let limit = u64::from(jsb.max_len - jsb.first);
 
     while plan.blocks_walked < limit {
         let block_buf = read_journal_block(fs, &jinode, cur, block_size)?;
@@ -203,6 +219,10 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
                 };
                 if torn {
                     pending_corrupt = Some("journal descriptor block of a committed transaction");
+                }
+                plan.blocks_walked += tags.len() as u64;
+                if plan.blocks_walked > limit {
+                    return Err(Error::Corrupt("journal transaction exceeds ring"));
                 }
                 for (entry, stored) in tags {
                     if let Some(seed) = seed {
@@ -239,6 +259,7 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
                 plan.revokes.append(&mut pending.revokes);
                 plan.last_commit = expect_seq;
                 expect_seq = expect_seq.wrapping_add(1);
+                plan.next_sequence = Some(expect_seq);
             }
             JBD2_REVOKE_BLOCK => {
                 if seed.is_some_and(|seed| !tail_checksum_matches(seed, &block_buf)) {
@@ -453,6 +474,40 @@ mod tests {
         buf[0..4].copy_from_slice(&JBD2_MAGIC_NUMBER.to_be_bytes());
         buf[4..8].copy_from_slice(&block_type.to_be_bytes());
         buf[8..12].copy_from_slice(&seq.to_be_bytes());
+    }
+
+    #[test]
+    fn revoke_order_wraps_like_jbd2_transaction_ids() {
+        let mut plan = ReplayPlan {
+            writes: vec![
+                ReplayEntry {
+                    transaction: u32::MAX,
+                    fs_block: 3,
+                    journal_block: 1,
+                    flags: 0,
+                },
+                ReplayEntry {
+                    transaction: 1,
+                    fs_block: 3,
+                    journal_block: 2,
+                    flags: 0,
+                },
+            ],
+            revokes: vec![
+                RevokeEntry {
+                    transaction: u32::MAX - 1,
+                    fs_block: 3,
+                },
+                RevokeEntry {
+                    transaction: 0,
+                    fs_block: 3,
+                },
+            ],
+            ..Default::default()
+        };
+        plan.filter_revoked();
+        assert_eq!(plan.writes.len(), 1);
+        assert_eq!(plan.writes[0].transaction, 1);
     }
 
     #[test]

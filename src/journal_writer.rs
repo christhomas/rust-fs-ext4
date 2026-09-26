@@ -72,6 +72,11 @@ use crate::transaction::Transaction;
 /// Cheap to construct (one inode read + extent walk). Not thread-safe; the
 /// outer Filesystem lock must serialize mutating ops anyway.
 pub struct JournalWriter {
+    healthy: bool,
+    /// Leave `needs_recovery` set after a checkpoint rather than clearing
+    /// it: a checked mount (`Filesystem::mount_recovering`) clears it only
+    /// at `finish`, so the volume reads as in recovery while it is owned.
+    hold_needs_recovery: bool,
     /// `physical_map[logical]` is the fs physical block backing journal
     /// logical block `logical`. Length = `jsb.max_len`. Block 0 is the
     /// JBD2 superblock; blocks 1.. carry transactions.
@@ -185,6 +190,8 @@ impl JournalWriter {
         }
 
         Ok(Some(Self {
+            healthy: true,
+            hold_needs_recovery: false,
             blocks_count: fs.sb.blocks_count,
             physical_map,
             block_size: bs,
@@ -230,6 +237,28 @@ impl JournalWriter {
     /// the on-disk JSB has been written back twice (dirty marker + clean
     /// marker).
     pub fn commit(&mut self, dev: &dyn BlockDevice, tx: &Transaction) -> Result<()> {
+        if !self.healthy {
+            return Err(Error::Corrupt("journal writer failed; reopen for recovery"));
+        }
+        self.commit_inner(dev, tx)
+    }
+
+    /// This writer, keeping `needs_recovery` set after every checkpoint.
+    pub(crate) fn holding_needs_recovery(mut self) -> Self {
+        self.hold_needs_recovery = true;
+        self
+    }
+
+    /// False once a commit failed after its first device write: the log and
+    /// the final locations are then in a state only a fresh replay can judge,
+    /// so this writer refuses every later commit. A refusal before any write
+    /// (read-only device, stale sequence, oversized transaction) leaves the
+    /// device untouched and the writer usable.
+    pub fn is_healthy(&self) -> bool {
+        self.healthy
+    }
+
+    fn commit_inner(&mut self, dev: &dyn BlockDevice, tx: &Transaction) -> Result<()> {
         if !dev.is_writable() {
             return Err(Error::ReadOnly);
         }
@@ -273,6 +302,10 @@ impl JournalWriter {
                 "journal_writer: transaction too large for journal",
             ));
         }
+
+        // From the first write on, a failure leaves the device in a state
+        // only a fresh replay can judge; cleared again once step 4 is done.
+        self.healthy = false;
 
         // -- Step 1: write transaction blocks to journal at logical [1..1+N).
         //    Block 0 is the JBD2 superblock; we never overwrite it here.
@@ -319,9 +352,12 @@ impl JournalWriter {
         self.jsb.start = 0;
         self.jsb.sequence = self.jsb.sequence.wrapping_add(1);
         self.write_jsb(dev)?;
-        crate::journal_apply::write_needs_recovery(dev, false)?;
+        if !self.hold_needs_recovery {
+            crate::journal_apply::write_needs_recovery(dev, false)?;
+        }
         dev.flush()?;
 
+        self.healthy = true;
         Ok(())
     }
 
@@ -517,6 +553,34 @@ mod tests {
                 "a volume with a journal handed back nothing, so a caller would fall \
                  back to unjournaled writes on a filesystem that has a log"
             );
+        }
+
+        /// A transaction refused before any journal block is written leaves
+        /// nothing on the device to recover from, so it must not retire the
+        /// writer: only a commit whose I/O began and failed does.
+        #[test]
+        fn a_refusal_before_any_write_leaves_the_writer_usable() {
+            let fs = formatted(FsFlavor::Ext3);
+            let mut writer = JournalWriter::open(&fs).expect("open").expect("writer");
+            let block = fs.sb.blocks_count - 1;
+            let mut too_large = writer.begin();
+            for i in 0..=writer.max_blocks_per_transaction() as u64 {
+                too_large
+                    .add_write(block - i, vec![0u8; BS as usize])
+                    .expect("add_write");
+            }
+            assert!(writer.commit(fs.dev.as_ref(), &too_large).is_err());
+            assert!(
+                writer.is_healthy(),
+                "a transaction refused before it wrote anything retired the writer"
+            );
+            let mut small = writer.begin();
+            small
+                .add_write(block, vec![0u8; BS as usize])
+                .expect("add_write");
+            writer
+                .commit(fs.dev.as_ref(), &small)
+                .expect("the next transaction commits");
         }
     }
 
