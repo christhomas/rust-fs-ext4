@@ -51,6 +51,7 @@ pub mod journal_apply;
 pub mod journal_writer;
 pub mod mkfs;
 pub mod path;
+pub mod runtime;
 pub mod superblock;
 pub mod transaction;
 pub mod verify;
