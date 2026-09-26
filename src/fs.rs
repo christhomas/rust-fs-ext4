@@ -856,7 +856,11 @@ impl Filesystem {
         // truncate, not a deletion. Finish the truncate and leave
         // the file alone.
         if parsed.links_count != 0 {
-            let freed = self.buffer_finish_interrupted_truncate(buf, orphan_ino, &parsed, raw)?;
+            let Some(freed) =
+                self.buffer_finish_interrupted_truncate(buf, orphan_ino, &parsed, raw)?
+            else {
+                return Ok(None);
+            };
             self.buffer_stamp_dtime(buf, orphan_ino, link)?;
             return Ok(Some((freed, 0, false)));
         }
@@ -946,16 +950,18 @@ impl Filesystem {
     /// INTACT
     ///
     /// Legacy indirect mappings still cannot be planned here: leave their
-    /// blocks allocated instead of deleting a named file. Extent-tree errors
-    /// propagate before the orphan transaction commits; corrupt metadata must
-    /// not be silently removed from the orphan list.
+    /// blocks allocated instead of deleting a named file. An extent tree
+    /// the planner refuses -- a node that fails its checksum or does not
+    /// describe a valid tree -- returns `None` having staged nothing, and
+    /// the caller keeps the member at the head of the chain: corrupt
+    /// metadata is neither freed around nor dropped from the orphan list.
     fn buffer_finish_interrupted_truncate(
         &self,
         buf: &mut BlockBuffer,
         ino: u32,
         parsed: &Inode,
         mut raw: Vec<u8>,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         let bs = self.sb.block_size() as u64;
         let mut freed_blocks: u64 = 0;
         let mut freed_sectors: u64 = 0;
@@ -965,7 +971,11 @@ impl Filesystem {
             // end that `new_size` implies, so passing i_size for both
             // frees precisely what lies past the file's declared end.
             {
-                let (_sc, muts) = self.plan_inode_truncate(ino, parsed, parsed.size)?;
+                // Planning reads and verifies every node and stages
+                // nothing, so a refusal here leaves `buf` as it was.
+                let Ok((_sc, muts)) = self.plan_inode_truncate(ino, parsed, parsed.size) else {
+                    return Ok(None);
+                };
                 for m in &muts {
                     match m {
                         crate::extent_mut::ExtentMutation::WriteRoot { bytes } => {
@@ -998,7 +1008,7 @@ impl Filesystem {
         raw[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
         self.finalize_inode_raw(ino, parsed.generation, &mut raw)?;
         self.buffer_write_inode(buf, ino, &raw)?;
-        Ok(freed_blocks)
+        Ok(Some(freed_blocks))
     }
 
     /// Read a whole block by its logical block number. Routes through
@@ -8034,6 +8044,63 @@ mod tests {
             before_free + 3,
             "only the three blocks past the new EOF should have been freed"
         );
+    }
+
+    /// AN INTERRUPTED TRUNCATE THE PLANNER REFUSES STAYS ON THE CHAIN. A
+    /// deep extent tree whose leaf fails its checksum cannot be planned.
+    /// Recovery must leave the member at the head, untouched, and report
+    /// no error -- the same answer it gives every member it cannot reclaim
+    /// whole, so the members behind it and the previous member's pending
+    /// `i_dtime` are handled the one way.
+    #[test]
+    fn an_interrupted_truncate_over_a_corrupt_deep_tree_stays_on_the_chain() {
+        let dev = formatted();
+        let ino = {
+            let fs = mount(&dev);
+            let ino = fs.apply_create("/deep.bin", 0o644).expect("create");
+            // One block every other block: twelve extents, more than the
+            // inline root's four, so the tree grows an external leaf.
+            for i in 0..12u64 {
+                fs.apply_pwrite("/deep.bin", i * 2 * BS as u64, &[0x5a; BS as usize])
+                    .expect("write");
+            }
+            ino
+        };
+
+        let (leaf, size_before) = {
+            let fs = mount(&dev);
+            let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+            assert!(
+                crate::extent::ExtentHeader::parse(&inode.block)
+                    .expect("root")
+                    .depth
+                    >= 1,
+                "fixture: the tree is deeper than the inline root"
+            );
+            let leaf = crate::extent::ExtentIdx::parse(&inode.block[12..24])
+                .expect("index")
+                .leaf_block;
+            plant_orphan(&fs, ino, 1, Some(BS as u64));
+            (leaf, inode.size)
+        };
+        // Break the leaf's checksum: the tail's last byte.
+        dev.bytes.lock().unwrap()[(leaf * BS as u64 + BS as u64 - 1) as usize] ^= 1;
+
+        let fs = mount(&dev);
+        assert_eq!(
+            fs.recover_orphans()
+                .expect("an unplannable member is not an error"),
+            0
+        );
+        assert_eq!(
+            fs.orphan_list().expect("orphan_list"),
+            vec![ino],
+            "the member it could not reclaim stays at the head"
+        );
+        let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+        assert_eq!(inode.links_count, 1, "the file is still named");
+        assert_eq!(inode.size, BS as u64, "its lowered size is kept");
+        assert_ne!(size_before, inode.size, "fixture: the size was lowered");
     }
 
     // --- i_file_acl: written where it is read -------------------------
