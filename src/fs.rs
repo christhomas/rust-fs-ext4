@@ -856,7 +856,11 @@ impl Filesystem {
         // truncate, not a deletion. Finish the truncate and leave
         // the file alone.
         if parsed.links_count != 0 {
-            let freed = self.buffer_finish_interrupted_truncate(buf, orphan_ino, &parsed, raw)?;
+            let Some(freed) =
+                self.buffer_finish_interrupted_truncate(buf, orphan_ino, &parsed, raw)?
+            else {
+                return Ok(None);
+            };
             self.buffer_stamp_dtime(buf, orphan_ino, link)?;
             return Ok(Some((freed, 0, false)));
         }
@@ -902,7 +906,7 @@ impl Filesystem {
             }
         }
         if parsed.has_extents() {
-            let Ok(runs) = self.extent_tree_runs(&parsed.block) else {
+            let Ok(runs) = self.extent_tree_runs(orphan_ino, &parsed) else {
                 return Ok(None);
             };
             freed += self.buffer_free_runs(buf, &runs)?;
@@ -945,23 +949,19 @@ impl Filesystem {
     /// # WHEN THE TRUNCATE CANNOT BE PLANNED, THE FILE IS STILL LEFT
     /// INTACT
     ///
-    /// Two shapes cannot be planned today: an inode mapping its blocks
-    /// the legacy indirect way (every ext2 and ext3 file), and an extent
-    /// tree deeper than its inline root. Neither is a reason to delete
-    /// the file. In both cases the block freeing is skipped and only
-    /// `i_dtime` is cleared, so the inode leaves the orphan list with its
-    /// data intact and its blocks past EOF still allocated.
-    ///
-    /// That leak is visible: `e2fsck` reports the `i_blocks` it can see
-    /// against the `i_size` the inode declares. A silent deletion is not
-    /// visible to anyone until the user goes looking for the file.
+    /// Legacy indirect mappings still cannot be planned here: leave their
+    /// blocks allocated instead of deleting a named file. An extent tree
+    /// the planner refuses -- a node that fails its checksum or does not
+    /// describe a valid tree -- returns `None` having staged nothing, and
+    /// the caller keeps the member at the head of the chain: corrupt
+    /// metadata is neither freed around nor dropped from the orphan list.
     fn buffer_finish_interrupted_truncate(
         &self,
         buf: &mut BlockBuffer,
         ino: u32,
         parsed: &Inode,
         mut raw: Vec<u8>,
-    ) -> Result<u64> {
+    ) -> Result<Option<u64>> {
         let bs = self.sb.block_size() as u64;
         let mut freed_blocks: u64 = 0;
         let mut freed_sectors: u64 = 0;
@@ -970,18 +970,19 @@ impl Filesystem {
             // old == new: `plan_truncate_shrink` works from the logical
             // end that `new_size` implies, so passing i_size for both
             // frees precisely what lies past the file's declared end.
-            // A tree this driver cannot plan leaves the blocks where they
-            // are and keeps the file — see the note above.
-            if let Ok((_sc, muts)) = crate::file_mut::plan_truncate_shrink(
-                parsed.size,
-                parsed.size,
-                &parsed.block,
-                self.sb.block_size(),
-            ) {
+            {
+                // Planning reads and verifies every node and stages
+                // nothing, so a refusal here leaves `buf` as it was.
+                let Ok((_sc, muts)) = self.plan_inode_truncate(ino, parsed, parsed.size) else {
+                    return Ok(None);
+                };
                 for m in &muts {
                     match m {
                         crate::extent_mut::ExtentMutation::WriteRoot { bytes } => {
                             Self::patch_inode_block_area(&mut raw, bytes)?;
+                        }
+                        crate::extent_mut::ExtentMutation::WriteTreeBlock { block, bytes } => {
+                            buf.put(*block, bytes.clone());
                         }
                         crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } => {
                             freed_blocks +=
@@ -1007,7 +1008,7 @@ impl Filesystem {
         raw[0x14..0x18].copy_from_slice(&0u32.to_le_bytes());
         self.finalize_inode_raw(ino, parsed.generation, &mut raw)?;
         self.buffer_write_inode(buf, ino, &raw)?;
-        Ok(freed_blocks)
+        Ok(Some(freed_blocks))
     }
 
     /// Read a whole block by its logical block number. Routes through
@@ -1219,6 +1220,45 @@ impl Filesystem {
         Ok(())
     }
 
+    /// Verify every external node before planning any tree/bitmap mutation.
+    /// Freed tree nodes use the same block accounting as freed data blocks.
+    fn plan_inode_truncate(
+        &self,
+        ino: u32,
+        inode: &Inode,
+        new_size: u64,
+    ) -> Result<(
+        crate::file_mut::SizeChange,
+        Vec<crate::extent_mut::ExtentMutation>,
+    )> {
+        if !inode.has_extents() {
+            return Err(Error::Unsupported("truncate of legacy block mappings"));
+        }
+        let mut read = |block| {
+            let bytes = self.read_block(block)?;
+            if !self.csum.verify_extent_tail(ino, inode.generation, &bytes) {
+                return Err(Error::BadChecksum {
+                    what: "extent block",
+                });
+            }
+            Ok(bytes)
+        };
+        let (change, mut mutations) = crate::file_mut::plan_truncate_shrink_deep(
+            inode.size,
+            new_size,
+            &inode.block,
+            self.sb.block_size(),
+            self.sb.blocks_count,
+            &mut read,
+        )?;
+        for mutation in &mut mutations {
+            if let crate::extent_mut::ExtentMutation::WriteTreeBlock { bytes, .. } = mutation {
+                self.csum.patch_extent_tail(ino, inode.generation, bytes);
+            }
+        }
+        Ok((change, mutations))
+    }
+
     /// Shrink a file to `new_size`. Composes `file_mut::plan_truncate_shrink`
     /// (extent-tree updates + freed-block ranges) with actual disk writes —
     /// rewrites the inode and zeros the freed bitmap bits.
@@ -1244,12 +1284,10 @@ impl Filesystem {
             ));
         }
 
-        let (_size_change, muts) = crate::file_mut::plan_truncate_shrink(
-            inode.size,
-            new_size,
-            &inode.block,
-            self.sb.block_size(),
-        )?;
+        if new_size == inode.size {
+            return Ok(());
+        }
+        let (_size_change, muts) = self.plan_inode_truncate(ino, &inode, new_size)?;
 
         let bs = self.sb.block_size() as u64;
         let mut freed_sectors: u64 = 0;
@@ -1264,6 +1302,9 @@ impl Filesystem {
                 crate::extent_mut::ExtentMutation::WriteRoot { bytes } => {
                     Self::patch_inode_block_area(&mut raw, bytes)?;
                 }
+                crate::extent_mut::ExtentMutation::WriteTreeBlock { block, bytes } => {
+                    buf.put(*block, bytes.clone());
+                }
                 crate::extent_mut::ExtentMutation::FreePhysicalRun { start, len } => {
                     freed_blocks +=
                         self.buffer_free_block_run_and_bgd(&mut buf, *start, *len as u64)?;
@@ -1277,6 +1318,14 @@ impl Filesystem {
             }
         }
 
+        // Clear the retained partial block so a later grow cannot expose
+        // bytes beyond the new EOF. Holes and unwritten extents need no write.
+        let tail = (new_size % bs) as usize;
+        if tail != 0 {
+            if let Some(block) = self.map_inode_logical(&inode, new_size / bs)? {
+                buf.get_mut(self, block)?[tail..].fill(0);
+            }
+        }
         // Patch size + blocks_count in the inode image, finalize csum.
         let new_blocks = inode.blocks.saturating_sub(freed_sectors);
         Self::patch_inode_size_and_blocks(&mut raw, new_size, new_blocks)?;
@@ -1689,9 +1738,25 @@ impl Filesystem {
     /// Read from the tree, not from `i_size`. A file of size zero can hold
     /// blocks (a `KEEP_SIZE` preallocation), and blocks can lie past the
     /// size of any file. A caller that frees a whole file frees these.
-    pub(crate) fn extent_tree_runs(&self, block: &[u8]) -> Result<Vec<(u64, u64)>> {
-        let (extents, nodes) =
-            crate::extent::collect_all_with_nodes(block, self.dev.as_ref(), self.sb.block_size())?;
+    ///
+    /// Every index and leaf block must pass its checksum first, or this
+    /// is [`Error::BadChecksum`] and nothing is returned to free: a node
+    /// that does not verify may name blocks that belong to another file,
+    /// and the kernel refuses the removal the same way.
+    pub(crate) fn extent_tree_runs(&self, ino: u32, inode: &Inode) -> Result<Vec<(u64, u64)>> {
+        let (extents, nodes) = crate::extent::collect_all_with_nodes(
+            &inode.block,
+            self.dev.as_ref(),
+            self.sb.block_size(),
+        )?;
+        for &node in &nodes {
+            let bytes = self.read_block(node)?;
+            if !self.csum.verify_extent_tail(ino, inode.generation, &bytes) {
+                return Err(Error::BadChecksum {
+                    what: "extent block",
+                });
+            }
+        }
         Ok(extents
             .iter()
             .map(|e| (e.physical_block, e.length as u64))
@@ -3302,7 +3367,7 @@ impl Filesystem {
         let mut freed_sectors: u64 = 0;
         let sectors_per_block = bs as u64 / 512;
         if target_inode.has_extents() {
-            let runs = self.extent_tree_runs(&target_inode.block)?;
+            let runs = self.extent_tree_runs(target_ino, &target_inode)?;
             freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
         } else {
             // A BLOCK-MAPPED FILE HAS BLOCKS TOO. Only extents were freed,
@@ -3860,7 +3925,7 @@ impl Filesystem {
 
         // Phase 1: free existing data blocks. Each freed run credits its
         // own group's BGD via `buffer_free_block_run_and_bgd`.
-        let runs = self.extent_tree_runs(&inode.block)?;
+        let runs = self.extent_tree_runs(ino, &inode)?;
         let freed_fs_blocks = self.buffer_free_runs(&mut buf, &runs)?;
 
         // Reset the inode's extent root to an empty leaf.
@@ -5306,6 +5371,15 @@ impl Filesystem {
                 }
             }
 
+            // Validate a destination that will be freed before any directory
+            // growth can commit part of the rename.
+            let destination_runs =
+                if (dst_is_dir || dst_old_inode.links_count <= 1) && dst_old_inode.has_extents() {
+                    self.extent_tree_runs(dst_old_ino, &dst_old_inode)?
+                } else {
+                    Vec::new()
+                };
+
             // Stage the whole overwrite into a single buffer so a crash
             // either fully replaces dst or leaves the FS in its prior
             // state — UNLESS the destination directory has to grow, in
@@ -5404,8 +5478,8 @@ impl Filesystem {
                 let sectors_per_block = bs as u64 / 512;
                 let mut freed_sectors: u64 = 0;
                 if dst_old_inode.has_extents() {
-                    let runs = self.extent_tree_runs(&dst_old_inode.block)?;
-                    freed_sectors += self.buffer_free_runs(&mut buf, &runs)? * sectors_per_block;
+                    freed_sectors +=
+                        self.buffer_free_runs(&mut buf, &destination_runs)? * sectors_per_block;
                 } else {
                     // A block-mapped file or directory being replaced: its
                     // blocks were left allocated.
@@ -6345,7 +6419,7 @@ impl Filesystem {
         // Free target's data blocks. Each freed run credits its own group's
         // BGD; SB credit accumulates and lands once below.
         let mut freed_blocks = if target_inode.has_extents() {
-            let runs = self.extent_tree_runs(&target_inode.block)?;
+            let runs = self.extent_tree_runs(target_ino, &target_inode)?;
             self.buffer_free_runs(&mut buf, &runs)?
         } else {
             // A block-mapped directory: read as an extent header, it was
@@ -7986,6 +8060,102 @@ mod tests {
             before_free + 3,
             "only the three blocks past the new EOF should have been freed"
         );
+    }
+
+    /// AN INTERRUPTED TRUNCATE THE PLANNER REFUSES STAYS ON THE CHAIN. A
+    /// deep extent tree whose leaf fails its checksum cannot be planned.
+    /// Recovery must leave the member at the head, untouched, and report
+    /// no error -- the same answer it gives every member it cannot reclaim
+    /// whole, so the members behind it and the previous member's pending
+    /// `i_dtime` are handled the one way.
+    #[test]
+    fn an_interrupted_truncate_over_a_corrupt_deep_tree_stays_on_the_chain() {
+        let dev = formatted();
+        let ino = {
+            let fs = mount(&dev);
+            let ino = fs.apply_create("/deep.bin", 0o644).expect("create");
+            // One block every other block: twelve extents, more than the
+            // inline root's four, so the tree grows an external leaf.
+            for i in 0..12u64 {
+                fs.apply_pwrite("/deep.bin", i * 2 * BS as u64, &[0x5a; BS as usize])
+                    .expect("write");
+            }
+            ino
+        };
+
+        let (leaf, size_before) = {
+            let fs = mount(&dev);
+            let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+            assert!(
+                crate::extent::ExtentHeader::parse(&inode.block)
+                    .expect("root")
+                    .depth
+                    >= 1,
+                "fixture: the tree is deeper than the inline root"
+            );
+            let leaf = crate::extent::ExtentIdx::parse(&inode.block[12..24])
+                .expect("index")
+                .leaf_block;
+            plant_orphan(&fs, ino, 1, Some(BS as u64));
+            (leaf, inode.size)
+        };
+        // Break the leaf's checksum: the tail's last byte.
+        dev.bytes.lock().unwrap()[(leaf * BS as u64 + BS as u64 - 1) as usize] ^= 1;
+
+        let fs = mount(&dev);
+        assert_eq!(
+            fs.recover_orphans()
+                .expect("an unplannable member is not an error"),
+            0
+        );
+        assert_eq!(
+            fs.orphan_list().expect("orphan_list"),
+            vec![ino],
+            "the member it could not reclaim stays at the head"
+        );
+        let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+        assert_eq!(inode.links_count, 1, "the file is still named");
+        assert_eq!(inode.size, BS as u64, "its lowered size is kept");
+        assert_ne!(size_before, inode.size, "fixture: the size was lowered");
+    }
+
+    /// A FILE WHOSE EXTENT LEAF FAILS ITS CHECKSUM IS NOT FREED AROUND.
+    /// Freeing walks the tree to learn which blocks to release; a node that
+    /// does not verify may name blocks that belong to something else. The
+    /// kernel refuses the removal (EFSBADCRC); so does this, before any
+    /// bitmap is touched.
+    #[test]
+    fn unlinking_a_file_whose_extent_leaf_fails_its_checksum_is_refused() {
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            fs.apply_create("/deep.bin", 0o644).expect("create");
+            for i in 0..12u64 {
+                fs.apply_pwrite("/deep.bin", i * 2 * BS as u64, &[0x5a; BS as usize])
+                    .expect("write");
+            }
+        }
+        let leaf = {
+            let fs = mount(&dev);
+            let ino = resolve(&fs, "/deep.bin").expect("resolve");
+            let (inode, _) = fs.read_inode_verified(ino).expect("read inode");
+            crate::extent::ExtentIdx::parse(&inode.block[12..24])
+                .expect("index")
+                .leaf_block
+        };
+        dev.bytes.lock().unwrap()[(leaf * BS as u64 + BS as u64 - 1) as usize] ^= 1;
+
+        let fs = mount(&dev);
+        let free_before = fs.sb.free_blocks_count;
+        let got = fs.apply_unlink("/deep.bin");
+        assert!(
+            matches!(got, Err(Error::BadChecksum { .. })),
+            "unlink over an unverified extent leaf: {got:?}"
+        );
+        drop(fs);
+        let fs = mount(&dev);
+        assert!(resolve(&fs, "/deep.bin").is_ok(), "the file is still named");
+        assert_eq!(fs.sb.free_blocks_count, free_before, "nothing was freed");
     }
 
     // --- i_file_acl: written where it is read -------------------------
