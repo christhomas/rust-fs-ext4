@@ -2,15 +2,16 @@
 //!
 //! Fixture bytes are encoded here, independently of the library transaction
 //! writer. Every image is disposable; no kernel mount or physical device is
-//! involved. Requires mkfs.ext4, debugfs and e2fsck on PATH.
-#![cfg(target_os = "linux")]
+//! involved. mkfs.ext4, debugfs and e2fsck run in the harness VM through
+//! `fs_ext4_test_support::oracle`, which fails rather than skips when the
+//! VM or a tool is missing.
 
 use fs_ext4::block_io::{BlockDevice, FileDevice};
 use fs_ext4::error::{Error, Result};
 use fs_ext4::{jbd2, Filesystem};
 use std::fs::{self, File};
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::Output;
 use std::sync::atomic::{AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 
@@ -21,11 +22,10 @@ const EXPECTED_MODE: u16 = 0o100600;
 const LABEL: &str = "journal-oracle";
 
 fn command(program: &str, args: &[&str]) -> Output {
-    Command::new(program)
+    fs_ext4_test_support::oracle(program)
         .args(args)
         .env("LC_ALL", "C")
         .output()
-        .unwrap_or_else(|error| panic!("{program} is required for this oracle: {error}"))
 }
 
 fn successful(program: &str, args: &[&str]) -> String {
@@ -62,8 +62,8 @@ struct Fixture {
 impl Fixture {
     fn new(tail_revoke: bool) -> Self {
         static NEXT: AtomicUsize = AtomicUsize::new(0);
-        let dir = std::env::temp_dir().join(format!(
-            "canoe-jbd2-oracle-{}-{}",
+        let dir = fs_ext4_test_support::temp_dir().join(format!(
+            "jbd2-oracle-{}-{}",
             std::process::id(),
             NEXT.fetch_add(1, Ordering::Relaxed)
         ));
@@ -249,7 +249,7 @@ impl Fixture {
 
 impl Drop for Fixture {
     fn drop(&mut self) {
-        if std::env::var_os("CANOE_JOURNAL_ORACLE_KEEP").is_some() {
+        if std::env::var_os("FS_EXT4_JOURNAL_ORACLE_KEEP").is_some() {
             eprintln!("journal oracle fixtures: {}", self.dir.display());
         } else {
             let _ = fs::remove_dir_all(&self.dir);

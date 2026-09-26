@@ -271,12 +271,10 @@ fn replay_refuses_a_destination_whose_byte_offset_wraps() {
 
 #[test]
 fn uncommitted_journal_does_not_replay() {
-    // End-to-end: inject a descriptor+data+commit sequence into the journal
-    // file, bump jsb.start so walk() sees it as dirty, replay, and assert
-    // the target fs block now holds the data we wrote.
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    // End-to-end: inject a descriptor+data sequence with NO commit block into
+    // the journal, bump jsb.start so walk() sees it as dirty, replay, and
+    // assert the target fs block is unchanged.
+    let path = copy_to_tmp("ext4-basic.img");
 
     let dev = Arc::new(FileDevice::open_rw(&path).expect("open_rw")) as Arc<dyn BlockDevice>;
     let fs = Filesystem::mount(dev.clone()).expect("mount");
@@ -355,10 +353,9 @@ fn uncommitted_journal_does_not_replay() {
     // Now re-mount so mount sees the dirty sb — actually we don't need to
     // remount: read_superblock fetches fresh every call.
     let n = journal_apply::replay_if_dirty(&fs).expect("replay");
-    // We placed 1 write tag; filter_revoked runs but has no revokes — so 1 write.
     assert_eq!(n, 0, "uncommitted blocks must never replay");
 
-    // Verify the target fs block now holds our payload.
+    // The target fs block still holds what it held before.
     let mut after = vec![0u8; block_size as usize];
     fs.dev
         .read_at(target_fs_block * block_size, &mut after)
@@ -371,9 +368,7 @@ fn uncommitted_journal_does_not_replay() {
 
 #[test]
 fn invalid_later_replay_destination_does_not_write_a_valid_prefix() {
-    let Some(path) = copy_to_tmp("ext4-basic.img") else {
-        return;
-    };
+    let path = copy_to_tmp("ext4-basic.img");
     let fs = Filesystem::mount(Arc::new(FileDevice::open_rw(&path).unwrap())).unwrap();
     let bs = fs.sb.block_size() as usize;
     let mut before = vec![0; bs];

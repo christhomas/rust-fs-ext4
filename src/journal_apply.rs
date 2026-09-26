@@ -87,10 +87,7 @@ fn mark_journal_clean(fs: &Filesystem, jsb: &JournalSuperblock, plan: &ReplayPla
     // (`++info.end_transaction`): a torn tail may already carry that ID, and
     // reusing it could let a stale block pass as part of the next transaction.
     // `next_sequence` rather than `last_commit`, whose 0 is also a real ID.
-    let sequence = plan
-        .next_sequence
-        .unwrap_or(jsb.sequence)
-        .wrapping_add(1);
+    let sequence = plan.next_sequence.unwrap_or(jsb.sequence).wrapping_add(1);
     buf[0x18..0x1C].copy_from_slice(&sequence.to_be_bytes());
     buf[0x1C..0x20].copy_from_slice(&0u32.to_be_bytes());
     if jsb.uses_csum_v2_or_v3() {

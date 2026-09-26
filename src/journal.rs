@@ -160,7 +160,10 @@ pub fn walk(fs: &Filesystem, jsb: &JournalSuperblock) -> Result<ReplayPlan> {
             "journal block size differs from the filesystem's",
         ));
     }
-    if jsb.first == 0 || jsb.first >= jsb.max_len || jsb.start < jsb.first || jsb.start >= jsb.max_len
+    if jsb.first == 0
+        || jsb.first >= jsb.max_len
+        || jsb.start < jsb.first
+        || jsb.start >= jsb.max_len
     {
         return Err(Error::Corrupt("invalid journal geometry"));
     }
