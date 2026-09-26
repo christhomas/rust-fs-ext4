@@ -1860,6 +1860,34 @@ impl Filesystem {
         Cow::Owned(groups)
     }
 
+    /// Plan a block allocation inside an open transaction: bitmaps come from
+    /// the buffer when it has staged them, and so do uninit flags.
+    ///
+    /// The second half is the one that matters. Staging an allocation into a
+    /// BLOCK_UNINIT group clears the flag on the buffer only, so it becomes
+    /// visible to the mount when the buffer commits. A plan that still sees
+    /// the flag synthesises the bitmap from the group's metadata and never
+    /// reads the staged one, so it offers the run just handed out again.
+    fn plan_buffered_block_allocation(
+        &self,
+        buf: &BlockBuffer,
+        count: u32,
+        hint: u32,
+    ) -> Result<crate::alloc::BlockAllocationPlan> {
+        let mut groups = self.allocation_groups();
+        for (&gi, &flags) in &buf.uninit_cleared {
+            if let Some(g) = groups.to_mut().get_mut(gi) {
+                g.flags = flags;
+            }
+        }
+        crate::alloc::plan_block_allocation(&self.sb, &groups, count, hint, |block| {
+            match buf.dirty.get(&block) {
+                Some(bytes) => Ok(bytes.clone()),
+                None => self.read_block(block),
+            }
+        })
+    }
+
     pub(crate) fn buffer_mark_block_run_used(
         &self,
         buf: &mut BlockBuffer,
@@ -4348,21 +4376,8 @@ impl Filesystem {
             while remaining_in_run > 0 {
                 let mut want = remaining_in_run;
                 let plan = loop {
-                    let plan_result = {
-                        let mut bitmap_reader = |b: u64| -> Result<Vec<u8>> {
-                            if let Some(bytes) = buf.dirty.get(&b) {
-                                return Ok(bytes.clone());
-                            }
-                            self.read_block(b)
-                        };
-                        crate::alloc::plan_block_allocation(
-                            &self.sb,
-                            &self.allocation_groups(),
-                            want,
-                            group_idx_of_inode,
-                            &mut bitmap_reader,
-                        )
-                    };
+                    let plan_result =
+                        self.plan_buffered_block_allocation(&buf, want, group_idx_of_inode);
                     match plan_result {
                         Ok(p) => break p,
                         Err(Error::Corrupt(msg)) if msg.contains("contiguous free run") => {
@@ -4433,21 +4448,11 @@ impl Filesystem {
                         let inode_generation = inode.generation;
                         let deep_plan = {
                             let mut alloc_closure = || -> Result<u64> {
-                                let p = {
-                                    let mut bitmap_reader = |b: u64| -> Result<Vec<u8>> {
-                                        if let Some(bytes) = buf.dirty.get(&b) {
-                                            return Ok(bytes.clone());
-                                        }
-                                        self.read_block(b)
-                                    };
-                                    crate::alloc::plan_block_allocation(
-                                        &self.sb,
-                                        &self.allocation_groups(),
-                                        1,
-                                        group_idx_of_inode,
-                                        &mut bitmap_reader,
-                                    )?
-                                };
+                                let p = self.plan_buffered_block_allocation(
+                                    &buf,
+                                    1,
+                                    group_idx_of_inode,
+                                )?;
                                 self.buffer_mark_block_run_used(&mut buf, p.first_block, 1)?;
                                 self.buffer_patch_bgd_counters(
                                     &mut buf,
@@ -6592,6 +6597,63 @@ mod tests {
 
     fn mount(dev: &std::sync::Arc<MemDev>) -> Filesystem {
         Filesystem::mount(dev.clone()).expect("mount")
+    }
+
+    /// Two plans in one open transaction must not hand out the same blocks
+    /// of a BLOCK_UNINIT group. The first plan's staging clears the group's
+    /// flag only on the buffer, so a second plan that still sees the flag
+    /// re-synthesises the bitmap from metadata alone and ignores the staged
+    /// bits -- a data run's second sub-allocation, or an extent-tree block,
+    /// then lands on top of the first.
+    #[test]
+    fn buffered_allocations_do_not_reuse_an_uninitialized_groups_first_run() {
+        let dev = formatted();
+        {
+            let fs = mount(&dev);
+            let (bgt_block, off) = fs.sb.descriptor_location(0);
+            let ds = fs.sb.desc_size as usize;
+            let mut raw = fs.read_block(bgt_block).unwrap();
+            let flags = u16::from_le_bytes(raw[off + 0x12..off + 0x14].try_into().unwrap())
+                | crate::bgd::BgdFlags::BLOCK_UNINIT.bits();
+            raw[off + 0x12..off + 0x14].copy_from_slice(&flags.to_le_bytes());
+            let c = crate::checksum::group_desc_csum(&fs.sb, &fs.csum, 0, &raw[off..off + ds])
+                .expect("the formatted volume checksums its descriptors");
+            raw[off + 0x1e..off + 0x20].copy_from_slice(&c.to_le_bytes());
+            dev.write_at(bgt_block * u64::from(BS), &raw).unwrap();
+        }
+        let fs = mount(&dev);
+        assert!(fs.allocation_groups()[0]
+            .flags()
+            .contains(crate::bgd::BgdFlags::BLOCK_UNINIT));
+        let before = dev.bytes.lock().unwrap().clone();
+
+        let mut buf = BlockBuffer::new(BS);
+        let first = fs.plan_buffered_block_allocation(&buf, 4, 0).unwrap();
+        fs.buffer_mark_block_run_used(&mut buf, first.first_block, 4)
+            .unwrap();
+        let next = fs.plan_buffered_block_allocation(&buf, 1, 0).unwrap();
+        assert!(
+            next.first_block < first.first_block || next.first_block >= first.first_block + 4,
+            "second plan {} overlaps the staged run {}..{}",
+            next.first_block,
+            first.first_block,
+            first.first_block + 4
+        );
+
+        // Nothing committed: the mount still sees the group as uninit, the
+        // device is untouched, and a fresh transaction plans as before.
+        assert!(fs.allocation_groups()[0]
+            .flags()
+            .contains(crate::bgd::BgdFlags::BLOCK_UNINIT));
+        assert!(
+            *dev.bytes.lock().unwrap() == before,
+            "planning wrote to the device"
+        );
+        drop(buf);
+        let again = fs
+            .plan_buffered_block_allocation(&BlockBuffer::new(BS), 4, 0)
+            .unwrap();
+        assert_eq!(again.first_block, first.first_block);
     }
 
     fn resolve(fs: &Filesystem, path: &str) -> Result<u32> {
