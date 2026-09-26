@@ -256,6 +256,10 @@ pub struct Filesystem {
     /// Whether this mount has cleared `EXT4_VALID_FS` on disk, and so
     /// owes the superblock its state back when it is dropped (#85).
     marked_not_clean: std::sync::atomic::AtomicBool,
+    /// The `s_state` found on disk when this mount cleared `EXT4_VALID_FS`:
+    /// what [`Drop`] puts back. Kept apart from `sb`, which is re-read after
+    /// replay and orphan recovery and by then holds the cleared state.
+    state_found: std::sync::atomic::AtomicU16,
 }
 
 /// A mount that cleared `EXT4_VALID_FS` puts the state it found back when
@@ -265,12 +269,20 @@ pub struct Filesystem {
 /// write leaves the volume marked not clean, which errs the safe way.
 impl Drop for Filesystem {
     fn drop(&mut self) {
+        // A journal whose commit failed mid-write leaves the device to the
+        // next owner's replay: nothing more is written through this handle.
+        let journal_failed = self
+            .journal
+            .as_ref()
+            .is_some_and(|w| w.lock().map_or(true, |w| !w.is_healthy()));
         if self
             .marked_not_clean
             .load(std::sync::atomic::Ordering::SeqCst)
             && self.dev.is_writable()
+            && !journal_failed
         {
-            let _ = self.write_superblock_state(self.sb.state);
+            let state = self.state_found.load(std::sync::atomic::Ordering::SeqCst);
+            let _ = self.write_superblock_state(state);
         }
     }
 }
@@ -329,7 +341,8 @@ impl Filesystem {
             .ok_or(Error::Corrupt("journal disappeared"))?
             .validate_plain_recovery(fs.sb.block_size(), fs.sb.blocks_count)?;
         fs.set_recovery_marker(true)?;
-        fs.journal = crate::journal_writer::JournalWriter::open(&fs)?.map(Mutex::new);
+        fs.journal = crate::journal_writer::JournalWriter::open(&fs)?
+            .map(|w| Mutex::new(w.holding_needs_recovery()));
         fs.recover_orphans()?;
         fs.refresh_metadata()?;
         fs.managed_recovery = true;
@@ -509,6 +522,7 @@ impl Filesystem {
             flavor,
             journal: None,
             marked_not_clean: std::sync::atomic::AtomicBool::new(false),
+            state_found: std::sync::atomic::AtomicU16::new(0),
         };
 
         // Replay a dirty journal: onto the device if it is writable (below,
@@ -692,6 +706,7 @@ impl Filesystem {
         if self.marked_not_clean.load(Ordering::SeqCst) {
             return Ok(());
         }
+        self.state_found.store(self.sb.state, Ordering::SeqCst);
         self.write_superblock_state(self.sb.state & !crate::superblock::EXT4_VALID_FS)?;
         self.marked_not_clean.store(true, Ordering::SeqCst);
         Ok(())
@@ -6726,6 +6741,129 @@ mod tests {
 
     fn mount(dev: &std::sync::Arc<MemDev>) -> Filesystem {
         Filesystem::mount(dev.clone()).expect("mount")
+    }
+
+    /// `Filesystem::mount_recovering` / `finish` on a journalled volume.
+    mod checked_recovery {
+        use super::*;
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        fn journalled() -> std::sync::Arc<MemDev> {
+            let dev = MemDev::new(VOL);
+            crate::mkfs::format_filesystem_with_flavor(
+                dev.as_ref(),
+                Some("checked"),
+                None,
+                VOL,
+                BS,
+                features::FsFlavor::Ext3,
+            )
+            .expect("format");
+            dev
+        }
+
+        fn on_disk(dev: &MemDev) -> Superblock {
+            Superblock::read(dev).expect("superblock")
+        }
+
+        fn needs_recovery(dev: &MemDev) -> bool {
+            on_disk(dev).feature_incompat & features::Incompat::RECOVER.bits() != 0
+        }
+
+        /// The marker is the lifecycle's promise: while the handle is
+        /// owned, the next owner must treat the volume as in recovery.
+        #[test]
+        fn needs_recovery_stays_set_across_commits_until_finish() {
+            let dev = journalled();
+            let fs = Filesystem::mount_recovering(dev.clone()).expect("checked mount");
+            fs.apply_create("/a", 0o644).expect("create");
+            assert!(
+                needs_recovery(&dev),
+                "a commit on a checked mount cleared needs_recovery before finish"
+            );
+            fs.finish().expect("finish");
+            assert!(!needs_recovery(&dev), "finish left needs_recovery set");
+        }
+
+        /// A checked mount marks the volume not clean on the way in; its
+        /// release must put back the state it found, not the state it made.
+        #[test]
+        fn finish_puts_back_the_clean_state_it_found() {
+            let dev = journalled();
+            assert_ne!(on_disk(&dev).state & crate::superblock::EXT4_VALID_FS, 0);
+            let fs = Filesystem::mount_recovering(dev.clone()).expect("checked mount");
+            fs.apply_create("/a", 0o644).expect("create");
+            fs.finish().expect("finish");
+            assert_ne!(
+                on_disk(&dev).state & crate::superblock::EXT4_VALID_FS,
+                0,
+                "a finished checked mount left the volume marked not clean"
+            );
+        }
+
+        /// A MemDev whose every write and flush after `fail_at` fails.
+        struct Failing {
+            inner: std::sync::Arc<MemDev>,
+            events: AtomicUsize,
+            fail_at: AtomicUsize,
+        }
+
+        impl Failing {
+            fn gate(&self) -> Result<()> {
+                if self.events.fetch_add(1, Ordering::SeqCst) >= self.fail_at.load(Ordering::SeqCst)
+                {
+                    return Err(Error::Corrupt("injected I/O failure"));
+                }
+                Ok(())
+            }
+        }
+
+        impl crate::block_io::BlockDevice for Failing {
+            fn read_at(&self, offset: u64, buf: &mut [u8]) -> Result<()> {
+                self.inner.read_at(offset, buf)
+            }
+            fn size_bytes(&self) -> u64 {
+                self.inner.size_bytes()
+            }
+            fn write_at(&self, offset: u64, buf: &[u8]) -> Result<()> {
+                self.gate()?;
+                self.inner.write_at(offset, buf)
+            }
+            fn flush(&self) -> Result<()> {
+                self.gate()
+            }
+            fn is_writable(&self) -> bool {
+                true
+            }
+        }
+
+        /// Once a journal commit failed mid-write, neither `finish` nor the
+        /// drop that follows it may touch the device again.
+        #[test]
+        fn a_failed_commit_leaves_finish_and_drop_without_device_io() {
+            let dev = std::sync::Arc::new(Failing {
+                inner: journalled(),
+                events: AtomicUsize::new(0),
+                fail_at: AtomicUsize::new(usize::MAX),
+            });
+            let fs = Filesystem::mount_recovering(dev.clone()).expect("checked mount");
+            let first = dev.events.load(Ordering::SeqCst) + 2;
+            dev.fail_at.store(first, Ordering::SeqCst);
+            assert!(
+                fs.apply_create("/a", 0o644).is_err(),
+                "the commit must fail"
+            );
+            let after_failure = dev.events.load(Ordering::SeqCst);
+            assert!(
+                fs.finish().is_err(),
+                "a failed journal claimed a clean finish"
+            );
+            assert_eq!(
+                dev.events.load(Ordering::SeqCst),
+                after_failure,
+                "finish or drop wrote to the device after the journal failed"
+            );
+        }
     }
 
     fn resolve(fs: &Filesystem, path: &str) -> Result<u32> {

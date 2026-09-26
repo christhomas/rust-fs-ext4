@@ -73,6 +73,10 @@ use crate::transaction::Transaction;
 /// outer Filesystem lock must serialize mutating ops anyway.
 pub struct JournalWriter {
     healthy: bool,
+    /// Leave `needs_recovery` set after a checkpoint rather than clearing
+    /// it: a checked mount (`Filesystem::mount_recovering`) clears it only
+    /// at `finish`, so the volume reads as in recovery while it is owned.
+    hold_needs_recovery: bool,
     /// `physical_map[logical]` is the fs physical block backing journal
     /// logical block `logical`. Length = `jsb.max_len`. Block 0 is the
     /// JBD2 superblock; blocks 1.. carry transactions.
@@ -187,6 +191,7 @@ impl JournalWriter {
 
         Ok(Some(Self {
             healthy: true,
+            hold_needs_recovery: false,
             blocks_count: fs.sb.blocks_count,
             physical_map,
             block_size: bs,
@@ -236,6 +241,12 @@ impl JournalWriter {
             return Err(Error::Corrupt("journal writer failed; reopen for recovery"));
         }
         self.commit_inner(dev, tx)
+    }
+
+    /// This writer, keeping `needs_recovery` set after every checkpoint.
+    pub(crate) fn holding_needs_recovery(mut self) -> Self {
+        self.hold_needs_recovery = true;
+        self
     }
 
     /// False once a commit failed after its first device write: the log and
@@ -341,7 +352,9 @@ impl JournalWriter {
         self.jsb.start = 0;
         self.jsb.sequence = self.jsb.sequence.wrapping_add(1);
         self.write_jsb(dev)?;
-        crate::journal_apply::write_needs_recovery(dev, false)?;
+        if !self.hold_needs_recovery {
+            crate::journal_apply::write_needs_recovery(dev, false)?;
+        }
         dev.flush()?;
 
         self.healthy = true;
