@@ -21,9 +21,14 @@
 # same size either way, and a tier that has outgrown its budget should say so
 # whether or not anybody was watching.
 #
-# THE VARIABLE WAS `FLTH_VERBOSE` until the wrapper moved to rust-fs-core. The
-# old name is not read by the canonical script, and setting it does nothing --
-# it does not error, the run simply stays quiet.
+# THE VARIABLE WAS `FLTH_VERBOSE` until the wrapper moved to rust-fs-core. A
+# rename like that fails silently -- `--verbose` simply stops working and
+# nothing errors -- so the canonical script now names the replacement on
+# stderr when it sees an `FLTH_*` variable. It does not honour it.
+#
+# A FAILING TIER IS QUIET TOO, from core v0.2.13. It prints the verdict, the
+# exit status and the log's path, not forty lines of tail; `--tail N` or
+# OUTPUT_BUDGET_FAIL_TAIL=N brings the tail back for whoever is watching.
 set -euo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
@@ -35,33 +40,89 @@ REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # them, reached four different ways, each repository internally consistent
 # and nothing comparing them.
 #
-# CARGO IS ASKED WHERE CORE IS, rather than this script guessing. Cargo has
-# already resolved the dependency, and its answer is right in both shapes
-# this family uses: with `path = "../rust-fs-core"` it reports the developer's
-# own checkout, so work in progress on the wrapper is exercised here on the
-# next run; with a plain version requirement it reports the registry copy of
-# the pinned release. There is no sibling-versus-crate decision to make,
-# because cargo made it.
+# THE SIBLING FIRST, THEN WHATEVER CARGO RESOLVED. The sibling comes first so
+# a coordinated local change to core's wrapper is actually exercised on the
+# next run here, rather than being masked by a registry copy of the last
+# release. A standalone checkout with no sibling falls through to cargo, which
+# has already resolved am-fs-core and can say where it put it.
 #
-# tmp/ is gitignored and is where the tier logs already live.
-CORE_DIR="$(cargo metadata --format-version 1 --locked --manifest-path "$REPO/Cargo.toml" \
-    2>/dev/null | python3 -c '
+# FS_CORE_ROOT NAMES CORE OUTRIGHT, and when it is set there is no fallback:
+# you have said where core is, so its absence there is an answer, not a reason
+# to go looking. It exists so both refusals below can be driven by
+# tests/scripts/test-output-budget.sh -- a resolver whose failure path nobody
+# executes has never been shown to refuse anything, which is the same defect
+# as a test that skips.
+#
+# WHAT IS VERIFIED IS `--version`, NOT A DIGEST. rust-fs-ntfs pins the script's
+# SHA-256, which means every comment core adds to it breaks a consumer until
+# the digest is chased; the same pin in seven repositories is the lockstep this
+# migration exists to remove. `rust-fs-core-output-budget 1` is the contract,
+# and a copy that cannot print it is not core's.
+#
+# A WRONG COPY IS FATAL, NOT A REASON TO LOOK ELSEWHERE. Falling through to the
+# next candidate would turn "core is broken" into "core is missing", which is a
+# different and much quieter problem.
+EXPECTED_API="rust-fs-core-output-budget 1"
+CORE_ROOT="${FS_CORE_ROOT:-$REPO/../rust-fs-core}"
+
+verified() {
+    [ -f "$1" ] || return 1
+    [ "$(bash "$1" --version 2>/dev/null || true)" = "$EXPECTED_API" ]
+}
+
+refuse_wrong() {
+    echo "tier.sh: $1/scripts/output-budget.sh is there, but does not answer" >&2
+    echo "         --version with '$EXPECTED_API'. That is a broken or far too" >&2
+    echo "         old rust-fs-core, not an absent one, so this stops here" >&2
+    echo "         rather than quietly looking somewhere else." >&2
+    exit 1
+}
+
+CORE_SCRIPT=""
+if [ -n "${FS_CORE_ROOT:-}" ]; then
+    if [ -e "$CORE_ROOT/scripts/output-budget.sh" ]; then
+        verified "$CORE_ROOT/scripts/output-budget.sh" || refuse_wrong "$CORE_ROOT"
+    else
+        echo "tier.sh: FS_CORE_ROOT names $CORE_ROOT, which has no" >&2
+        echo "         scripts/output-budget.sh. The wrapper lives in" >&2
+        echo "         rust-fs-core and is deliberately not committed here." >&2
+        exit 1
+    fi
+    CORE_SCRIPT="$CORE_ROOT/scripts/output-budget.sh"
+elif [ -e "$CORE_ROOT/scripts/output-budget.sh" ]; then
+    verified "$CORE_ROOT/scripts/output-budget.sh" || refuse_wrong "$CORE_ROOT"
+    CORE_SCRIPT="$CORE_ROOT/scripts/output-budget.sh"
+else
+    CORE_DIR="$(cargo metadata --format-version 1 --locked --manifest-path "$REPO/Cargo.toml" \
+        2>/dev/null | python3 -c '
 import json, sys
 packages = json.load(sys.stdin)["packages"]
 print(next((p["manifest_path"].rsplit("/", 1)[0]
             for p in packages if p["name"] == "am-fs-core"), ""))
-')"
-if [ -z "$CORE_DIR" ] || [ ! -f "$CORE_DIR/scripts/output-budget.sh" ]; then
-    echo "tier.sh: cargo could not say where am-fs-core is, or its copy has no" >&2
-    echo "         scripts/output-budget.sh. The wrapper lives in rust-fs-core;" >&2
-    echo "         check the am-fs-core dependency resolves and is at a version" >&2
-    echo "         that ships it (v0.2.11 or later)." >&2
+' 2>/dev/null)"
+    if [ -n "$CORE_DIR" ] && [ -e "$CORE_DIR/scripts/output-budget.sh" ]; then
+        verified "$CORE_DIR/scripts/output-budget.sh" || refuse_wrong "$CORE_DIR"
+        CORE_SCRIPT="$CORE_DIR/scripts/output-budget.sh"
+    fi
+fi
+
+if [ -z "$CORE_SCRIPT" ]; then
+    echo "tier.sh: no rust-fs-core supplied scripts/output-budget.sh." >&2
+    echo "         The wrapper lives in rust-fs-core and is deliberately not" >&2
+    echo "         committed here. Looked for the sibling at" >&2
+    echo "           $CORE_ROOT/scripts/output-budget.sh" >&2
+    echo "         then asked cargo for the am-fs-core package." >&2
+    echo "         Run 'chore siblings', or depend on v0.2.13 or later." >&2
     exit 1
 fi
 
+# THE WRAPPER IS COPIED FOR THIS RUN AND DELETED AFTER IT, so a `chore siblings`
+# or a `cargo update` part-way through a long tier cannot change the script out
+# from under it. tmp/ is gitignored and is where the tier logs already live.
+
 BUDGET="$REPO/tmp/output-budget.$$.sh"
 mkdir -p "$REPO/tmp"
-cp "$CORE_DIR/scripts/output-budget.sh" "$BUDGET"
+cp "$CORE_SCRIPT" "$BUDGET"
 trap 'rm -f "$BUDGET"' EXIT
 
 [ $# -ge 5 ] || { echo "tier.sh: usage: tier.sh LABEL LOG MAX-LINES MAX-BYTES -- CMD..." >&2; exit 2; }

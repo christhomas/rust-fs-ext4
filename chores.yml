@@ -118,11 +118,11 @@ vars:
   # org, and a URL rebuilt from a repo name points at a repository that
   # does not exist for exactly the ones that are not.
   FS_CORE_URL: https://github.com/antimatter-studios/rust-fs-core.git
-  # v0.2.11 is the release that packages scripts/output-budget.sh, which
-  # scripts/resolve-output-budget.sh resolves and verifies. v0.2.10 does not
-  # contain it, so this pin cannot go back below v0.2.11 while the tiers read
-  # the wrapper from core.
-  FS_CORE_REF: v0.2.11
+  # scripts/tier.sh reads scripts/output-budget.sh out of core. v0.2.11 is the
+  # first release that packages it and v0.2.13 is the first that carries the
+  # quiet-failure behaviour, so this pin cannot go back below v0.2.13 while
+  # the tiers read the wrapper from core.
+  FS_CORE_REF: v0.2.13
   LINUX_HARNESS_URL: https://github.com/antimatter-studios/fs-linux-test-harness.git
   LINUX_HARNESS_REF: v0.1.0
 
@@ -234,30 +234,30 @@ tasks:
             fi
           done
 
-          # TELL CARGO TO USE THE CHECKOUT WE JUST MADE.
+          # CARGO IS TOLD ABOUT THE CHECKOUT BY Cargo.toml, NOT BY A CONFIG
+          # FILE WRITTEN HERE.
           #
-          # The manifest declares am-fs-core by VERSION only. A `path` in
-          # Cargo.toml is a developer's machine layout committed to the
-          # repository: it forces every consumer to have a sibling beside
-          # them, and it is published metadata that is wrong for everyone
-          # else. The dependency is the released crate; a developer who wants
-          # their own core exercised says so HERE, locally.
+          # An earlier cut of this task wrote a `paths` override into
+          # .cargo/config.toml holding an ABSOLUTE path to the sibling, so the
+          # manifest could name am-fs-core by version alone. It failed in the
+          # one place this repository cannot afford to fail: `chore test:vm`
+          # mounts this working tree into the guest at /repo, the override went
+          # with it, and the host path it names does not exist inside the VM.
+          #   error: failed to update path override
+          #          `/home/runner/work/rust-fs-ext4/rust-fs-core`
+          #          (defined in `/repo/.cargo/config.toml`)
+          # -- run 35852463970, job 107154016599.
           #
-          # .cargo/config.toml is gitignored, so this cannot be committed by
-          # accident, and a `paths` override is not recorded in Cargo.lock, so
-          # it cannot leak that way either. Remove the file to go back to the
-          # published crate.
+          # A path INSIDE the repository is a path two machines have to agree
+          # on, and these two do not. `path = "../rust-fs-core"` in Cargo.toml
+          # is the answer both of them already have: on the host it is the
+          # sibling this task pins, and in the guest it is /rust-fs-core, which
+          # test:vm stages there for exactly this reason. It is also what every
+          # other crate in this family declares.
           #
-          # THE PATH IS ABSOLUTE, DELIBERATELY. A relative one means a
-          # different directory depending on whether you are in the main
-          # checkout or a thread worktree, and both can exist at once: a
-          # worktree resolving `../rust-fs-core` was found pointing at a
-          # SECOND core checkout a day out of date, which is the drift this
-          # arrangement exists to prevent.
-          core_abs="$(cd ../rust-fs-core && pwd)"
-          mkdir -p .cargo
-          printf 'paths = ["%s"]\n' "$core_abs" > .cargo/config.toml
-          echo "siblings: cargo will use $core_abs (.cargo/config.toml, gitignored)"
+          # `version` beside the `path` is what gets published: cargo drops the
+          # path when it packages, so the released crate depends on the
+          # registry version and nobody downstream inherits our layout.
 
   tools:
     desc: "Install and verify what the HOST needs: ripgrep, and the VM the oracle tools live in"

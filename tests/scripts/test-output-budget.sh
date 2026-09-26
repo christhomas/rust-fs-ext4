@@ -13,6 +13,10 @@
 set -uo pipefail
 
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../.." && pwd)"
+# tmp/ is gitignored, so a fresh checkout does not have one and every mktemp
+# below fails into the filesystem root -- which reads as nine unrelated
+# assertion failures rather than "there is no tmp/".
+mkdir -p "$REPO/tmp"
 fails=0
 note() { echo "FAIL  $*" >&2; fails=$(( fails + 1 )); }
 
@@ -80,10 +84,50 @@ else
     [ "$rc" = 7 ] || note "a failing run exited $rc, not the command's own 7"
     case "$out" in *"the reason"*) ;; *) note "a failure printed no excerpt: $out" ;; esac
 
+    # A failure is quiet unless the tail is asked for. Core v0.2.13 stopped
+    # reading the log aloud on every failure; this is the shape that replaced
+    # it, and it is the one every CI log now carries.
+    out="$("$budget" --log "$work/silent.log" --label silent \
+              -- sh -c 'echo the reason; exit 7' 2>&1)"
+    rc=$?
+    [ "$rc" = 7 ] || note "a quiet failure exited $rc, not the command's own 7"
+    case "$out" in *"the reason"*) note "a failure read its log aloud without --tail: $out" ;; esac
+    case "$out" in *"silent.log"*) ;; *) note "a quiet failure did not name its log: $out" ;; esac
+
     # Verbose streams, and is still budgeted.
     out="$(OUTPUT_BUDGET_VERBOSE=1 "$budget" --log "$work/v.log" --max-lines 5 --label v -- echo hello 2>&1)"
     case "$out" in *hello*) ;; *) note "--verbose did not stream the output: $out" ;; esac
 fi
+
+# --- 3. The resolver refuses a core it cannot verify. ----------------------
+#
+# scripts/tier.sh reads the wrapper out of rust-fs-core at run time and keeps
+# no copy of its own. The whole arrangement rests on it REFUSING rather than
+# improvising, and a refusal nobody executes has never been shown to happen --
+# which is the same defect as a test that skips. So both refusals are driven
+# here, through FS_CORE_ROOT, which exists for exactly this.
+resolver_work="$(mktemp -d "$REPO/tmp/tier-resolver-test.XXXXXX")"
+trap 'rm -rf "$work" "$resolver_work"' EXIT
+
+# A core that is not there. FS_CORE_ROOT is authoritative: naming a directory
+# that holds no wrapper is an answer, not a reason to go looking elsewhere.
+out="$(FS_CORE_ROOT="$resolver_work/nowhere" \
+          bash "$REPO/scripts/tier.sh" t log 10 100 -- true 2>&1)"
+rc=$?
+[ "$rc" != 0 ] || note "tier.sh ran a tier with no rust-fs-core to get the wrapper from"
+case "$out" in *"rust-fs-core"*) ;; *) note "the refusal did not name rust-fs-core: $out" ;; esac
+
+# A core that is present and wrong. This is the case that must NOT fall
+# through to the next candidate: "core is broken" reported as "core is
+# missing" is a quieter and much more confusing failure.
+mkdir -p "$resolver_work/wrong/scripts"
+printf '#!/usr/bin/env bash\necho "some-other-wrapper 9"\n' \
+    > "$resolver_work/wrong/scripts/output-budget.sh"
+out="$(FS_CORE_ROOT="$resolver_work/wrong" \
+          bash "$REPO/scripts/tier.sh" t log 10 100 -- true 2>&1)"
+rc=$?
+[ "$rc" != 0 ] || note "tier.sh accepted a wrapper that is not rust-fs-core's"
+case "$out" in *"--version"*) ;; *) note "the refusal did not say what it checked: $out" ;; esac
 
 if [ "$fails" -gt 0 ]; then
     echo "FAIL  $fails output-budget violation(s)" >&2
